@@ -53,7 +53,7 @@ cmake --build build -j
 python -m powermodeling --help
 ```
 
-Python 회귀 테스트 **141개가 로컬에서 통과했다**. 테스트는 생성된 데이터와 NVML/subprocess mock으로 실패·반례를 검증한다. NCU timeout·중단 시 소유한 process group만 종료하고 부분 출력·실패 evidence·clock 복원 결과를 보존하는 경로도 포함한다. 독립 주소 열거에서 write/copy 소유권 9,543 조건과 finite footprint 30,720 조건을 확인했으며, 이는 주소 수학의 검증이다. CUDA 12 다중 아키텍처 빌드는 컴파일 가능성을 검증한다. 최종 실행 결과와 CI 상태는 [PR #1](https://github.com/bang001/powermodeling/pull/1)에 기록한다. 테스트 이름·조건은 `tests/`에서 확인할 수 있다.
+Python 회귀 테스트 **142개가 로컬에서 통과했다**. 테스트는 생성된 데이터와 NVML/subprocess mock으로 실패·반례를 검증한다. NCU timeout·중단 시 소유한 process group만 종료하고 부분 출력·실패 evidence·clock 복원 결과를 보존하는 경로도 포함한다. 독립 주소 열거에서 write/copy 소유권 9,543 조건과 finite footprint 30,720 조건을 확인했으며, 이는 주소 수학의 검증이다. CUDA 12 다중 아키텍처 빌드는 컴파일 가능성을 검증한다. 최종 실행 결과와 CI 상태는 [PR #1](https://github.com/bang001/powermodeling/pull/1)에 기록한다. 테스트 이름·조건은 `tests/`에서 확인할 수 있다.
 
 ## 실제 GPU에서 남은 확인
 

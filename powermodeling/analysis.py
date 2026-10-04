@@ -174,7 +174,7 @@ def _phase_stats(phase: Mapping[str, Any] | None, name: str, policy: AnalysisPol
     result["distinct_power_values"] = len(set(v for v in power_values if v is not None))
     result["observed_power_change_interval_median_s"] = _median(change_gaps)
     result["power_update_cadence_note"] = "Changes are not proof of sensor refresh cadence; unchanged values may be steady power."
-    for field in ("graphics_clock_mhz", "memory_clock_mhz", "temperature_c"):
+    for field in ("graphics_clock_mhz", "sm_clock_mhz", "memory_clock_mhz", "temperature_c"):
         values = [_finite(s.get(field)) for s in selected]
         values = [v for v in values if v is not None]
         result[field] = statistics.median(values) if values else None
@@ -412,10 +412,14 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
                    or _finite(record.get("power_limit_w", device.get("power_limit_w", config.get("power_limit_w"))))
                    or _finite((device.get("sample") or {}).get("power_limit_w")))
     tensor_peak = None
-    if record.get("workload") in _TENSOR_WORKLOADS and measure.get("graphics_clock_mhz") is not None:
+    peak_clock_source = "sm_clock_mhz" if (_finite(measure.get("sm_clock_mhz")) or 0) > 0 else "graphics_clock_mhz"
+    peak_clock = _finite(measure.get(peak_clock_source))
+    if record.get("workload") in _TENSOR_WORKLOADS and peak_clock is not None and peak_clock > 0:
         try:
             from .profiles import theoretical_tensor_tflops
-            tensor_peak = theoretical_tensor_tflops(record.get("cuda_device") or device, measure["graphics_clock_mhz"])
+            tensor_peak = theoretical_tensor_tflops(record.get("cuda_device") or device, peak_clock)
+            if peak_clock_source != "sm_clock_mhz":
+                warnings.append("tensor_peak_uses_graphics_clock_proxy; measured SM clock unavailable")
         except (ValueError, KeyError, TypeError):
             warnings.append("tensor_theoretical_peak_unavailable")
     baseline_deltas = {}
@@ -478,6 +482,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "device_event_throughput_ops_s": operations / device_duration if operations is not None and device_duration and device_duration > 0 else None,
         "device_event_throughput_bytes_s": logical_bytes / device_duration if logical_bytes is not None and device_duration and device_duration > 0 else None,
         "tensor_peak_tflops_at_achieved_clock": tensor_peak,
+        "tensor_peak_clock_source": peak_clock_source if tensor_peak is not None else None,
         "tensor_utilization_vs_dense_clock_peak": ops_rate / 1e12 / tensor_peak if ops_rate is not None and tensor_peak and tensor_peak > 0 else None,
         "board_power_w": board_power, "idle_power_w": idle_power, "incremental_power_w": incremental_power,
         "total_energy_j": total, "idle_energy_j": idle_energy, "incremental_energy_j": incremental,
@@ -491,7 +496,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "memory_rail_energy_j": rail_energy, "memory_rail_incremental_energy_j": rail_incremental,
         "memory_rail_incremental_power_w": rail_incremental / duration if rail_incremental is not None and duration else None,
         "memory_rail_sources": sorted(rail_sources),
-        "graphics_clock_mhz": measure.get("graphics_clock_mhz"), "memory_clock_mhz": measure.get("memory_clock_mhz"),
+        "graphics_clock_mhz": measure.get("graphics_clock_mhz"), "sm_clock_mhz": measure.get("sm_clock_mhz"), "memory_clock_mhz": measure.get("memory_clock_mhz"),
         "temperature_c": measure.get("temperature_c"), "throttle_reasons_mask": effective_mask,
         "other_gpu_process_pids": sorted(other_pids),
         "power_limit_w": power_limit,
@@ -528,7 +533,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
 
 _METRICS = ("board_power_w", "idle_power_w", "incremental_power_w", "throughput_ops_s", "throughput_bytes_s",
             "pj_per_op", "pj_per_logical_byte", "total_pj_per_op", "total_pj_per_logical_byte",
-            "memory_rail_power_w", "memory_rail_incremental_power_w", "graphics_clock_mhz", "memory_clock_mhz",
+            "memory_rail_power_w", "memory_rail_incremental_power_w", "graphics_clock_mhz", "sm_clock_mhz", "memory_clock_mhz",
             "temperature_c", "idle_fraction_of_measured_power", "idle_fraction_of_power_limit", "power_limit_utilization",
             "tensor_peak_tflops_at_achieved_clock", "tensor_utilization_vs_dense_clock_peak")
 _REPEAT_KEYS = {"repeat", "repeat_id", "repeat_index", "trial_id", "output_dir", "output_path"}
@@ -769,7 +774,7 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
     csv_path = destination / "trials.csv"
     fields = ["trial_id", "gpu_uuid", "gpu_name", "workload", "valid", "target_verified", "ncu_status", "ncu_target_suitability", "ncu_utilization_status", "profiler_suitability_status",
               "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "duration_s", *_METRICS,
-              "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w"]
+              "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source"]
     with csv_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()

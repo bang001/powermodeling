@@ -153,6 +153,20 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(trial["valid"], trial["issues"])
         self.assertAlmostEqual(trial["tensor_peak_tflops_at_achieved_clock"], 265.4208)
         self.assertAlmostEqual(trial["tensor_utilization_vs_dense_clock_peak"], 200 / 265.4208)
+        self.assertEqual(trial["tensor_peak_clock_source"],"graphics_clock_mhz")
+        self.assertTrue(any("graphics_clock_proxy" in warning for warning in trial["warnings"]))
+
+    def test_tensor_peak_prefers_observed_sm_domain_over_graphics_clock(self):
+        record=synthetic_trial("gemm",throughput=200e12)
+        record["cuda_device"]={"compute_capability":[8,0],"sm_count":108}
+        for sample in record["phases"]["measure"]["samples"]:
+            sample["sm_clock_mhz"]=1000
+        trial=analyze_trial(record)
+        self.assertAlmostEqual(trial["tensor_peak_tflops_at_achieved_clock"],221.184)
+        self.assertEqual(trial["tensor_peak_clock_source"],"sm_clock_mhz")
+        self.assertEqual(trial["graphics_clock_mhz"],1200)
+        self.assertEqual(trial["sm_clock_mhz"],1000)
+        self.assertFalse(any("graphics_clock_proxy" in warning for warning in trial["warnings"]))
 
     def test_legacy_whole_run_host_rate_is_explicitly_qualified_estimate(self):
         record = synthetic_trial()

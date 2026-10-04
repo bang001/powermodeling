@@ -59,7 +59,8 @@ class FakeSampler:
         return self
 
     def stop(self):
-        return [{"t_s": index / 2, "power_w": 50.0} for index in range(49)]
+        return [{"t_s": index / 2, "power_w": 50.0,
+                 "compute_processes":[],"graphics_processes":[]} for index in range(49)]
 
 
 class FakeProcess:
@@ -69,7 +70,7 @@ class FakeProcess:
         self.command = command
 
     def communicate(self, timeout):
-        events = []
+        events = [{"type":"device",**DEVICE}]
         for name, start, end in (("idle_pre", 0, 6), ("measure", 6, 18), ("idle_post", 18, 24)):
             for kind, timestamp in (("start", start), ("end", end)):
                 events.append({"type": "phase", "phase": name, "event": kind,
@@ -174,7 +175,9 @@ class IntegrationReviewTests(unittest.TestCase):
         evidence = {"condition_id": "c", "gpu_uuid": DEVICE["uuid"], "workload": "l2",
                     "memory_target_verified": True, "verification_notes": "Synthetic test, not measured evidence",
                     "profile_clocks_verified": True, "rows": [{"metric": "counter", "value": "1"}]}
-        self.assertTrue(attach_verification(record, evidence)["validation"]["memory_target_verified"])
+        assessment = attach_verification(record, evidence)["validation"]
+        self.assertFalse(assessment["memory_target_verified"])
+        self.assertEqual(assessment["status"], "inconclusive")
         for modified in ({"gpu_uuid": "GPU-other"}, {"condition_id": "other"}, {"locality": "near"}):
             with self.subTest(modified=modified), self.assertRaises(ValueError):
                 attach_verification(record, {**evidence, **modified})
@@ -193,6 +196,14 @@ class IntegrationReviewTests(unittest.TestCase):
             self.assertEqual(len(json.loads(output.read_text())["trials"]), 3)
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["analyze", "--input", str(Path(directory) / "absent"), "--output", directory]), 2)
+
+    def test_cli_rejected_fit_is_saved_and_returns_failure(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            source=Path(directory)/"rows.json"
+            output=Path(directory)/"model.json"
+            source.write_text('[]')
+            self.assertEqual(main(["fit","--input",str(source),"--features","x","--output",str(output)]),2)
+            self.assertEqual(json.loads(output.read_text())["status"],"rejected")
 
 
 if __name__ == "__main__":

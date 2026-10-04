@@ -60,10 +60,36 @@ def parser():
     profile.add_argument("--extra-metrics",default="",help="Additional discovered L2 fabric metrics, comma-separated")
     profile.add_argument("--output",required=True)
     profile.add_argument("--print-command",action="store_true")
+    profile.add_argument("--policy",help="JSON file overriding documented counter-assessment thresholds")
+    profile.add_argument("--apply-clocks",action="store_true",help="Use the planned clock pair during counter validation")
+    profile.add_argument("--clock-method",choices=("applications","locked"),default="applications")
+    profile_restore=profile.add_mutually_exclusive_group()
+    profile_restore.add_argument("--locked-restore",help="Known preexisting graphics/memory locked ranges JSON")
+    profile_restore.add_argument("--clock-reset-on-exit",action="store_true",help="Declare both clock domains were unlocked before profiling")
+    evaluate=commands.add_parser("evaluate-profile",help="Compute pass/fail/inconclusive from raw ncu evidence without GPU access")
+    evaluate.add_argument("--evidence",required=True)
+    evaluate.add_argument("--policy",help="JSON overrides for documented counter thresholds")
+    evaluate.add_argument("--output",required=True)
+    batch=commands.add_parser("validate-run",help="Run ncu once per measured condition and attach computed judgments to every repeat")
+    hardware(batch)
+    batch.add_argument("--plan",required=True)
+    batch.add_argument("--input",required=True)
+    batch.add_argument("--output",required=True)
+    batch.add_argument("--profiles-dir",required=True)
+    batch.add_argument("--ncu",default="ncu")
+    batch.add_argument("--extra-metrics",default="")
+    batch.add_argument("--policy")
+    batch.add_argument("--apply-clocks",action="store_true")
+    batch.add_argument("--clock-method",choices=("applications","locked"),default="applications")
+    batch_restore=batch.add_mutually_exclusive_group()
+    batch_restore.add_argument("--locked-restore")
+    batch_restore.add_argument("--clock-reset-on-exit",action="store_true")
+    batch.add_argument("--limit-conditions",type=int,help="Profile first N unique conditions; output explicitly records partial coverage")
     verify=commands.add_parser("attach-verification",help="Attach reviewed counter/locality evidence to matching measured trials")
     verify.add_argument("--input",required=True)
     verify.add_argument("--evidence",required=True)
     verify.add_argument("--output",required=True,help="New directory; original raw measurements stay intact")
+    verify.add_argument("--policy",help="JSON overrides for documented counter thresholds")
     return p
 
 
@@ -121,7 +147,7 @@ def main(argv=None):
             result=fit_model(rows,features=[s.strip() for s in args.features.split(",") if s.strip()],target=args.target)
             atomic_json(args.output,result)
         elif args.command=="profile":
-            from .profiling import capture_profile,profile_command
+            from .profiling import profile_command
             plan=read_json(args.plan)
             if args.print_command:
                 trial=next((t for t in plan["trials"] if t["trial_id"]==args.trial_id),None)
@@ -130,22 +156,51 @@ def main(argv=None):
             else:
                 selected=describe_benchmark(args.bench,args.device)
                 if selected["uuid"]!=plan["device"]["uuid"]: raise ValueError("Profile device UUID differs from plan")
-                plan["device"]["device_index"]=args.device
-                result=capture_profile(plan,args.trial_id,args.bench,args.output,args.ncu,
-                                       tuple(x.strip() for x in args.extra_metrics.split(",") if x.strip()))
+                from .profile_session import capture_profile_session
+                selected["device_index"]=args.device
+                restore=(read_json(args.locked_restore) if args.locked_restore else
+                         {"graphics":None,"memory":None} if args.clock_reset_on_exit else None)
+                result=capture_profile_session(plan,args.trial_id,args.bench,args.output,selected,args.ncu,
+                                       tuple(x.strip() for x in args.extra_metrics.split(",") if x.strip()),
+                                       read_json(args.policy) if args.policy else None,
+                                       args.apply_clocks,args.clock_method,restore)
+        elif args.command=="evaluate-profile":
+            from .validation import assess_profile
+            result=assess_profile(read_json(args.evidence),read_json(args.policy) if args.policy else None)
+            atomic_json(args.output,result)
+        elif args.command=="validate-run":
+            from .validation_workflow import validate_run
+            selected=describe_benchmark(args.bench,args.device)
+            selected["device_index"]=args.device
+            restore=(read_json(args.locked_restore) if args.locked_restore else
+                     {"graphics":None,"memory":None} if args.clock_reset_on_exit else None)
+            result=validate_run(read_json(args.plan),args.input,args.output,args.profiles_dir,args.bench,selected,
+                                args.ncu,tuple(x.strip() for x in args.extra_metrics.split(",") if x.strip()),
+                                read_json(args.policy) if args.policy else None,args.apply_clocks,
+                                args.clock_method,restore,args.limit_conditions)
         elif args.command=="attach-verification":
             from .profiling import attach_verification
             evidence=read_json(args.evidence)
             records=load_trials(args.input)
+            from .runner import validate_trial_ids
+            validate_trial_ids(records)
             matching=[r for r in records if r.get("condition_id")==evidence.get("condition_id")]
             if not matching: raise ValueError("No measured trials match evidence condition_id")
             output=Path(args.output)
-            for record in matching:
+            # Preserve unmatched measurements so assessment does not silently
+            # change the population used to estimate maximum observed throughput.
+            updated=[]
+            for record in records:
+                updated.append(attach_verification(record,evidence,read_json(args.policy) if args.policy else None)
+                               if record.get("condition_id")==evidence.get("condition_id") else record)
+            for record in updated:
                 path=output/"trials"/(record["trial_id"]+".json")
                 if path.exists(): raise FileExistsError(f"Output already exists: {path}")
-                atomic_json(path,attach_verification(record,evidence))
-            result={"attached_trials":len(matching),"output":str(output.resolve())}
+            for record in updated:
+                atomic_json(output/"trials"/(record["trial_id"]+".json"),record)
+            result={"assessed_trials":len(matching),"preserved_trials":len(records)-len(matching),"output":str(output.resolve())}
         print(json.dumps(result,indent=2,allow_nan=False))
+        if args.command=="fit" and result.get("status")=="rejected": return 2
         return 0
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
         print(f"powermodeling: {exc}",file=sys.stderr)

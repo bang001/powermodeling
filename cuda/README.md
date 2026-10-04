@@ -47,13 +47,30 @@ at stride 1. Offset wrapping uses precomputed normalized offsets and subtraction
 inside the loop, avoiding hot 64-bit division even for 20/25 MiB footprints.
 `--offset-bytes` shifts the allocation base and must be 4-byte aligned.
 
+Write/copy rounds the effective number of words down to a whole multiple of
+`blocks * threads * stride`. This address ownership tile ensures that separate
+threads never store to the same word even after wrapping. A footprint smaller
+than one tile is rejected. Both `requested_working_set_bytes` and the effective
+`working_set_bytes` are reported. This can change the effective footprint between
+geometry trials; compare the reported geometry and counters, rather than assuming
+the requested allocation was used unchanged.
+
 For a strided region with `n` words, potential reachable words are
 `n / gcd(n, stride)`. Allocation capacity alone therefore does not establish an
 HBM workload. Result fields `logical_reachable_bytes` and
 `potential_cache_sector_bytes` describe a complete address period; finite
 iterations and SM admission can touch less. The sector value is a conservative
 bound unless `potential_sector_footprint_exact` is true. Neither is observed
-cache/DRAM traffic.
+cache/DRAM traffic. Every non-latency memory launch restarts the same address
+sequence, so a large allocation can still touch only a small cache-resident
+subset. `finite_launch_reachable_bytes_upper_bound` and
+`finite_launch_sector_bytes_upper_bound` report finite-work bounds; their
+respective `*_exact` fields identify exact address-footprint calculations.
+For unfiltered read/write/copy, the unique per-region word count is
+`min(n / gcd(n, stride), lanes * 4 * iterations)`; L1 uses per-block `n` and
+`lanes`, then sums disjoint slices. Bounds for SM-filtered runs do not prove the
+actual subset was visited. Dependent latency probes use a varying deterministic
+start on a randomized full cycle and report a bound over measured probes.
 
 `--sm-ids 0,1,...` admits blocks only when `%smid` is in the requested set. This
 is best effort dispatch admission: it does not disable SMs or map GPCs. Actual
@@ -76,21 +93,57 @@ clocks. Dirty writeback/background effects may affect the post-idle baseline.
 
 `duration_s` is CUDA-event elapsed **experiment window**, including launch gaps;
 it is not the sum of profiler kernel busy times. `host_duration_s` is also
-reported. FLOPs use dense FMA = 2. Memory bytes are requested logical payload;
+reported. `measure_epochs` records approximately one second of complete batches
+with exact admitted block counts, operations and logical bytes. Epochs carry
+`host_monotonic_start_ns` / `host_monotonic_end_ns` plus `start_s` / `end_s` in the
+same Linux monotonic timebase as power samples. They include counter readback
+gaps; `counter_readback_ns` records that overhead. Microbenchmarks read back
+32 KiB of admission counters at most once per roughly one second and once for
+the final partial epoch. No per-epoch stdout occurs during measurement. The
+analyzer can sum complete epochs wholly inside the trimmed steady-state window
+and integrate power over those exact bounds. It must not interpolate work in an
+unknown partial batch or silently substitute full-run throughput. FLOPs use dense
+FMA = 2. Memory bytes are requested logical payload;
 copy includes one read and one write. Sector inflation, cache fills/writebacks,
 telemetry, initialization and sink/output transfers are not included in logical
-byte counts. No component rail attribution is performed by this executable.
+byte counts. `auxiliary_work` quantifies issued result-output payload, Tensor
+operand loads, telemetry atomic updates and host counter readbacks. These are
+logical work counts, not physical traffic, and exclude possible compiler spills.
+The GEMM output payload is an algorithmic minimum; internal kernels can add work.
+No component rail attribution is performed by this executable.
 
 For deterministic Nsight application replay, use fixed counts instead of a
 wall-clock loop:
 
 ```sh
 build/powerbench --workload l2 --warmup-seconds 0 --idle-seconds 0 \
-  --warmup-batches 1 --fixed-batches 1 --batch-launches 1 --iterations 1024
+  --warmup-batches 8 --fixed-batches 1 --batch-launches 1 --iterations 1024 \
+  --profile-region
 ```
 
-Filter the intended workload kernel, skip its first (warmup) launch and profile
-the next one. Profiling results are counter diagnostics; they must not be treated
-as uninstrumented energy measurements. cuBLAS may launch several internal
-kernels per invocation, so `kernel_launches` is null for `gemm` and
-`gemm_invocations` is reported separately.
+`--profile-region` brackets `measure` with `cudaProfilerStart` / `cudaProfilerStop`.
+Start Nsight Compute with `--profile-from-start off` so initialization and warmup
+kernels are excluded without relying on launch counts. For example:
+
+```sh
+ncu --profile-from-start off --replay-mode application --cache-control none \
+  --set full --csv build/powerbench --workload l2 --warmup-seconds 0 \
+  --idle-seconds 0 --warmup-batches 8 --fixed-batches 1 --batch-launches 1 \
+  --iterations 1024 --profile-region
+```
+
+Application replay and cache-control preservation allow the application warmup
+before each pass. Eight batches are a starting point; measured hit rate, finite
+footprint and stable clocks must still establish warmup adequacy. Filter the
+intended microbenchmark kernel when appropriate. For GEMM retain all kernels
+inside the measure region, since cuBLAS may launch multiple internal kernels per
+invocation. `kernel_launches` is null for `gemm`; `gemm_invocations` is reported
+separately. The first measured latency-probe nonce is reset after timed warmup,
+so profiler replay begins from the same deterministic sequence.
+
+Profiling results are counter diagnostics and must not be used as
+uninstrumented energy measurements. Device metadata includes process ID and
+CUDA compile/runtime/driver/cuBLAS versions to bind evidence to the actual
+process and software stack. Real GPU execution is required to validate cache
+residency, effective traffic, register spills, Tensor utilization, stationarity
+and board or HBM energy.

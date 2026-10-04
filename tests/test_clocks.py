@@ -102,7 +102,30 @@ class ClockTests(unittest.TestCase):
             with clock_context(device, graphics_mhz=900, memory_mhz=1215, method="locked", allow_mutation=True,
                                locked_restore={"graphics": None, "memory": None}):
                 pass
-        self.assertEqual(device.events, [("lock_memory", 1215, 1215), ("reset_memory",)])
+        self.assertEqual(device.events, [("lock_memory", 1215, 1215), ("reset_graphics",), ("reset_memory",)])
+
+    def test_error_after_driver_mutation_still_restores_prior_application_pair(self):
+        device = ClockDevice()
+        original_set = device.nvmlDeviceSetApplicationsClocks
+        def mutate_then_fail(memory, graphics):
+            original_set(memory, graphics)
+            if graphics == 900:
+                raise RuntimeError("set failed after mutation")
+        device.nvmlDeviceSetApplicationsClocks = mutate_then_fail
+        with self.assertRaisesRegex(RuntimeError, "after mutation") as caught:
+            with clock_context(device, graphics_mhz=900, memory_mhz=1593, allow_mutation=True):
+                pass
+        self.assertEqual((device.application_graphics, device.application_memory), (1200, 1215))
+        self.assertTrue(caught.exception.clock_record["restored"])
+
+    def test_partial_locked_failure_restores_only_requested_domains(self):
+        device = ClockDevice()
+        device.fail_gpu_set = True
+        with self.assertRaisesRegex(RuntimeError, "GPU lock failed"):
+            with clock_context(device, graphics_mhz=900, method="locked", allow_mutation=True,
+                               locked_restore={"graphics": None, "memory": [1215, 1593]}):
+                pass
+        self.assertEqual(device.events, [("reset_graphics",)])
 
     def test_restoration_failure_is_fatal_and_recorded(self):
         device = ClockDevice()

@@ -1,10 +1,13 @@
 import copy
 import json
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
 
 from powermodeling.analysis import AnalysisPolicy, analyze_trial, summarize, write_summary
+
+_TRIAL_SERIAL = itertools.count()
 
 
 def synthetic_trial(workload="tensor", active_power=150.0, throughput=1e12, repeat=0):
@@ -16,14 +19,32 @@ def synthetic_trial(workload="tensor", active_power=150.0, throughput=1e12, repe
             t = start + index / 4
             samples.append({"t_s": t, "power_w": power, "energy_mj": (accumulated + power * (t - start)) * 1000,
                             "graphics_clock_mhz": 1200, "memory_clock_mhz": 1000, "temperature_c": 50,
-                            "throttle_reasons": 0})
+                            "throttle_reasons": 0, "compute_processes": [], "graphics_processes": []})
         phases[name] = {"start_s": start, "end_s": end, "samples": samples}
         accumulated += power * (end - start)
-    return {"trial_id": f"synthetic-{repeat}", "workload": workload, "status": "complete",
+    return {"trial_id": f"synthetic-{repeat}-{next(_TRIAL_SERIAL)}", "workload": workload, "status": "complete",
             "config": {"gpu_uuid": "GPU-test", "graphics_clock_mhz": 1200, "memory_clock_mhz": 1000,
                        "blocks": 80, "stride_bytes": 32, "repeat": repeat},
-            "benchmark": {"duration_s": 12, "operations": throughput * 12, "logical_bytes": throughput * 12},
+            "benchmark": {"duration_s": 12, "operations": throughput * 12, "logical_bytes": throughput * 12,
+                          "measure_epochs": [{"start_s": start, "end_s": start + 1, "operations": throughput,
+                                              "logical_bytes": throughput, "counts_exact": True} for start in range(6, 18)]},
             "phases": phases, "device": {"name": "Synthetic, not measured hardware", "power_limit_w": 400}}
+
+
+def verified_profile(record):
+    from test_ncu_validation import pass_fixture
+    binding, evidence = pass_fixture(record["workload"])
+    record["condition_id"] = binding["condition_id"]
+    record["provenance"] = binding["provenance"]
+    record["config"].update(binding["config"])
+    record["benchmark"].update({key: value for key, value in binding["benchmark"].items()
+                                 if key not in ("logical_bytes", "kernel_launches")})
+    for phase in record["phases"].values():
+        for sample in phase["samples"]:
+            sample["memory_clock_mhz"] = 1593
+    record["samples"] = [sample for phase in record["phases"].values() for sample in phase["samples"]]
+    record["validation"] = {"profiler_evidence": evidence}
+    return record
 
 
 class AnalysisTests(unittest.TestCase):
@@ -43,6 +64,8 @@ class AnalysisTests(unittest.TestCase):
     def test_counter_missing_uses_integrated_power_and_preserves_unavailable(self):
         record = synthetic_trial("l2")
         record["benchmark"].pop("operations")
+        for epoch in record["benchmark"]["measure_epochs"]:
+            epoch["operations"] = 0
         for phase in record["phases"].values():
             for sample in phase["samples"]:
                 sample.pop("energy_mj")
@@ -131,12 +154,15 @@ class AnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(trial["tensor_peak_tflops_at_achieved_clock"], 265.4208)
         self.assertAlmostEqual(trial["tensor_utilization_vs_dense_clock_peak"], 200 / 265.4208)
 
-    def test_host_duration_is_used_for_energy_count_rate(self):
+    def test_legacy_whole_run_host_rate_is_explicitly_qualified_estimate(self):
         record = synthetic_trial()
+        record["benchmark"].pop("measure_epochs")
         record["benchmark"]["host_duration_s"] = 12.2
         trial = analyze_trial(record)
         self.assertTrue(trial["valid"], trial["issues"])
         self.assertAlmostEqual(trial["pj_per_op"], 100 * 12.2 / 12)
+        self.assertFalse(trial["count_energy_time_alignment_exact"])
+        self.assertEqual(trial["energy_per_work_kind"], "stationary whole-run-rate estimate")
         record["benchmark"]["host_duration_s"] = 15
         self.assertIn("host_device_duration_disagreement", analyze_trial(record)["issues"])
 
@@ -161,7 +187,7 @@ class AnalysisTests(unittest.TestCase):
         trial = analyze_trial(record)
         self.assertEqual(trial["memory_rail_incremental_power_w"], 20)
         self.assertEqual(trial["memory_rail_incremental_energy_j"], 160)
-        self.assertTrue(trial["target_verified"])
+        self.assertFalse(trial["target_verified"], "A caller's boolean is not numeric counter evidence")
 
     def test_repeated_configuration_medians_not_lucky_minima(self):
         records = []
@@ -212,6 +238,8 @@ class AnalysisTests(unittest.TestCase):
         for index in range(3):
             control = synthetic_trial("control", active_power=70, repeat=index)
             control["benchmark"].update(operations=0, logical_bytes=0)
+            for epoch in control["benchmark"]["measure_epochs"]:
+                epoch.update(operations=0, logical_bytes=0)
             latency = synthetic_trial("l2_latency", active_power=80, repeat=index + 3)
             latency["benchmark"]["latency_probe"] = {"enabled": True, "per_sm": {"0": {"loads": 1200, "cycles": 12000, "cycles_per_access": 10}}}
             records.extend((control, latency, synthetic_trial(repeat=index + 6)))
@@ -247,7 +275,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(trial["active_minus_idle_state_deltas"]["idle_pre"]["graphics_clock_mhz"], 900)
         record = synthetic_trial("l2")
         record["validation"] = {"memory_target_verified": True}
-        self.assertTrue(analyze_trial(record)["dynamic_attribution_eligible"])
+        self.assertFalse(analyze_trial(record)["dynamic_attribution_eligible"], "Manual target flags cannot establish attribution eligibility")
 
     def test_offset_stride_and_repeat_keys_group_correctly(self):
         a, b, c = [synthetic_trial("l2", repeat=i) for i in range(3)]
@@ -274,6 +302,106 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(trial["duration_s"], 10)
         with self.assertRaises(ValueError):
             summarize([], throughput_fraction=1.1)
+
+    def test_matching_epoch_counts_exclude_boundary_throughput_transients(self):
+        record = synthetic_trial(throughput=100e12)
+        for epoch in record["benchmark"]["measure_epochs"]:
+            if epoch["start_s"] < 8 or epoch["start_s"] >= 16:
+                epoch["operations"] = 300e12
+        record["benchmark"]["operations"] = sum(epoch["operations"] for epoch in record["benchmark"]["measure_epochs"])
+        trial = analyze_trial(record)
+        self.assertTrue(trial["valid"], trial["issues"])
+        self.assertEqual(trial["throughput_ops_s"], 100e12)
+        self.assertEqual(trial["counted_measure_operations"], 800e12)
+        self.assertEqual(trial["pj_per_op"], 1)
+        self.assertTrue(trial["count_energy_time_alignment_exact"])
+
+    def test_malformed_or_duplicated_epochs_are_rejected(self):
+        record = synthetic_trial()
+        record["benchmark"]["measure_epochs"].append(copy.deepcopy(record["benchmark"]["measure_epochs"][0]))
+        self.assertIn("overlapping_measure_epochs", analyze_trial(record)["issues"])
+        record = synthetic_trial()
+        record["benchmark"]["measure_epochs"][4]["operations"] = float("nan")
+        self.assertIn("invalid_measure_epoch_count:operations", analyze_trial(record)["issues"])
+
+    def test_numeric_profile_is_recomputed_and_must_match_binary(self):
+        from test_ncu_validation import change
+        from powermodeling.validation import L2_READ_HITS
+        record = verified_profile(synthetic_trial("l2"))
+        trial = analyze_trial(record)
+        self.assertTrue(trial["target_verified"], trial["ncu_assessment"]["reasons"])
+        self.assertTrue(trial["verified_selection_eligible"])
+        self.assertTrue(trial["dynamic_attribution_eligible"])
+        change(record["validation"]["profiler_evidence"], L2_READ_HITS, 0)
+        record["validation"]["memory_target_verified"] = True
+        self.assertEqual(analyze_trial(record)["ncu_status"], "fail")
+        record = verified_profile(synthetic_trial("l2"))
+        record["provenance"]["benchmark_sha256"] = "b" * 64
+        self.assertFalse(analyze_trial(record)["target_verified"])
+
+    def test_verified_peak_coverage_reports_unprofiled_faster_conditions(self):
+        records = []
+        for index in range(3):
+            records.append(verified_profile(synthetic_trial("l2", throughput=80, repeat=index)))
+            unprofiled = verified_profile(synthetic_trial("l2", throughput=100, repeat=index))
+            unprofiled["config"]["blocks"] = 160
+            unprofiled["validation"] = {}
+            records.append(unprofiled)
+        summary = summarize(records)
+        self.assertEqual(summary["verified_target_within_clock_best"], [])
+        coverage = next(item for item in summary["verified_target_coverage"] if item["scope"] == "within_clock")
+        self.assertAlmostEqual(coverage["verified_peak_coverage_fraction"], .8)
+        self.assertEqual(coverage["verified_high_throughput_groups"], 0)
+        self.assertIn("no_verified_condition", coverage["selection_status"])
+
+    def test_unknown_process_inventory_is_not_empty_inventory(self):
+        record = synthetic_trial()
+        record["phases"]["idle_pre"]["samples"][10]["graphics_processes"] = None
+        self.assertIn("missing_process_inventory:graphics_processes", analyze_trial(record)["issues"])
+
+    def test_seed_and_binary_are_separate_conditions_and_duplicate_ids_not_repeats(self):
+        a = synthetic_trial("hbm", repeat=0)
+        b = synthetic_trial("hbm", repeat=1)
+        a["config"]["seed"], b["config"]["seed"] = 2026, 2027
+        self.assertEqual(len(summarize([a, b], min_repeats=1)["groups"]), 2)
+        b["config"]["seed"] = 2026
+        b["provenance"] = {"benchmark_sha256": "different-binary"}
+        self.assertEqual(len(summarize([a, b], min_repeats=1)["groups"]), 2)
+        summary = summarize([a, copy.deepcopy(a), copy.deepcopy(a)])
+        self.assertEqual(summary["groups"][0]["valid_repeats"], 1)
+        self.assertEqual(summary["within_clock_best"], [])
+        self.assertEqual(len(summary["duplicate_trial_ids_ignored"]), 2)
+
+    def test_uncontrolled_clocks_cannot_win_fair_comparison(self):
+        records = [synthetic_trial(repeat=index) for index in range(3)]
+        for record in records:
+            record["config"].update(graphics_clock_mhz=None, memory_clock_mhz=None)
+        summary = summarize(records)
+        self.assertEqual(summary["within_clock_best"], [])
+        self.assertEqual(summary["cross_clock_best"], [])
+        self.assertEqual(len(summary["uncontrolled_clock_exploratory_best"]), 1)
+        records[2]["phases"]["measure"]["samples"] = [dict(sample, graphics_clock_mhz=1250) for sample in records[2]["phases"]["measure"]["samples"]]
+        self.assertEqual(len(summarize(records)["groups"]), 2)
+
+    def test_nonfinite_policy_cannot_disable_quality_checks(self):
+        with self.assertRaises(ValueError):
+            AnalysisPolicy(max_sample_gap_s=float("nan"))
+
+    def test_baseline_matching_requires_complete_stable_idle_clock_samples(self):
+        record = verified_profile(synthetic_trial("l2"))
+        record["phases"]["idle_pre"]["samples"][10]["graphics_clock_mhz"] = 300
+        trial = analyze_trial(record)
+        self.assertTrue(trial["valid"], trial["issues"])
+        self.assertFalse(trial["baseline_clock_matched"])
+        self.assertFalse(trial["dynamic_attribution_eligible"])
+
+    def test_missing_active_clock_samples_and_negative_idle_sensor_are_rejected(self):
+        record = synthetic_trial()
+        record["phases"]["measure"]["samples"][12]["graphics_clock_mhz"] = None
+        self.assertIn("missing_clock_telemetry:graphics_clock_mhz", analyze_trial(record)["issues"])
+        record = synthetic_trial()
+        record["phases"]["idle_pre"]["samples"][12]["power_w"] = -1
+        self.assertIn("negative_power:idle_pre", analyze_trial(record)["issues"])
 
 
 if __name__ == "__main__":

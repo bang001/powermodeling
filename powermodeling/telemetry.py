@@ -41,6 +41,14 @@ def _number(value: Any) -> float:
     return result
 
 
+def _integer(value: Any) -> int:
+    """Validate counters without converting their potentially large integers to float."""
+    result = int(value)
+    if isinstance(value, bool) or result < 0 or result != value:
+        raise ValueError(f"Invalid nonnegative integer telemetry value: {value!r}")
+    return result
+
+
 class NvmlDevice:
     """Select a physical NVML device by exact UUID (preferred) or NVML index.
 
@@ -86,9 +94,13 @@ class NvmlDevice:
 
     def call(self, name: str, *args: Any) -> Any:
         """Call a backend function under the per-device telemetry lock."""
-        with self._lock:
+        if not self._lock.acquire(timeout=1):
+            raise TelemetryError("Another NVML query is still running; refusing concurrent driver access")
+        try:
             self._check_open()
             return getattr(self.nvml, name)(self.handle, *args)
+        finally:
+            self._lock.release()
 
     def _query(self, result: dict, key: str, function: str, *args: Any,
                transform=None) -> Any:
@@ -144,6 +156,10 @@ class NvmlDevice:
                     if error_class is not None:
                         raise error_class(code)
                     raise TelemetryError(f"NVML field returned error code {code}")
+                if hasattr(field, "fieldId") and int(field.fieldId) != getattr(self.nvml, field_name):
+                    raise TelemetryError("NVML returned a field with the wrong field ID")
+                if hasattr(field, "scopeId") and int(field.scopeId) != scope_id:
+                    raise TelemetryError("NVML returned a field with the wrong power scope")
                 value_type = int(field.valueType)
                 member = {
                     getattr(self.nvml, "NVML_VALUE_TYPE_DOUBLE", 0): "dVal",
@@ -158,7 +174,9 @@ class NvmlDevice:
                 result["field_metadata"][key] = {
                     "field": field_name, "scope": scope_label, "scope_id": scope_id,
                     "timestamp_us": int(field.timestamp),
+                    "timestamp_clock": "unix_epoch_microseconds",
                     "latency_us": int(field.latencyUsec),
+                    "semantics": "one_second_average" if "average" in key else "driver_instantaneous",
                 }
                 self.capabilities[key] = {"available": True, "field": field_name, "scope": scope_label}
             except Exception as exc:
@@ -177,6 +195,7 @@ class NvmlDevice:
         with self._lock:
             self._check_open()
             start = time.monotonic()
+            realtime_start = time.time()
             result: dict[str, Any] = {"uuid": self.uuid, "errors": {}, "field_metadata": {}}
             self._query(result, "power_w", "nvmlDeviceGetPowerUsage", transform=lambda v: _number(v) / 1000)
             self._power_fields(result)
@@ -191,9 +210,9 @@ class NvmlDevice:
             sm_clock = getattr(self.nvml, "NVML_CLOCK_SM", 1)
             memory = getattr(self.nvml, "NVML_CLOCK_MEM", 2)
             temperature = getattr(self.nvml, "NVML_TEMPERATURE_GPU", 0)
-            self._query(result, "graphics_clock_mhz", "nvmlDeviceGetClockInfo", graphics, transform=int)
-            self._query(result, "sm_clock_mhz", "nvmlDeviceGetClockInfo", sm_clock, transform=int)
-            self._query(result, "memory_clock_mhz", "nvmlDeviceGetClockInfo", memory, transform=int)
+            self._query(result, "graphics_clock_mhz", "nvmlDeviceGetClockInfo", graphics, transform=_integer)
+            self._query(result, "sm_clock_mhz", "nvmlDeviceGetClockInfo", sm_clock, transform=_integer)
+            self._query(result, "memory_clock_mhz", "nvmlDeviceGetClockInfo", memory, transform=_integer)
             self._query(result, "temperature_c", "nvmlDeviceGetTemperature", temperature, transform=int)
             self._query(result, "pstate", "nvmlDeviceGetPerformanceState", transform=int)
             throttle_api = ("nvmlDeviceGetCurrentClocksEventReasons"
@@ -209,26 +228,34 @@ class NvmlDevice:
             self._query(result, "enforced_power_limit_w", "nvmlDeviceGetEnforcedPowerLimit", transform=lambda v: _number(v) / 1000)
             self._query(result, "compute_processes", "nvmlDeviceGetComputeRunningProcesses", transform=self._processes)
             self._query(result, "graphics_processes", "nvmlDeviceGetGraphicsRunningProcesses", transform=self._processes)
+            self._query(result, "mps_compute_processes", "nvmlDeviceGetMPSComputeRunningProcesses", transform=self._processes)
             end = time.monotonic()
             result.update(t_s=(start + end) / 2, query_start_s=start,
-                          query_end_s=end, query_duration_s=end - start)
+                          query_end_s=end, query_duration_s=end - start,
+                          query_realtime_start_s=realtime_start,
+                          query_realtime_end_s=time.time())
+            fatal_codes = {getattr(self.nvml, name, default) for name, default in (
+                ("NVML_ERROR_UNINITIALIZED", 1), ("NVML_ERROR_GPU_IS_LOST", 15),
+                ("NVML_ERROR_RESET_REQUIRED", 16), ("NVML_ERROR_LIB_RM_VERSION_MISMATCH", 18))}
+            result["fatal_errors"] = {key: value for key, value in result["errors"].items()
+                                      if value.get("code") in fatal_codes}
             return result
 
     sample = read_sample
 
     @staticmethod
     def _energy(value: Any) -> int:
-        result = int(value)
-        if result < 0:
-            raise ValueError("Energy counter must be a nonnegative integer")
-        return result
+        return _integer(value)
 
     def _processes(self, processes: Any) -> list[dict[str, Any]]:
         unavailable = getattr(self.nvml, "NVML_VALUE_NOT_AVAILABLE", (1 << 64) - 1)
         result = []
         for process in processes:
             used = getattr(process, "usedGpuMemory", None)
-            result.append({"pid": int(process.pid), "used_gpu_memory_bytes": None if used in (None, unavailable) else int(used)})
+            pid = _integer(process.pid)
+            if pid == 0:
+                raise ValueError("NVML process inventory must contain positive process IDs")
+            result.append({"pid": pid, "used_gpu_memory_bytes": None if used in (None, unavailable) else _integer(used)})
         return result
 
     def _throttle_names(self, value: int) -> list[str]:
@@ -280,7 +307,13 @@ class NvmlDevice:
         return result
 
     def close(self) -> None:
-        with self._lock:
+        # Do not block on a stuck native NVML query while trying to close a
+        # still-active sampler. Native calls cannot be safely killed in Python.
+        if self._active_samplers:
+            raise TelemetryError("Stop all telemetry samplers before closing the device")
+        if not self._lock.acquire(timeout=1):
+            raise TelemetryError("NVML query is still running; device cannot be closed safely")
+        try:
             if self._closed:
                 return
             if self._active_samplers:
@@ -294,6 +327,8 @@ class NvmlDevice:
                     self.nvml.nvmlShutdown()
                 else:
                     _sessions[key] = count - 1
+        finally:
+            self._lock.release()
 
     def __enter__(self):
         return self
@@ -320,6 +355,7 @@ class Sampler:
         self._samples_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._attached = False
+        self._started = threading.Event()
         self.error: dict | None = None
 
     @property
@@ -328,8 +364,12 @@ class Sampler:
             return list(self._samples)
 
     def _append(self, sample: dict) -> None:
+        if not isinstance(sample, dict) or not math.isfinite(float(sample.get("t_s", float("nan")))):
+            raise TelemetryError("NVML sampler received a malformed or non-finite sample timestamp")
         with self._samples_lock:
             self._samples.append(sample)
+        if sample.get("fatal_errors"):
+            raise TelemetryError(f"Fatal NVML device error: {sample['fatal_errors']}")
 
     def start(self):
         if self._thread is not None:
@@ -339,7 +379,6 @@ class Sampler:
             self.device._active_samplers += 1
             self._attached = True
         try:
-            self._append(self.device.read_sample())
             self._thread = threading.Thread(target=self._run, name="nvml-telemetry", daemon=True)
             self._thread.start()
         except Exception:
@@ -347,11 +386,18 @@ class Sampler:
                 self.device._active_samplers -= 1
                 self._attached = False
             raise
+        if not self._started.wait(timeout=10):
+            self._stop.set()
+            raise TelemetryError("Initial NVML query did not finish; stop further experiments")
+        if self.error:
+            raise TelemetryError(f"Initial NVML sample failed: {self.error}")
         return self
 
     def _run(self) -> None:
-        deadline = time.monotonic() + self.interval_s
         try:
+            self._append(self.device.read_sample())
+            self._started.set()
+            deadline = time.monotonic() + self.interval_s
             while not self._stop.wait(max(0.0, deadline - time.monotonic())):
                 self._append(self.device.read_sample())
                 now = time.monotonic()
@@ -359,23 +405,27 @@ class Sampler:
                 deadline += self.interval_s
                 if deadline <= now:
                     deadline = now + self.interval_s
-        except Exception as exc:
+            # Final bracketing query stays on the worker so stop() can time out
+            # even when the driver's final query hangs.
+            self._append(self.device.read_sample())
+        except BaseException as exc:
             self.error = _error(exc)
-
-    def stop(self) -> list[dict]:
-        if self._thread is None:
-            raise TelemetryError("Sampler has not been started")
-        self._stop.set()
-        self._thread.join(timeout=10)
-        if self._thread.is_alive():
-            raise TelemetryError("NVML sampler did not stop; device must remain open until its query finishes")
-        if self._attached:
-            try:
-                self._append(self.device.read_sample())
-            finally:
+        finally:
+            self._started.set()
+            if self._attached:
                 with self.device._lock:
                     self.device._active_samplers -= 1
                     self._attached = False
+
+    def stop(self, timeout_s: float = 10) -> list[dict]:
+        if self._thread is None:
+            raise TelemetryError("Sampler has not been started")
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("Sampler shutdown timeout must be finite and positive")
+        self._stop.set()
+        self._thread.join(timeout=timeout_s)
+        if self._thread.is_alive():
+            raise TelemetryError("NVML sampler did not stop; device must remain open until its query finishes")
         if self.error:
             raise TelemetryError(f"NVML sampler failed: {self.error}")
         return self.samples

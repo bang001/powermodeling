@@ -169,8 +169,10 @@ def clock_context(
     try:
         if method == "applications":
             if graphics_mhz != previous["graphics"] or memory_mhz != previous["memory"]:
-                device.call("nvmlDeviceSetApplicationsClocks", memory_mhz, graphics_mhz)
+                # A driver call can change policy and still report an error.
+                # Own restoration before attempting the mutation, not after it.
                 changed.append("applications")
+                device.call("nvmlDeviceSetApplicationsClocks", memory_mhz, graphics_mhz)
             # Read back policy; hardware under load may still throttle.
             graphics_type, memory_type = _clock_types(device)
             got_g = int(device.call("nvmlDeviceGetApplicationsClock", graphics_type))
@@ -179,13 +181,17 @@ def clock_context(
                 raise ClockError(f"Application clock readback differs: got {got_g}/{got_m} MHz")
         else:
             if memory_mhz is not None:
-                device.call("nvmlDeviceSetMemoryLockedClocks", memory_mhz, memory_mhz)
                 changed.append("memory")
+                device.call("nvmlDeviceSetMemoryLockedClocks", memory_mhz, memory_mhz)
             if graphics_mhz is not None:
-                device.call("nvmlDeviceSetGpuLockedClocks", graphics_mhz, graphics_mhz)
                 changed.append("graphics")
+                device.call("nvmlDeviceSetGpuLockedClocks", graphics_mhz, graphics_mhz)
         record["applied"] = True
         yield record
+    except BaseException as exc:
+        # Preserve setup/restoration evidence even when __enter__ never yields.
+        exc.clock_record = record
+        raise
     finally:
         failures = {}
         for domain in reversed(changed):
@@ -209,4 +215,6 @@ def clock_context(
         record["restored"] = not bool(failures)
         record["restore_errors"] = failures
         if failures:
-            raise ClockRestoreError(f"Clock policy restoration failed; stop further runs: {failures}")
+            error = ClockRestoreError(f"Clock policy restoration failed; stop further runs: {failures}")
+            error.clock_record = record
+            raise error

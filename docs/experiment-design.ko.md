@@ -54,7 +54,7 @@ flowchart TD
 | 워크로드 | 실험 설계 | 반드시 확인할 것 | 에너지에 함께 들어가는 것 |
 |---|---|---|---|
 | Tensor WMMA | 작은 타일을 한 번 준비하고 반복 MMA; 여러 독립 accumulator, warp/block 및 block 수 sweep | FP16 입력·FP32 누산, 연산이 제거되지 않음, tensor 명령이 실제 생성됨 | Tensor operand 전달, register file, instruction issue, 제어 및 최소 입출력 |
-| Tensor cuBLAS GEMM | 행렬 크기를 늘려 지속 dense FP16 GEMM을 실행 | `2MNK`, datatype, 누산, 라이브러리·툴킷, 실제 Tensor 경로와 수치 검증 | Tensor와 데이터 이동·캐시·HBM 전체 |
+| Tensor cuBLAS GEMM | 행렬 크기를 늘려 지속 dense FP16 GEMM을 실행 | `2MNK`, datatype, 누산, 라이브러리·툴킷, 실제 Tensor 경로·finite sample/checksum; 기준 결과와의 정확도 비교는 별도 | Tensor와 데이터 이동·캐시·HBM 전체 |
 | L1 | `ld.global.ca`로 block별 작은 working set을 반복 읽음 | resident block들의 총 working set, L1 hit 및 낮은 L2/DRAM 트래픽 | load/store unit, 주소 계산, register·L1·제어 |
 | L2 | `ld.global.cg`로 L1을 우회하고 L2보다 작은 working set을 반복 읽음 | L2 hit, DRAM bytes, L2 fabric 트래픽, partition 충돌 | L2+interconnect+SM의 load 발행/수신 |
 | HBM | `ld.global.cg`, L2보다 충분히 큰 working set, coalesced streaming | DRAM 실측 대역폭, L2 hit, 메모리·SM 클럭에 따른 plateau | HBM+controller+L2+interconnect+SM |
@@ -80,7 +80,7 @@ PTX의 `.ca`는 cache-all, `.cg`는 global-level caching의 힌트이다. `.cg`�
 | address offset | 정렬된 여러 offset | 주소에 따른 slice/partition 행동을 경험적으로 관찰 |
 | 데이터 | 재현되는 nonzero pseudo-random | zero-filled 데이터의 압축·낮은 토글 활동과 구분 |
 
-`KiB = 1,024 bytes`, `MiB = 1,048,576 bytes`이고, `GB/s = 10^9 bytes/s`이다. sector는 32 bytes, 일반 L1/L2 cache line은 128 bytes로 4 sectors이다. 32개 thread가 각각 정렬된 4-byte 원소를 연속 읽으면 요청량은 128 bytes이며 이상적인 sector 수는 4다. stride가 커지면 같은 logical bytes를 읽어도 많은 sectors가 움직일 수 있다. HBM stride sweep은 stride에 맞춰 할당 크기를 늘리고 전체 순환에서 방문할 수 있는 sector footprint가 최소 L2의 4배인지 검사한다. 가능한 주소 집합의 크기와 실제 실행에서 발생한 DRAM traffic은 다르므로 profiler 검증은 여전히 필요하다. cache throughput과 HBM bandwidth를 logical bytes만으로 비교하지 않는다. [S9]
+`KiB = 1,024 bytes`, `MiB = 1,048,576 bytes`이고, `GB/s = 10^9 bytes/s`이다. sector는 32 bytes, 일반 L1/L2 cache line은 128 bytes로 4 sectors이다. 32개 thread가 각각 정렬된 4-byte 원소를 연속 읽으면 요청량은 128 bytes이며 이상적인 sector 수는 4다. stride가 커지면 같은 logical bytes를 읽어도 많은 sectors가 움직일 수 있다. HBM stride sweep은 전체 stride cycle에서 가능한 sector footprint와 **한 launch가 유한한 iteration 동안 방문하는 footprint**를 구분한다. 주소 시작점이 같은 짧은 launch를 반복하면 큰 할당도 cache에 머물 수 있다. worker는 정확한 footprint 또는 상한임을 표시하고 주소 정렬·SM filter 한계를 기록한다. write/copy는 각 thread의 목적지 소유권을 겹치지 않게 유효 footprint를 조정한다. actual DRAM counter는 여전히 필요하며 cache throughput과 HBM bandwidth를 logical bytes만으로 비교하지 않는다. [S9]
 
 ## 5. 센서와 측정 시간
 
@@ -88,7 +88,9 @@ NVML 호출 이름이 같아도 평균 창이 다르다. 현재 공식 설명은
 
 기본 실험은 warmup 3초, 측정 12초, 전후 idle 각 6초, 50 ms polling, active 양 끝 2초 제외, 3회 반복이다. 50 ms마다 API를 부른다고 센서의 실제 갱신주기가 50 ms가 되지는 않는다. 평균 창을 비우기 위해 시작 이후 수초를 제외하고, 끝부분을 제외하여 shutdown·전이의 영향을 줄인다. 온도가 안정되지 않으면 warmup/측정 시간을 늘린다. 지속 작업으로 센서 갱신주기와 커널 실행의 우연한 위상 일치를 줄이고, 서로 다른 반복 길이에서도 추정값이 유지되는지 확인한다.
 
-측정 시계는 monotonic host clock을 쓰고, GPU 처리 시간도 CUDA event로 별도 측정한다. 전력의 시간범위와 맞추는 sustained throughput에는 host duration을 사용하며 CUDA event 기준 throughput도 진단값으로 기록한다. Python이 worker를 시작한 시점만으로 workload 시작을 추정하지 않는다. worker의 단계 메시지와 sensor timestamps를 맞춰 setup, warmup, active, cooldown을 분리한다. 누적 카운터의 endpoint 에너지가 trimmed 구간보다 넓은 구간을 덮을 경우 같은 값을 섞어서 비교하지 않는다.
+측정 시계는 monotonic host clock을 쓰고 CUDA event elapsed도 진단값으로 기록한다. CUDA event는 event 사이의 launch gap을 포함하므로 kernel busy time으로 이름 붙이지 않는다. worker는 약 1초 단위로 완료된 batch 수·SM admission 수와 host 시작/끝을 보고한다. 분석은 양 끝을 제외한 구간 안의 완전한 epoch만 선택해 **같은 시작/끝에서 work count와 에너지 적분**을 계산한다. 부분 batch를 비례 배분하지 않는다. admission counter의 readback overhead도 해당 시간에 포함해 기록한다. 과거 epoch 없는 결과는 whole-run rate의 정상 상태 가정에 따른 추정치이며 검증된 최적값에서 제외한다.
+
+Python의 process 시작 시점으로 active 시작을 추정하지 않고 worker 단계 메시지로 setup·warmup·active·idle을 구분한다. NVML sensor epoch timestamp와 host monotonic query midpoint는 다른 시계이므로 직접 비교하지 않는다. 누적 counter도 같은 구간에서 비교하고, 실패·누락 sensor를 0으로 바꾸지 않는다.
 
 memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보고한다. 동일 시각·평균창·포함 관계가 확인되지 않은 GPU와 memory 값을 단순히 더하거나 빼서 core rail을 확정하지 않는다. 최신 NVML에는 `NVML_POWER_SCOPE_MEMORY`가 있고, `nvidia-smi`는 GPU Memory Power Readings를 문서화한다. 공개 API의 존재는 개별 H100에서 지원된다는 보장이 아니다. [S2, S10]
 
@@ -105,7 +107,9 @@ memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보
 
 HBM에서는 memory clock을 고정한 뒤 SM clock을 올려 bandwidth가 포화되는 지점을 찾고, SM clock을 고정한 뒤 memory clock을 바꾼다. 낮은 SM clock에서 HBM bandwidth가 떨어지는 이유는 memory clock만이 아니라 load 발행량·주소 계산·interconnect·L2의 공급 능력일 수 있다. tensor·L1·L2도 클럭별 plateau를 따로 찾는다.
 
-각 층에서 반복 중앙값을 사용한다. 조건 `R >= 0.95 × R_max`를 만족하는 설정 중 증가분 pJ/unit가 가장 작은 설정과 전체 pJ/unit가 가장 작은 설정을 각각 선택한다. 두 기준의 선택 차이와 Pareto 경계를 함께 검토한다. `R_max`는 **실험에서 관찰한 최대값**이며 이론적 peak가 아니다. 반복 수·변동폭을 함께 확인하고, 좁은 차이를 물리적 최솟값이라고 단정하지 않는다.
+각 층에서 반복 중앙값을 사용한다. 조건 `R >= 0.95 × R_max`를 만족하는 설정 중 증가분 pJ/unit가 가장 작은 설정과 전체 pJ/unit가 가장 작은 설정을 각각 선택한다. 두 기준의 선택 차이와 Pareto 경계를 함께 검토한다. `R_max`는 **실험에서 관찰한 최대값**이며 이론적 peak가 아니다. 고정 클럭 비교와 요청 클럭 없는 DVFS 탐색은 분리하고 seed·binary·clock policy가 다른 결과를 같은 repeat로 합치지 않는다.
+
+verified 선택은 NCU 통과·같은 측정 구간의 정확한 work count·반복 품질을 요구한다. 95%의 분모는 미검증·target 실패 후보도 포함한 **전체 유효 고정 클럭 sweep의 최고 처리량**이다. 검증한 후보 중 최고 처리량만으로 기준을 낮추지 않는다. 검증된 후보가 전체 최고값의 95%에 도달하지 못하면 winner는 비워 두고 `verified_target_coverage`에 전체/검증된 peak·비율·미검증 또는 실패한 peak group을 남긴다. 반복 수·변동폭을 함께 확인하고 좁은 차이를 물리적 최솟값이라고 단정하지 않는다.
 
 클럭 변경에는 드라이버·권한 제한이 있을 수 있다. 실패를 조용히 기본 DVFS 실행으로 바꾸지 않고 명시한다. 커널이 없는 idle 구간에는 높은 요청 클럭에서도 hardware gating으로 실제 클럭이 내려갈 수 있다. 이런 기준은 requested-clock-matched reference이며, 모든 실험에서 실제 active idle 상태가 일치한다고 부르지 않는다. `baseline_clock_matched`와 `baseline_temperature_matched`로 idle와 active 상태의 일치를 별도 기록한다. `dynamic_attribution_eligible`는 품질·profiler·기준 상태의 전제조건이 충족되었는지를 나타내며 순수 physical dynamic의 분리 증명이 아니다. [S10]
 
@@ -119,23 +123,30 @@ HBM에서는 memory clock을 고정한 뒤 SM clock을 올려 bandwidth가 포�
 
 현재 도구의 locality 결과는 경험적 latency 지도다. 공개 CUDA API로 특정 GPC와 물리 L2 partition을 확정하여 고정하는 기능은 제공하지 않는다. 이 한계를 제거하려면 장치별 reverse engineering·추가 counters·실행 배치 검증이 필요하다.
 
-## 8. 별도 counter 검증
+## 8. NCU 적절성 판정과 분석 반영
 
-전력 실행과 Nsight Compute 실행을 분리한다. profiler는 replay, cache flushing, clock locking을 수행할 수 있으므로 그 실행에서 읽은 NVML 전력을 일반 실행 전력으로 섞으면 안 된다. 외부에서 클럭을 요청한 동일 조건으로 짧고 결정적인 workload를 profile하고 `--clock-control none`, `--cache-control none`을 사용한다. cache priming이 필요한 경우 application replay가 적합하다. 장치·버전에 따라 counter 이름이 다르므로 먼저 `ncu --query-metrics`로 확인한다. 검증 실행은 warmup batch 1개와 측정 batch 1개를 결정적으로 실행하며 custom kernel은 warmup launch를 건너뛰고 측정 launch 하나를 profile한다. pointer chase의 warmup 1회가 전체 working set을 cache에 올리기에 부족할 수 있으므로 actual hit와 DRAM bytes를 검토한 evidence만 연결한다. [S9]
+`NCU`는 NVIDIA Nsight Compute의 명령행 profiler이다. 전력 실행과 NCU 실행을 분리한다. replay와 계측 overhead가 있는 profile의 전력·실행시간을 energy trial 값으로 사용하지 않는다. 같은 UUID·condition·benchmark binary·요청 클럭에서 짧고 결정적인 workload를 실행하고 actual clocks를 확인한다. CUDA profiler start/stop으로 setup·initialization·warmup을 제외하고 실제 대상 launch만 profile한다. cuBLAS도 이 구간 안의 launch만 대상이다. `--profile-from-start off`, `--clock-control none`, `--cache-control none`, application replay를 쓰며 NCU CSV는 worker JSON과 별도 파일에 보존한다. counter 목록은 선택한 CUDA ordinal의 장치에서 조회한다. [S9, S16]
 
-| 대상 | 검증 항목 |
-|---|---|
-| Tensor | tensor pipe 활동·명령, SM 처리량, occupancy, register spills |
-| L1 | L1 sector hit, L2로 가는 miss, load requests·sectors |
-| L2 | L2 hit, DRAM bytes, L2 Fabric Total/지원 fabric metrics |
-| HBM | DRAM read/write bytes 및 대역폭, L2 hit와 압축 가능성 |
-| 모든 실험 | 실제 SM·memory clocks, throttling 사유, 일정한 온도, numerical/checksum 검증 |
+| 대상 | 자동 판단의 주된 근거 | 반드시 구분할 추가 검토 |
+|---|---|---|
+| Tensor | Tensor pipe 활동과 실제 SM clock | FP16 입력·FP32 누산 코드 정의·finite sample/checksum; 수치 정확도·spill/occupancy와 peak 활용률은 별도 |
+| L1 | L1 요청과 hit, 하위 L2·DRAM 이동 | L1 carveout·동시 상주 block·주소 재사용; generic texture hit와 global-load hit 구분 |
+| L2 | L2 요청과 hit, 실제 DRAM byte | sector당 32 bytes 변환; near/far는 SM·주소·fabric 지도 필요 |
+| HBM | DRAM read/write byte와 L2 요청·hit | physical/logical byte 차이·stride coalescing·데이터 압축 |
+| 공통 | 대상 launch·metric 단위·counter 유효성·actual clocks | 동일 조건의 지속 전력 실행과 identity 일치 |
 
-warm cache 검증에서 default cache flushing을 쓰면 검증하려는 상태가 사라질 수 있다. 하지만 flushing을 껐다고 cache hit가 보장되는 것도 아니다. 결과를 먼저 보고 계층 attribution을 결정한다.
+자동 평가 결과는 `pass`, `fail`, `inconclusive`와 개별 check·사용 policy·계산한 traffic 지표를 보존한다. 필수 counter가 없거나 `n/a`, 유효하지 않은 단위·범위, 불충분한 clock evidence이면 판단을 유보한다. 명확한 기준 위반은 실패로 기록한다. threshold는 변경 가능한 본 프로젝트의 실험 정책이며 NVIDIA가 보장하는 물리 경계값이 아니다. 수동 `*_verified: true` 표시는 자동 판정을 덮어쓰지 못한다. evidence 연결 시와 분석 시 재평가한다.
+
+기본 read policy는 L1/L2 hit 95% 이상, L1 bypass hit 5% 이하, cache의 하위 byte/logical byte 0.10 이하를 요구한다. HBM은 read L2 hit 20% 이하·요청 방향의 DRAM/logical byte 0.75 이상·DRAM/L2 byte 0.75–1.25를 사용한다. sector inflation 0.90–8.25와 실제 클럭 오차/drift 3% 한계도 기록한다. local load/store sector가 있으면 register spill 또는 local-memory 경로가 함께 사용되므로 component isolation의 적절성은 실패한다. L2 write/copy residency는 read hit만으로 검증할 수 없어 현재 별도 policy 필요 상태로 남긴다. Tensor activity가 양수라는 경로 확인과 Tensor peak 활용률은 구분한다.
+
+실패와 미확정의 에너지 결과를 삭제하지 않는다. 일반 raw 결과에 상태·이유를 남기고 목표가 검증된 최적값 선택에서 제외한다. `pass`가 증명하는 것은 **관측 counter에서 의도한 데이터/연산 경로를 지배적으로 사용했다는 프로젝트 기준의 적절성**이다. 대역폭이 포화됐다는 증명은 clock/geometry sweep와 별도 plateau 판정, 높은 throughput에서의 최소 에너지는 반복과 95% 선정, 순수 회로 에너지는 rail·식별 가능한 모델 검증을 추가로 요구한다.
+
+warm cache 검증에서 flushing을 끄면 일반 실행 상태를 보존하기 쉽지만 hit를 보장하지는 않는다. warmup이 짧거나 SM 배치가 달라 실제 hit가 낮으면 해당 실행을 검증 통과로 처리하지 않는다. locality도 counter 자동 통과만으로 이름 붙이지 않고 독립적으로 검증한 지도와 함께 평가한다. 실제 metric·권한·NCU 지원 여부는 V100/A100/H100 각각에서 확인한다.
 
 ## 9. 공정한 비교를 위한 실험 환경
 
 - 동일한 CUDA toolkit·cuBLAS 버전을 가능하면 사용하고, 버전·컴파일 옵션·커널 SHA를 결과와 함께 보관한다. V100용 `sm_70`을 포함한 공통 비교에는 CUDA 12.x를 사용한다. CUDA 13.0에서 Volta의 offline compilation과 library support가 제거되었다. [S14]
+- NCU 역시 V100을 지원하는 버전이 필요하다. 공식 2025.2 지원 목록은 GV100·A100·H100을 포함하지만 2025.3부터 Volta를 제거했다. 공통 profiling에는 2025.2.x 등의 지원 버전을 지정하고 NCU 버전·driver 요구사항을 기록한다. CUDA compiler 지원과 profiler 지원은 다른 조건이다. [S17]
 - GPU UUID와 PCI bus ID를 기준으로 NVML과 CUDA worker가 같은 물리 장치를 선택하는지 확인한다. `CUDA_VISIBLE_DEVICES`는 worker의 ordinal을 재배치할 수 있다.
 - MIG(Multi-Instance GPU), MPS(Multi-Process Service), ECC(Error Correcting Code), 다른 GPU 프로세스, persistence 및 power cap 상태를 기록한다. 전체 GPU 모델 비교는 같은 자원 범위를 사용한다.
 - 냉각·팬·공기 온도, GPU 및 memory 온도, throttling 사유를 확인한다. 시작/끝 기준 전력의 차이가 크면 기준 subtraction과 최소값 해석을 보류한다.
@@ -150,7 +161,9 @@ warm cache 검증에서 default cache flushing을 쓰면 검증하려는 상태�
 
 이 식은 설계 형태이며 네 개의 microbenchmark 결과를 더하면 자동으로 물리적 전력이 복원된다는 뜻이 아니다. 각 workload는 공유 경로를 사용하고 상관된 counter를 만든다. 먼저 단일 workload의 **기준 대비 증가분 기울기**를 확인한다. 여러 블록을 함께 쓰는 모델은 각각의 활동을 독립적으로 변화시킨 calibration, counter 기반 특징, 설계 행렬의 rank/condition 점검, 알려지지 않은 mixed workload holdout 검증이 필요하다. 식별되지 않는 계수는 결과를 내지 않는다. idle baseline, active control, tensor와 memory 데이터가 서로 중복 집계되지 않게 정의한다. 현재 control은 별도 workload로 기록된다. 분석의 `active_control_associations`는 같은 장치·요청 클럭·block/thread·SM filter인 control을 설명용으로 연결하며, 명령어 구성이 다르므로 자동 차감하여 component 에너지로 해석하지 않는다.
 
-`fit`은 사용자가 명시적으로 준비한 활동률 feature rows에 대해 증가분 전력을 회귀한다. 미측정 feature를 0으로 자동 채우지 않는다. 별도 장치와 클럭 층을 섞는 모델, rank가 부족하거나 condition이 나쁜 설계는 거부한다. logical throughput만으로 fitting한 계수는 workload의 계수이며 순수 L1/L2/HBM 회로 계수가 아니다. 독립적인 mixed-workload validation이 통과하기 전에는 동시에 여러 활동을 쓰는 일반 애플리케이션의 예측을 허용하지 않는다. calibration 범위 밖 외삽은 별도로 다룬다. 현재 harness는 concurrent mixed workload의 실제 feature rows를 자동 수집하지 않으므로 사용자가 별도 측정·counter 검증으로 준비해야 한다.
+`fit`은 명시적으로 준비한 활동률 feature rows에 대해 증가분 전력을 회귀한다. 단위·counter/count source·logical/physical byte 정의·power provenance와 같은 GPU/고정 클럭 층을 요구한다. 분석 row는 NCU evidence를 다시 평가하고 정확한 work/energy 시간 정렬을 확인한다. 미측정 feature를 0으로 채우지 않으며 rank가 부족하거나 condition이 나쁜 설계는 거부한다. logical throughput으로 fitting한 계수는 workload의 계수이며 순수 L1/L2/HBM 회로 계수가 아니다.
+
+mixed 예측은 독립 holdout의 오차와 calibration 범위가 통과한 뒤, 통과 holdout feature들의 convex hull 안으로 제한한다. 이는 실제 검증 조건을 가중 평균하여 만들 수 있는 범위다. feature별 최소/최대의 사각형 전체가 검증됐다고 확대하지 않는다. holdout 하나는 같은 vector만 지지한다. 현재 harness는 concurrent mixed workload의 실제 feature rows를 자동 수집하지 않으므로 별도 측정·counter 검증이 필요하다.
 
 | 질문 | 계산 | 의미 |
 |---|---|---|

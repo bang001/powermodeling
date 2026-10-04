@@ -37,14 +37,18 @@ def numeric_expression(value, names):
         raise ValueError(f"Expected numeric value/expression, got {value!r}")
     if not math.isfinite(result) or result < 0 or result > 2**63-1:
         raise ValueError(f"Expression outside supported range: {value!r}")
+    if result != int(result):
+        raise ValueError(f"Parameter expression must evaluate to an integer, got {value!r}")
     return int(result)
 
 
 def _quantiles(values, quantiles):
-    values = sorted(set(int(x) for x in values))
+    if any(type(x) is not int or x <= 0 for x in values):
+        raise ValueError("Supported clock MHz values must be positive integers")
+    values = sorted(set(values))
     if not values:
         raise ValueError("Supported clocks unavailable; supply verified explicit clock_pairs")
-    if any(not 0 <= q <= 1 for q in quantiles):
+    if not isinstance(quantiles, list) or not quantiles or any(isinstance(q, bool) or not isinstance(q, (int, float)) or not math.isfinite(q) or not 0 <= q <= 1 for q in quantiles):
         raise ValueError("Clock quantiles must lie in [0,1]")
     return sorted({values[round(q * (len(values)-1))] for q in quantiles})
 
@@ -62,6 +66,8 @@ def resolve_clocks(config, supported):
             if graphics is not None and (type(graphics) is not int or graphics <= 0 or type(memory) is not int or memory <= 0):
                 raise ValueError("Clock MHz values must be positive integers")
             normalized.append({"graphics_mhz": graphics, "memory_mhz": memory})
+        if len({(p["graphics_mhz"], p["memory_mhz"]) for p in normalized}) != len(normalized):
+            raise ValueError("clock_pairs contains duplicates")
         return normalized
     sweep = config.get("clock_sweep", {})
     raw = supported.get("supported_pairs", supported.get("pairs", []))
@@ -80,14 +86,19 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
     seconds = float(config.get("seconds", 12))
     warmup = float(config.get("warmup_seconds", 3))
     idle = float(config.get("idle_seconds", 6))
-    repeats = int(config.get("repeats", 3))
+    repeats = config.get("repeats", 3)
     interval = float(config.get("sample_interval_s", 0.05))
-    if seconds < 10 or warmup < 1 or idle < 6 or repeats < 3 or not 0.005 <= interval <= 1:
+    if (any(not math.isfinite(value) for value in (seconds, warmup, idle, interval))
+            or type(repeats) is not int or seconds < 10 or warmup < 1 or idle < 6
+            or repeats < 3 or not 0.005 <= interval <= 1):
         raise ValueError("Energy experiments require seconds>=10, warmup>=1, idle>=6, repeats>=3 and sample interval 0.005..1s")
     clocks = resolve_clocks(config, supported_clocks or {})
     names = {"sm_count": int(device["sm_count"]), "l2_bytes": int(device["l2_bytes"]),
              "total_memory_bytes": int(device["total_memory_bytes"])}
+    if any(value <= 0 for value in names.values()):
+        raise ValueError("Discovered device capacities and SM count must be positive")
     trials = []
+    conditions = set()
     for spec in config["experiments"]:
         if stage and spec.get("stage", "saturation") != stage: continue
         workload = spec["workload"]
@@ -109,14 +120,56 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             blocks, threads = resolved.get("blocks", names["sm_count"]*2), resolved.get("threads", 256)
             if blocks < 1 or threads < 32 or threads > 1024 or threads % 32:
                 raise ValueError("blocks>=1 and threads must be a multiple of warp size32 within32..1024")
-            if workload == "l1" and resolved.get("access", "read") != "read":
+            if blocks > 1000000 or blocks > 2**31-1:
+                raise ValueError("blocks exceeds the benchmark practical limit of1000000")
+            access = resolved.get("access", "read")
+            if access not in ("read", "write", "copy"):
+                raise ValueError("access must be read, write or copy")
+            if workload in ("l1", "l2_latency") and access != "read":
                 raise ValueError("L1 experiment supports read only; stores are not equivalent L1 accesses")
             if resolved.get("stride_elements", 1) < 1 or resolved.get("iterations", 1) < 1:
                 raise ValueError("stride_elements and iterations must be positive")
-            ws = resolved.get("working_set_bytes", 1048576)
-            multiplier = 2 if resolved.get("access") == "copy" else 1
-            if ws * multiplier > names["total_memory_bytes"] * 0.7:
-                raise ValueError("Working set exceeds70% of device memory; reduce allocation")
+            if resolved.get("stride_elements", 1) > 2**32 or resolved.get("iterations", 1) > 2**32:
+                raise ValueError("stride_elements and iterations must be <=2^32")
+            if not 1 <= resolved.get("tensor_accumulators", 4) <= 8:
+                raise ValueError("tensor_accumulators must be within1..8")
+            if not 1 <= resolved.get("batch_launches", 1) <= 65536:
+                raise ValueError("batch_launches must be within1..65536")
+            if workload == "l2_latency" and resolved.get("stride_elements", 1) != 1:
+                raise ValueError("Dependent latency probes require stride_elements=1")
+            if "sm_ids" in resolved:
+                ids = resolved["sm_ids"]
+                if not isinstance(ids, list) or not ids or any(type(i) is not int or not 0 <= i < 4096 for i in ids) or len(set(ids)) != len(ids):
+                    raise ValueError("sm_ids must be a nonempty unique list of integers within0..4095")
+                if workload == "gemm":
+                    raise ValueError("cuBLAS GEMM cannot honor sm_ids")
+                # SM IDs are sparse hardware identifiers on some SKUs. They
+                # cannot be inferred merely from the enabled SM count.
+                known_ids = device.get("discovered_sm_ids")
+                if known_ids is not None and any(i not in known_ids for i in ids):
+                    raise ValueError("sm_ids includes an ID absent from the discovered hardware map")
+            if workload == "l1": default_ws = blocks * 16 * 1024
+            elif workload in ("l2", "l2_latency"): default_ws = max(4, names["l2_bytes"] // 8 * 4)
+            else: default_ws = max(512 * 1024 * 1024, names["l2_bytes"] * 8)
+            ws = resolved.get("working_set_bytes", default_ws)
+            offset = resolved.get("offset_bytes", 0)
+            if ws < 4 or ws % 4 or offset % 4:
+                raise ValueError("working_set_bytes and offset_bytes must be word-aligned (4bytes), with a nonempty working set")
+            if workload == "l1" and ws < blocks * 4:
+                raise ValueError("L1 working set must include at least one 4byte word per block")
+            if workload == "l2_latency" and ws // 4 > 2**32 - 1:
+                raise ValueError("Latency probe exceeds its32bit node index range")
+            if workload in ("l1", "l2", "l2_latency", "hbm"):
+                multiplier = 1 if access == "read" else 2
+                allocation = (ws + offset) * multiplier + blocks * threads * 4
+                if allocation > names["total_memory_bytes"] * 0.7:
+                    raise ValueError("Allocated working buffers including offset exceed70% of device memory")
+            if workload == "gemm":
+                m, n, k = (resolved.get(f"gemm_{axis}", 4096) for axis in ("m", "n", "k"))
+                if min(m, n, k) <= 0 or max(m, n, k) > 2**31 - 1:
+                    raise ValueError("GEMM dimensions must be positive signed32bit integers")
+                if 2 * m * k + 2 * k * n + 4 * m * n > names["total_memory_bytes"] * 0.7:
+                    raise ValueError("GEMM A/B/C allocations exceed70% of device memory")
             if workload == "hbm" and ws < names["l2_bytes"]*4:
                 raise ValueError("HBM requested footprint must be at least4x discovered L2; verify physical traffic separately")
             if workload == "hbm":
@@ -133,6 +186,9 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                              "seconds": seconds, "warmup_seconds": warmup, "idle_seconds": idle}
                 fingerprint={**condition,"benchmark_sha256":device.get("benchmark_sha256")}
                 condition_id = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
+                if condition_id in conditions:
+                    raise ValueError("Duplicate resolved experiment condition; remove duplicate grid values/specifications")
+                conditions.add(condition_id)
                 for repeat in range(repeats):
                     trials.append({**condition, "condition_id": condition_id, "repeat": repeat,
                                    "trial_id": f"{condition_id}-r{repeat}"})
@@ -155,5 +211,5 @@ def benchmark_command(executable, trial, device_index=0, profiling=False):
         if key == "sm_ids" and isinstance(value, list): value = ",".join(str(v) for v in value)
         command += ["--"+key.replace("_", "-"), str(value)]
     if profiling:
-        command += ["--batch-launches","1","--warmup-batches","1","--fixed-batches","1"]
+        command += ["--batch-launches","1","--warmup-batches","1","--fixed-batches","1", "--profile-region"]
     return command

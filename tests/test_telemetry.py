@@ -1,4 +1,6 @@
 import unittest
+import threading
+import time
 from types import SimpleNamespace
 
 from powermodeling.telemetry import NvmlDevice, Sampler, TelemetryError
@@ -122,6 +124,8 @@ class TelemetryTests(unittest.TestCase):
             meta = sample["field_metadata"]["memory_power_instant_w"]
             self.assertEqual(meta["scope"], "memory")
             self.assertEqual(meta["timestamp_us"], 987654321)
+            self.assertEqual(meta["timestamp_clock"], "unix_epoch_microseconds")
+            self.assertLessEqual(sample["query_realtime_start_s"], sample["query_realtime_end_s"])
             self.assertLessEqual(sample["query_start_s"], sample["t_s"])
             self.assertLessEqual(sample["t_s"], sample["query_end_s"])
 
@@ -171,6 +175,95 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual([s["t_s"] for s in samples], sorted(s["t_s"] for s in samples))
         self.assertEqual(sampler.stop(), samples)
         device.close()
+
+    def test_mismatched_nvml_field_identity_cannot_be_used_as_memory_power(self):
+        fake = FakeNvml(memory_supported=True)
+        original = fake.nvmlDeviceGetFieldValues
+        def wrong_scope(handle, fields):
+            values = original(handle, fields)
+            for value, (field_id, scope) in zip(values, fields):
+                value.fieldId = field_id
+                value.scopeId = fake.NVML_POWER_SCOPE_GPU
+            return values
+        fake.nvmlDeviceGetFieldValues = wrong_scope
+        with NvmlDevice(nvml_module=fake) as device:
+            sample = device.read_sample()
+            self.assertIsNone(sample["memory_power_w"])
+            self.assertIn("wrong power scope", sample["errors"]["memory_power_instant_w"]["message"])
+
+    def test_energy_counter_rejects_fractional_and_negative_values(self):
+        for value in (-1, 1.5, True):
+            fake = FakeNvml()
+            fake.energy = value
+            with self.subTest(value=value), NvmlDevice(nvml_module=fake) as device:
+                sample = device.read_sample()
+                self.assertIsNone(sample["energy_mj"])
+                self.assertIn("energy_mj", sample["errors"])
+
+    def test_fatal_gpu_lost_is_preserved_and_sampler_does_not_continue(self):
+        class GpuLost(RuntimeError):
+            value = 15
+        fake = FakeNvml()
+        def lost(handle):
+            raise GpuLost("GPU lost")
+        fake.nvmlDeviceGetPowerUsage = lost
+        device = NvmlDevice(nvml_module=fake)
+        sampler = Sampler(device, interval_s=0.001)
+        with self.assertRaisesRegex(TelemetryError, "Initial NVML sample failed"):
+            sampler.start()
+        with self.assertRaisesRegex(TelemetryError, "NVML sampler failed"):
+            sampler.stop()
+        self.assertEqual(len(sampler.samples), 1)
+        self.assertIn("power_w", sampler.samples[0]["fatal_errors"])
+        self.assertEqual(device._active_samplers, 0)
+        device.close()
+
+    def test_failed_final_bracket_is_bounded_worker_error_and_releases_device(self):
+        device = NvmlDevice(nvml_module=FakeNvml())
+        original = device.read_sample
+        count = 0
+        def fail_second():
+            nonlocal count
+            count += 1
+            if count > 1:
+                raise RuntimeError("final query failed")
+            return original()
+        device.read_sample = fail_second
+        sampler = Sampler(device, interval_s=1).start()
+        with self.assertRaisesRegex(TelemetryError, "final query failed"):
+            sampler.stop()
+        self.assertEqual(len(sampler.samples), 1)
+        self.assertEqual(device._active_samplers, 0)
+        device.close()
+
+    def test_stuck_native_query_cannot_block_stop_or_unsafe_close(self):
+        fake = FakeNvml()
+        entered, release = threading.Event(), threading.Event()
+        original = fake.nvmlDeviceGetPowerUsage
+        queries = 0
+        def block_second(handle):
+            nonlocal queries
+            queries += 1
+            if queries == 2:
+                entered.set()
+                release.wait(timeout=2)
+            return original(handle)
+        fake.nvmlDeviceGetPowerUsage = block_second
+        device = NvmlDevice(nvml_module=fake)
+        sampler = Sampler(device, interval_s=0.001).start()
+        try:
+            self.assertTrue(entered.wait(timeout=1))
+            started = time.monotonic()
+            with self.assertRaisesRegex(TelemetryError, "did not stop"):
+                sampler.stop(timeout_s=0.002)
+            with self.assertRaisesRegex(TelemetryError, "Stop all telemetry samplers"):
+                device.close()
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertNotIn("shutdown", fake.events)
+        finally:
+            release.set()
+            sampler.stop(timeout_s=1)
+            device.close()
 
 
 if __name__ == "__main__":

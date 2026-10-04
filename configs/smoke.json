@@ -1,0 +1,14 @@
+{
+  "description": "Uncontrolled-clock functional smoke check; not a fair fixed-clock architecture comparison.",
+  "seconds": 12, "warmup_seconds": 3, "idle_seconds": 6, "repeats": 3,
+  "sample_interval_s": 0.05,
+  "clock_pairs": [{"graphics_mhz": null, "memory_mhz": null}],
+  "experiments": [
+    {"workload": "control", "parameters": {"blocks": "sm_count*2", "threads": 256}},
+    {"workload": "tensor", "parameters": {"blocks": "sm_count*2", "threads": 256, "tensor_accumulators": 4}},
+    {"workload": "gemm", "parameters": {"gemm_m": 4096, "gemm_n": 4096, "gemm_k": 4096}},
+    {"workload": "l1", "parameters": {"blocks": "sm_count*2", "threads": 256, "working_set_bytes": "sm_count*2*16384"}},
+    {"workload": "l2", "parameters": {"blocks": "sm_count*2", "threads": 256, "working_set_bytes": "l2_bytes*0.5"}},
+    {"workload": "hbm", "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "max(l2_bytes*8,268435456)", "seed": 2026}}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "description": "Independent graphics/memory clock sweep; replace geometry with selected saturation conditions before comparing.",
+  "seconds": 12, "warmup_seconds": 3, "idle_seconds": 6, "repeats": 3,
+  "sample_interval_s": 0.05,
+  "clock_sweep": {"graphics_quantiles": [0.25, 0.6, 1.0], "memory_quantiles": [0.0, 1.0]},
+  "experiments": [
+    {"workload": "control", "stage": "dvfs", "parameters": {"blocks": "sm_count*4", "threads": 256}},
+    {"workload": "tensor", "stage": "dvfs", "parameters": {"blocks": "sm_count*4", "threads": 256, "tensor_accumulators": 4}},
+    {"workload": "gemm", "stage": "dvfs", "parameters": {"gemm_m": 4096, "gemm_n": 4096, "gemm_k": 4096}},
+    {"workload": "l1", "stage": "dvfs", "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "sm_count*4*16384"}},
+    {"workload": "l2", "stage": "dvfs", "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "l2_bytes*0.5"}},
+    {"workload": "hbm", "stage": "dvfs", "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "max(l2_bytes*8,268435456)", "seed": 2026}}
+  ]
+}

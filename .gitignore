@@ -1,0 +1,7 @@
+build/
+results/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+*.ncu-rep

@@ -128,7 +128,7 @@ function renderPlan(plan){const view=byId('plan-view');view.replaceChildren();co
 byId('plan-file').addEventListener('change',async event=>{try{renderPlan(await readJson(event.target.files[0],byId('plan-status')))}catch(error){byId('plan-view').hidden=true;setError(byId('plan-status'),error)}});
 let optima=[];
 function getOptima(summary){const fixed=Array.isArray(summary.empirical_gpu_energy_optima)?summary.empirical_gpu_energy_optima:[];const overall=Array.isArray(summary.empirical_gpu_overall_energy_optima)?summary.empirical_gpu_overall_energy_optima:[];return [...fixed.map(x=>({...x,_viewer_scope:'fixed_memory'})),...overall.map(x=>({...x,_viewer_scope:'across_memory'}))];}
-function keyLabel(entry){const s=entry.stratum||entry,mem=entry._viewer_scope==='across_memory'?'memory 전체 지원 domain':display(field(s,'memory_clock_mhz','memory_mhz'))+' MHz memory';return [field(s,'gpu_uuid'),field(s,'workload'),field(s,'access'),mem,field(entry,'objective')||field(s,'objective')].map(display).join(' · ');}
+function keyLabel(entry){const s=entry.stratum||entry,mem=entry._viewer_scope==='across_memory'?'측정한 memory domain 전체':display(field(s,'memory_clock_mhz','memory_mhz'))+' MHz memory';return [field(s,'gpu_uuid'),field(s,'workload'),field(s,'access'),mem,field(entry,'objective')||field(s,'objective')].map(display).join(' · ');}
 function metricCell(label,value){const m=el('div',undefined,'metric');m.append(el('div',label,'label'),el('div',value,'value'));return m;}
 const svgns='http://www.w3.org/2000/svg';
 function svgEl(tag,attrs,text){const x=document.createElementNS(svgns,tag);Object.entries(attrs||{}).forEach(([k,v])=>x.setAttribute(k,String(v)));if(text!==undefined)x.textContent=text;return x;}

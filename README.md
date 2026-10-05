@@ -146,7 +146,7 @@ python -m powermodeling attach-verification --input results/saturation --evidenc
 python -m powermodeling analyze --input results/verified --output results/verified-report
 ```
 
-기본 DVFS plan은 `--apply-clocks` 없이 profile한다. `locked` 방식의 복원 옵션은 `run`과 같다. `evaluate-profile`은 offline counter 판정이며, 측정 trial의 UUID·binary·effective parameter·클럭 일치까지 확인하는 최종 판정은 연결과 분석 시 수행한다. `--policy policy.json`으로 프로젝트 판정 기준을 바꿀 수 있으며, 평가에 사용한 기준도 결과에 보존된다. counter 이름·지원 범위는 세대 및 Nsight Compute 버전에 따라 다르므로 장치의 metric 목록을 먼저 조회한다.
+`null/null`인 무설정 current-policy trial은 `--apply-clocks` 없이 profile한다. DVFS sweep의 고정 클럭 trial은 전력 실행과 같은 `--apply-clocks` 및 clock method를 사용한다. `locked` 방식의 복원 옵션은 `run`과 같다. `evaluate-profile`은 offline counter 판정이며, 측정 trial의 UUID·binary·effective parameter·클럭 일치까지 확인하는 최종 판정은 연결과 분석 시 수행한다. `--policy policy.json`으로 프로젝트 판정 기준을 바꿀 수 있으며, 평가에 사용한 기준도 결과에 보존된다. counter 이름·지원 범위는 세대 및 Nsight Compute 버전에 따라 다르므로 장치의 metric 목록을 먼저 조회한다.
 
 | 목표 | 자동 판단에 사용하는 근거 | 해석 |
 |---|---|---|

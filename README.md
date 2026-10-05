@@ -1,8 +1,10 @@
 # NVIDIA GPU power modeling
 
-V100·A100·H100에서 **높은 지속 처리량을 유지하면서 가장 작은 연산·전송당 에너지**를 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM의 working set·thread/block·stride·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다.
+**SXM 모듈의 V100·A100·H100**에서 **충분히 활용한 조건의 실측 pJ/FLOP·pJ/bit 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM의 working set·thread/block·stride·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다.
 
-이 저장소에는 실측 GPU 숫자가 들어 있지 않다. `idle`은 실험 기준 전력이며 순수 누설 전력이 아니다. 보드 전체 전력에서 기준을 뺀 pJ/FLOP·pJ/logical-byte와, 지원되는 memory power scope를 구분해서 보고한다. cache/DRAM counter로 검증하기 전에는 목표 계층과 물리 회로 에너지를 동일시하지 않는다.
+SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter로 검증하기 전에는 목표 계층과 물리 회로 에너지를 동일시하지 않는다.
+
+[실험 설계 HTML](docs/experiment-design.html)은 treatment/reference 도식, 약 90 MHz clock coverage, 실제 plan·summary JSON의 로컬 뷰어를 제공한다. 서버 업로드 없이 사용할 수 있으며 문서 도식에는 실측 전력곡선이 없다.
 
 ## 제공 기능
 
@@ -12,9 +14,9 @@ V100·A100·H100에서 **높은 지속 처리량을 유지하면서 가장 작�
 | L1·L2·HBM | `.ca`/`.cg` load, working set·grid·thread·stride·주소 offset·read/copy sweep |
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
 | 전력 측정 | capability 기반 NVML 평균/현재/누적에너지, 지원되는 memory scope, raw timestamps·오류 |
-| 시간·기준 | CUDA 컨텍스트를 유지한 전후 idle, warmup, multi-second active 구간, trimmed 적분 |
-| 클럭·DVFS | 지원 clock pair 탐색, 요청·실제 클럭 비교, 권한 실패와 throttling 기록, 원래 정책 복원 |
-| 분석 | repeat 중앙값·bootstrap 구간, 최대 처리량의 95% 이상에서 최소 전체/증가분 에너지, Pareto 경계, idle 비율 |
+| 시간·기준 | 같은 context·버퍼·clock policy의 전후 idle 및 AB/BA paired active reference, arm별 warmup·완료 epoch의 정렬 적분 |
+| 클럭·DVFS | 지원 pair 안의 약 90 MHz graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
+| 분석 | GPU UUID별 전체·idle 증가분·paired-reference 단가 최소와 이산 근접 측정점·bootstrap 구간; 주파수별 활용 조건과 전체 최고 성능 제약을 분리 |
 | 모델 | 명시적 활동률 특징, rank/condition 검사, 다른 GPU·클럭 층 분리, mixed holdout 검증 |
 | 검증 | Nsight Compute counter를 자동 판정하고 분석에 반영; `pass`/`fail`/`inconclusive` 및 근거 보존 |
 
@@ -69,13 +71,19 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 | [configs/dvfs.json](configs/dvfs.json) | memory×SM clock 도메인의 bandwidth plateau와 효율 탐색 |
 | [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
 
-JSON의 `clock_pairs`로 실측 장치가 지원하는 `(graphics_mhz, memory_mhz)`를 명시하거나, `clock_sweep`으로 지원 목록의 상대 단계를 선택할 수 있다. `sm_count`, `l2_bytes`, `total_memory_bytes`를 쓰는 숫자 표현식은 장치의 조회값으로 해석된다. `blocks = sm_count × 2`는 작업량 지정이며 정확히 각 SM에 2 blocks를 배치하는 명령이 아니다.
+JSON의 `clock_pairs`로 실측 장치가 지원하는 `(graphics_mhz, memory_mhz)`를 명시할 수 있다. **`configs/dvfs.json`은 `graphics_step_mhz: 90`으로 모든 광고된 memory domain에서 약 90 MHz graphics grid를 만든다.** 이전 quantile 선택은 이 간격을 보장하지 않았다. `saturation.json`과 `locality.json`의 quantile은 geometry/latency 탐색 단계이며 90 MHz frequency sweep로 표시하지 않는다. 지원 범위 끝점, exact 1110 MHz(지원 domain), advertised default 고정 pair와 무설정 current-policy reference를 포함하고, 미지원/미조회 사유와 실제 간격은 `plan.clock_sweep_coverage`에 남긴다. 1110 미지원일 때 근사 주파수로 대체하지 않는다. current-policy reference는 이전 applications/locked 정책이 있을 수 있어 factory default라고 확정하지 않는다. `sm_count`, `l2_bytes`, `total_memory_bytes`를 쓰는 숫자 표현식은 장치의 조회값으로 해석된다. `blocks = sm_count × 2`는 작업량 지정이며 정확히 각 SM에 2 blocks를 배치하는 명령이 아니다.
 
 DVFS 설정의 geometry는 예제 시작점이다. saturation 결과에서 확인한 block/thread·working set을 `configs/dvfs.json`에 반영한 뒤 주파수 도메인을 검토한다. 전체 격자는 수시간 걸릴 수 있으므로 plan의 trial 수와 예상 시간을 확인한다.
 
 HBM stride 실험은 stride가 커질 때 전체 할당 크기도 늘리고 순환 접근의 가능한 sector footprint를 검사한다. worker는 한 launch가 유한한 iteration 동안 실제로 방문할 수 있는 footprint와 전체 stride cycle의 footprint를 구분한다. 짧은 launch가 같은 작은 주소 집합을 반복하면 큰 할당이어도 cache 실험이 될 수 있으므로 DRAM counter가 필요하다. write/copy는 thread 간 주소 소유권이 겹치지 않도록 유효 크기를 조정하고 실제 사용 크기를 결과에 기록한다.
 
-기본 에너지 실험은 측정 12초, warmup 3초, 전후 idle 각각 6초, 50 ms polling, 3회 반복이다. 분석은 active 양 끝 2초 및 idle 양 끝 1초를 제외한다. 50 ms polling이 센서의 50 ms 갱신을 뜻하지 않는다. config에서 실험 시간을 늘릴 수 있다.
+기본 custom Tensor·L1·L2·HBM 에너지 실험은 초기 target warmup 3초, 전후 idle 각각 6초, reference/treatment 각 arm warmup 3초·측정 12초, 50 ms polling, 기본 4회 반복이다. 각 arm은 최소 10초 이상 측정하며, 완전히 균형 잡힌 AB/BA 순서는 짝수 4회 이상 반복을 권장한다. odd 반복은 순서 imbalance를 진단에 남기며 paired 최적점에는 동일한 유효 AB/BA 수를 요구한다. 기본 cuBLAS GEMM은 대응 geometry가 불명확하여 unpaired이며 전체·idle 기준으로 읽는다. 분석은 각 active arm 양 끝 2초 및 idle 양 끝 1초를 제외한다. 50 ms polling이 센서의 50 ms 갱신을 뜻하지 않는다. config에서 실험 시간을 늘릴 수 있다.
+
+## Treatment·idle·active reference
+
+Treatment는 측정하려는 대상 작업이다. `paired_reference: true`인 custom workload는 같은 worker process·context·할당·clock policy에서 issue-loop `control`을 AB/BA 순서로 짝지어 실행한다. grid/thread·loop·SM filter·batch 설정과 actual clocks·온도·cap·간섭을 검사하며, 각 arm의 에너지와 완료 count를 독립적으로 정렬한다. control도 정수 연산·제어·launch·store 전력을 쓰므로 두 arm의 차이는 operational contrast다.
+
+전후 idle는 active 시점에 보간하고 drift·actual clock·온도를 검사한다. baseline가 실패해도 treatment 전체 에너지의 품질 판정은 보존한다. 미승인 차감값과 음의 대비는 진단값으로 남기지만 승인된 최적점 후보로 사용하지 않는다. 전체 에너지, 승인된 idle 증가분, 승인된 paired 대비를 서로 대체하지 않으며 순수 static/dynamic·회로 에너지로 이름 붙이지 않는다. 이전 plan/결과와 새 paired protocol을 같은 repeat로 합치지 않는다.
 
 ## 결과 읽기
 
@@ -86,8 +94,13 @@ HBM stride 실험은 stride가 커질 때 전체 할당 크기도 늘리고 순�
 | `board_power_w` | 측정 구간의 NVML GPU scope 평균 전력 |
 | `idle_power_w` | 전후 idle 구간으로 보간한 기준 전력 |
 | `incremental_power_w` | 전체 GPU 전력의 기준 대비 증가분; 순수 block dynamic이 아님 |
-| `pj_per_op`, `total_pj_per_op` | 기준 대비 / 전체 pJ/FLOP; Tensor에서 FMA를 2 FLOP으로 계산 |
-| `pj_per_logical_byte`, `total_pj_per_logical_byte` | 기준 대비 / 전체 요청 바이트당 에너지; 물리 traffic과 구분 |
+| `total_pj_per_flop`, `total_pj_per_logical_bit` | 전체 GPU 단가. FMA=2 FLOP, logical bit=요청 byte×8 |
+| `operational_idle_increment_pj_per_flop`, `operational_idle_increment_pj_per_logical_bit` | 전후 idle 대비 증가분 단가; 승인 여부와 함께 읽음 |
+| `paired_active_reference_pj_per_flop`, `paired_active_reference_pj_per_logical_bit` | 같은 process의 짝지은 control 대비 단가; 물리 component isolation이 아님 |
+| `baseline_valid`, `baseline_issues`, `operational_idle_increment_eligible` | 전후 idle 품질과 실제 상태 일치에 따라 증가분 최적점 사용을 승인 |
+| `paired_active_reference_eligible`, `paired_active_reference_issues` | arm별 geometry·시간 정렬·actual clock·온도·cap·간섭·protocol 검사 |
+| `paired_reference_order_counts` | group의 AB/BA 유효 반복 수. 두 순서의 수가 같아야 paired 최적점 승인 |
+| 기존 `pj_per_op`, `pj_per_logical_byte` | legacy alias; `metric_aliases`와 실제 FLOP/byte 정의를 함께 읽음 |
 | `memory_rail_*` | 지원되는 memory scope의 관측값; 미지원이면 null |
 | `tensor_peak_tflops_at_achieved_clock` | 실제 SM 개수·실측 MHz로 계산한 dense FP16 issue ceiling |
 | `tensor_utilization_vs_dense_clock_peak` | 측정 TFLOP/s / 해당 클럭의 dense peak |
@@ -102,14 +115,18 @@ HBM stride 실험은 stride가 커질 때 전체 할당 크기도 늘리고 순�
 | `energy_per_work_kind` | 같은 구간의 실제 count 기반 단가인지, 과거 whole-run rate를 이용한 추정인지 |
 | `verified_selection_eligible` | 품질·NCU 통과·같은 구간의 정확한 work count가 최적값 선택에 충분한지 |
 | `uncontrolled_clock_exploratory_best` | 기본 DVFS 결과의 탐색용 최적값; 고정 클럭 비교와 별도 |
-| `within_clock_best`, `cross_clock_best` | 관찰된 최고 처리량의 95% 이상 조건에서 최저 증가분 단가 |
+| `within_clock_best`, `cross_clock_best` | 같은 clock/전체 clock 관측 최고 처리량의 95% 이상 조건에서 최저 승인된 증가분 단가 |
 | `within_clock_best_total_energy`, `cross_clock_best_total_energy` | 95% 처리량 조건에서 최소 전체 에너지 단가의 설정 |
 | `pareto_frontiers` | 더 높은 처리량과 더 낮은 전력으로 동시에 개선할 수 없는 관측 설정 |
-| `active_control_associations` | UUID·클럭·grid/thread·SM filter가 같은 control과의 설명용 연결; 자동 전력 차감은 하지 않음 |
+| `active_control_associations` | 별도로 실행한 control과의 설명용 연결; same-process paired arm과 다르며 자동 component 차감에 사용하지 않음 |
+| `empirical_gpu_energy_optima` | GPU UUID·작업·access·고정 memory MHz·objective별 실제 단가 최솟값. 각 주파수 전체 geometry peak의 기본 95% 이상 요구 |
+| `empirical_gpu_overall_energy_optima` | measured graphics·memory domain을 함께 비교한 각 GPU의 실제 최솟값 |
+| `near_optimum_support_points`, `uncertainty_overlap_support_points` | 기본 최소 단가 5% 이내 / 95% 구간이 겹치는 실측 support points; 미측정 gap이나 연속 최적 구간을 보장하지 않음 |
+| `observed_frequency_pairs_without_eligible_candidate` | 측정은 했으나 검증·활용·baseline 요건으로 최적점 후보를 만들지 못한 frequency pair |
 | `verified_target_*` | NCU 통과·정확한 시간 정렬 조건 중 **전체 유효 고정 클럭 sweep 최고 처리량의 95% 이상**을 달성한 결과의 최저 단가; 없으면 winner 없음 |
 | `verified_target_coverage` | 전체/검증된 최고 처리량·비율·95% 통과 조건 수·미검증 또는 실패한 peak group을 보고 |
 
-`valid=true`는 기록의 품질 기준을 통과했다는 뜻이며, `target_verified=true`나 물리 블록 isolation의 증명이 아니다. worker는 약 1초 간격의 완료 batch 수와 실제 SM admission 수를 기록하고, 분석은 양 끝을 제외한 완료 구간에서 work count와 에너지를 함께 계산한다. 이 기록이 없는 과거 결과는 지속 처리량이 일정하다는 가정의 추정치로 남기고 검증된 최적값에는 사용하지 않는다. idle와 active의 실제 클럭이나 온도가 다르면 증가분에는 activation·주파수 상태·누설 변화가 섞일 수 있으며 경고가 남는다. 반복 3회의 bootstrap 범위는 거칠다. 수치 차이가 작으면 반복을 늘리고 온도·센서·counter evidence를 확인한다.
+`valid=true`는 기록의 품질 기준을 통과했다는 뜻이며, `target_verified=true`나 물리 블록 isolation의 증명이 아니다. worker는 약 1초 간격의 완료 batch 수와 실제 SM admission 수를 기록하고, 분석은 양 끝을 제외한 완료 구간에서 work count와 에너지를 함께 계산한다. 이 기록이 없는 과거 결과는 지속 처리량이 일정하다는 가정의 추정치로 남기고 검증된 최적값에는 사용하지 않는다. idle와 active의 실제 클럭이나 온도가 다르면 증가분에는 activation·주파수 상태·누설 변화가 섞일 수 있으며 경고가 남는다. 3–4회처럼 적은 반복의 bootstrap 범위는 거칠다. 수치 차이가 작으면 반복과 최소점 주변 지원 주파수 측정을 늘리고 온도·센서·counter evidence를 확인한다. V100·A100·H100의 최적 pJ/bit·pJ/FLOP 주파수는 각 UUID의 결과에서 독립적으로 선택하며 1110 MHz를 최적점으로 미리 지정하지 않는다. physical pJ/bit는 동일 energy-window의 계층 traffic provenance가 없어 현재 withheld이고 NCU replay bytes만으로 단가를 계산하지 않는다.
 
 ## NCU를 통한 적절성 판단
 

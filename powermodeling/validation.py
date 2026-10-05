@@ -274,7 +274,7 @@ def validate_evidence(record, evidence, policy=None):
             _check(checks, "matching_parameter_" + name, config.get(name), lambda v, e=expected: v == e, "exact requested workload parameter")
     benchmark = evidence.get("profile_benchmark") or {}
     measured_benchmark = record.get("benchmark") or {}
-    for name in ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block"):
+    for name in ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated"):
         if name in benchmark or name in measured_benchmark:
             _check(checks, "matching_effective_" + name, benchmark.get(name), lambda v, e=measured_benchmark.get(name): e is not None and v == e, "exact effective profile/energy workload parameter")
     clocks = provenance.get("requested_clocks") or {}

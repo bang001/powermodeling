@@ -79,17 +79,61 @@ block counts and SM IDs are recorded. Missing requested SMs reject the trial.
 number of blocks dispatched to that SM per launch. It describes assignment, not
 concurrent residency or cache occupancy.
 
-Each run allocates and initializes data before any measurement phase:
+Each run allocates and initializes data before any measurement phase. New plans
+use a paired active reference for custom Tensor/L1/L2/HBM kernels; standalone
+`powerbench` requires `--paired-reference` to enable it. The initial target
+`warmup` precedes `idle_pre`, which keeps the CUDA context and all buffers
+allocated. Every arm then has its own warmup, outside its measurement window:
 
-1. `warmup` runs the selected workload.
-2. `idle_pre` leaves the existing CUDA context and buffers allocated.
-3. `measure` runs the workload for the requested window.
-4. `idle_post` retains the same context and buffers.
+| Order | Sequence after `idle_pre` and before `idle_post` |
+|---|---|
+| `AB` | `warmup_reference` → `active_reference` → `warmup_treatment` → `measure` |
+| `BA` | `warmup_treatment` → `measure` → `warmup_reference` → `active_reference` |
+
+`A` is an integer issue-loop control and `B` is the requested treatment. Each arm
+runs for the configured sustained window (at least 10 s); each arm's warmup is
+at least 1 s, and each idle bracket is at least 6 s. A plan assigns AB/BA order by
+repeat parity with a seeded random flip per condition. Four repeats give exact
+order balance; three leave one extra order. Changing trial order and balanced
+crossover order address different sources of drift. GEMM can opt in, but its
+cuBLAS launch geometry is not matched and its active-reference contrast is
+ineligible for attribution. Latency/control diagnostic workloads are unpaired by
+default.
+
+The reference shares the custom treatment's blocks, threads, iterations, SM
+admission mask and batch-launch count. Dedicated reference sinks and admission
+counters keep a BA reference from overwriting the treatment's output or counts.
+The context, allocations and requested clock policy remain constant across both
+arms. This is a practical **operational contrast**, not an exact instruction
+counterfactual: register pressure, occupancy, cache/DRAM residency, instruction
+mix and duration per launch can differ. Even a clock/temperature qualified
+contrast does not isolate transistor switching or one physical component's
+energy. Negative contrasts are retained as diagnostics, never clipped to zero
+or promoted to an energy optimum. Retain treatment total energy, powered-idle
+state energy and paired-reference energy separately.
+
+`type=treatment_protocol` records the actual order, phase order and scope.
+`type=active_reference_result` records reference timing, exact per-epoch complete
+batch/admission counts and requested-SM coverage; `operations` and
+`logical_bytes` are zero because the integer reference is neither target FLOPs
+nor target memory payload. The Python runner stores these as top-level
+`treatment_protocol` and `active_reference` and rejects missing/duplicate arms,
+wrong order, changed geometry or overlapping warmup/measurement phases. The
+usual `type=result` still contains treatment `measure_epochs`.
+
+Without the paired flag (including legacy plans), the sequence is `warmup` →
+`idle_pre` → `measure` → `idle_post`. Legacy measurements remain visible with
+no paired-reference claim.
 
 Phase records carry `host_monotonic_ns` from Linux `CLOCK_MONOTONIC`, so a host
-power sampler can clip readings to the boundaries. An idle interval can change
-P-states and temperature; the runner must trim transitions and qualify measured
-clocks. Dirty writeback/background effects may affect the post-idle baseline.
+power sampler can clip readings to the boundaries. Idle is a **powered state**
+that includes clocks, leakage, HBM refresh and background activity. An idle
+interval can change P-states and temperature; the analyzer trims transitions,
+interpolates pre/post idle drift at each measured arm, and qualifies actual
+clocks and temperatures. Dirty writeback/background effects may affect the
+post-idle baseline. An active-minus-idle value is an operational state increment,
+not automatically physical dynamic energy. Paired-reference telemetry is
+qualified independently, with its complete epoch windows and its actual state.
 
 `duration_s` is CUDA-event elapsed **experiment window**, including launch gaps;
 it is not the sum of profiler kernel busy times. `host_duration_s` is also
@@ -131,6 +175,11 @@ ncu --profile-from-start off --replay-mode application --cache-control none \
   --idle-seconds 0 --warmup-batches 8 --fixed-batches 1 --batch-launches 1 \
   --iterations 1024 --profile-region
 ```
+
+With a paired plan, the profiler command retains `--paired-reference` only to
+allocate the same reference buffers. `--profile-region` suppresses every reference
+arm and its warmup; only treatment `measure` is profiled.
+`paired_reference_context_allocated` in the result must match the energy run.
 
 Application replay and cache-control preservation allow the application warmup
 before each pass. Eight batches are a starting point; measured hit rate, finite

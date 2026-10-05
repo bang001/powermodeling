@@ -247,6 +247,16 @@ class TargetAdmissionTests(unittest.TestCase):
 
 
 class ProvenanceAdmissionTests(unittest.TestCase):
+    def test_paired_allocation_context_must_match_energy_capture(self):
+        record, evidence = pass_fixture()
+        record["benchmark"]["paired_reference_context_allocated"] = True
+        evidence["profile_benchmark"]["paired_reference_context_allocated"] = True
+        self.assertEqual(validate_evidence(record, evidence)["status"], "pass")
+        evidence["profile_benchmark"]["paired_reference_context_allocated"] = False
+        self.assertEqual(validate_evidence(record, evidence)["status"], "fail")
+        del evidence["profile_benchmark"]["paired_reference_context_allocated"]
+        self.assertEqual(validate_evidence(record, evidence)["status"], "inconclusive")
+
     def test_hash_uuid_params_effective_defaults_and_replay_bind(self):
         for mutation in (lambda r, e: e["profile_provenance"].update(benchmark_sha256="b" * 64),
                          lambda r, e: e["profile_provenance"].update(observed_gpu_uuid="GPU-other"),

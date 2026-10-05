@@ -1,14 +1,134 @@
 {
   "description": "Geometry/capacity saturation first. Refine around observed plateaus; advertised utilization is not proof of peak.",
-  "seconds": 12, "warmup_seconds": 3, "idle_seconds": 6, "repeats": 3,
-  "sample_interval_s": 0.05, "randomization_seed": 2026,
-  "clock_sweep": {"graphics_quantiles": [0.6, 1.0], "memory_quantiles": [1.0]},
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "randomization_seed": 2026,
+  "clock_sweep": {
+    "graphics_quantiles": [
+      0.6,
+      1.0
+    ],
+    "memory_quantiles": [
+      1.0
+    ],
+    "required_graphics_mhz": [
+      1110
+    ],
+    "include_default_policy": true,
+    "include_advertised_default": true
+  },
   "experiments": [
-    {"workload": "control", "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4"], "threads": [128, 256]}},
-    {"workload": "tensor", "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4"], "threads": [128, 256], "tensor_accumulators": [1, 4, 8]}},
-    {"workload": "gemm", "parameters": {"gemm_n": 4096, "gemm_k": 4096}, "grid": {"gemm_m": [2048, 4096, 8192]}},
-    {"workload": "l1", "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4"], "threads": [128, 256], "working_set_bytes": ["blocks*16384", "blocks*32768", "blocks*65536"]}},
-    {"workload": "l2", "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4"], "threads": [128, 256], "working_set_bytes": ["l2_bytes*0.25", "l2_bytes*0.75", "l2_bytes*1.25"]}},
-    {"workload": "hbm", "parameters": {"working_set_bytes": "max(l2_bytes*8,268435456)", "seed": 2026}, "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4"], "threads": [128, 256], "access": ["read", "copy"]}}
-  ]
+    {
+      "workload": "control",
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ]
+      }
+    },
+    {
+      "workload": "tensor",
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "tensor_accumulators": [
+          1,
+          4,
+          8
+        ]
+      }
+    },
+    {
+      "workload": "gemm",
+      "parameters": {
+        "gemm_n": 4096,
+        "gemm_k": 4096
+      },
+      "grid": {
+        "gemm_m": [
+          2048,
+          4096,
+          8192
+        ]
+      }
+    },
+    {
+      "workload": "l1",
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "blocks*16384",
+          "blocks*32768",
+          "blocks*65536"
+        ]
+      }
+    },
+    {
+      "workload": "l2",
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "l2_bytes*0.25",
+          "l2_bytes*0.75",
+          "l2_bytes*1.25"
+        ]
+      }
+    },
+    {
+      "workload": "hbm",
+      "parameters": {
+        "working_set_bytes": "max(l2_bytes*8,268435456)",
+        "seed": 2026
+      },
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "access": [
+          "read",
+          "copy"
+        ]
+      }
+    }
+  ],
+  "target_form_factor": "SXM",
+  "paired_reference": true
 }

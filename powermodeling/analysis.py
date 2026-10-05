@@ -33,6 +33,7 @@ class AnalysisPolicy:
     max_temperature_drift_c: float = 5.0
     max_idle_drift_fraction: float = 0.10
     counter_disagreement_fraction: float = 0.10
+    near_optimum_fraction: float = 0.05
 
     def __post_init__(self):
         for field, value in asdict(self).items():
@@ -253,6 +254,128 @@ def _measure_epochs(benchmark: Mapping[str, Any], phase: Mapping[str, Any],
     return inner, []
 
 
+
+def _physical_traffic_estimates(result, assessment, byte_rate):
+    """Keep replay counters separate from an unprofiled energy denominator.
+
+    Replay can establish path/coalescing diagnostics. It does not count bytes
+    in the energy window, so physical pJ/bit is deliberately withheld.
+    """
+    return {"physical_pj_per_bit": None,
+            "status": "unavailable_without_matched_energy_window_hardware_traffic_counts",
+            "profile_rates": assessment.get("rates_summary"),
+            "note": "Nsight replay busy-time rates and logical/physical ratios are diagnostic; they are not the energy-window physical-bit denominator."}
+
+
+def _paired_reference_contrast(record, phase_records, result, pre, post, measure, policy):
+    """Evaluate an operational paired reference without claiming pure block power."""
+    protocol = record.get("treatment_protocol") or (record.get("benchmark") or {}).get("treatment_protocol") or {}
+    reference_record = record.get("active_reference") or {}
+    reference_phase = phase_records.get("active_reference")
+    result.update(paired_active_reference_eligible=False, paired_active_reference_power_w=None,
+                  paired_active_reference_energy_j=None, paired_active_reference_pj_per_flop=None,
+                  paired_active_reference_pj_per_logical_bit=None, paired_active_reference_issues=[],
+                  paired_active_reference_protocol=protocol,
+                  paired_active_reference_interpretation="same-process active issue-loop reference contrast; instruction, memory and scheduling differences remain; physical component switching power is not isolated")
+    if not reference_phase:
+        result["paired_active_reference_issues"] = ["missing_paired_active_reference_phase"]
+        return
+    reference = _phase_stats(reference_phase, "active_reference", policy)
+    reference_epochs, epoch_issues = _measure_epochs(reference_record, reference_phase, policy)
+    if reference_epochs:
+        aligned = {**reference_phase, "start_s": reference_epochs[0]["start_s"], "end_s": reference_epochs[-1]["end_s"]}
+        reference = _phase_stats(aligned, "active_reference", replace(policy, trim_s=0))
+    issues = list(reference["issues"]) + epoch_issues
+    if not reference_epochs or not all(epoch.get("counts_exact") is True for epoch in reference_epochs):
+        issues.append("reference_work_energy_window_unverified")
+    # Protocol identity comes from the measured executable, not a caller's
+    # generic control-group match. Both arms share context/allocations/clocks.
+    for field in ("same_process", "same_allocations", "same_clock_policy", "launch_geometry_matched"):
+        if protocol.get(field) is not True:
+            issues.append("paired_protocol_unverified:" + field)
+    if protocol.get("kind") != "paired_active_reference" or protocol.get("reference_kind") != "issue_loop" or protocol.get("reference_workload") != "control":
+        issues.append("paired_reference_definition_unverified")
+    order = protocol.get("order")
+    if order not in ("AB", "BA"):
+        issues.append("paired_protocol_order_unverified")
+    if order == "AB" and (_finite(reference_phase.get("end_s")) or 0) > (_finite((phase_records.get("measure") or {}).get("start_s")) or 0):
+        issues.append("paired_arm_order_or_overlap_invalid")
+    if order == "BA" and (_finite((phase_records.get("measure") or {}).get("end_s")) or 0) > (_finite(reference_phase.get("start_s")) or 0):
+        issues.append("paired_arm_order_or_overlap_invalid")
+    treatment_benchmark = record.get("benchmark") or {}
+    for field in ("blocks", "threads", "batch_launches", "iterations_per_launch"):
+        if reference_record.get(field) is None or treatment_benchmark.get(field) is None or reference_record[field] != treatment_benchmark[field]:
+            issues.append("paired_geometry_mismatch:" + field)
+    state_deltas = {}
+    reference_clock_fields = ["graphics_clock_mhz", "memory_clock_mhz"]
+    if any(_finite(sample.get("sm_clock_mhz")) is not None for phase in (measure, reference) for sample in phase.get("_selected", [])):
+        reference_clock_fields.append("sm_clock_mhz")
+    result["paired_reference_clock_domains_compared"] = reference_clock_fields
+    result["paired_reference_sm_clock_uses_graphics_proxy"] = "sm_clock_mhz" not in reference_clock_fields
+    for field in (*reference_clock_fields, "temperature_c"):
+        active, baseline = _finite(measure.get(field)), _finite(reference.get(field))
+        state_deltas[field] = active - baseline if active is not None and baseline is not None else None
+        tolerance = policy.max_temperature_drift_c if field == "temperature_c" else (active or 0) * policy.clock_tolerance_fraction
+        samples = reference.get("_selected", [])
+        if active is None or baseline is None or not samples or any((value := _finite(sample.get(field))) is None or abs(value - active) > tolerance for sample in samples):
+            issues.append("paired_state_mismatch:" + field)
+    for sample in reference.get("_selected", []):
+        if (_throttle_mask(sample.get("throttle_reasons")) is None
+                or (_throttle_mask(sample.get("throttle_reasons")) or 0) & ~0x3):
+            issues.append("reference_throttle_unverified_or_active")
+        for field in ("compute_processes", "graphics_processes"):
+            inventory = sample.get(field)
+            if not isinstance(inventory, list):
+                issues.append("reference_process_inventory_unverified:" + field)
+            elif any((item.get("pid") if isinstance(item, dict) else item) != (record.get("quality") or {}).get("measurement_pid") for item in inventory):
+                issues.append("reference_foreign_gpu_process")
+    # A fixed board cap is a state variable even if consumption is below it.
+    treatment_caps = [_finite(sample.get("power_limit_w")) for sample in measure.get("_selected", [])]
+    reference_caps = [_finite(sample.get("power_limit_w")) for sample in reference.get("_selected", [])]
+    all_caps = treatment_caps + reference_caps
+    if not all_caps or any(cap is None or cap <= 0 for cap in all_caps):
+        issues.append("paired_power_cap_unverified")
+    elif max(all_caps) - min(all_caps) > 1e-6:
+        issues.append("paired_power_cap_changed")
+    for field in ("enforced_power_limit_w", "pstate"):
+        active_values = {_finite(sample.get(field)) for sample in measure.get("_selected", [])}
+        reference_values = {_finite(sample.get(field)) for sample in reference.get("_selected", [])}
+        if active_values != {None} or reference_values != {None}:
+            if None in active_values or None in reference_values or len(active_values) != 1 or active_values != reference_values:
+                issues.append("paired_state_mismatch:" + field)
+    if (reference_record.get("sanity") or {}).get("requested_sm_coverage_complete") is not True:
+        issues.append("reference_sm_coverage_unverified")
+    reference_power = _finite(reference.get("power_w"))
+    treatment_power = _finite(result.get("board_power_w"))
+    contrast = treatment_power - reference_power if treatment_power is not None and reference_power is not None else None
+    duration = result.get("duration_s")
+    if contrast is None:
+        issues.append("paired_power_unavailable")
+    elif contrast <= 0:
+        issues.append("nonpositive_paired_contrast; signed observation retained but cannot minimize an energy objective")
+    result.update(paired_active_reference_power_w=contrast,
+                  paired_active_reference_energy_j=contrast * duration if contrast is not None and duration else None,
+                  paired_active_reference_eligible=result["valid"] and result["count_energy_time_alignment_exact"] and not issues,
+                  paired_active_reference_issues=sorted(set(issues)),
+                  paired_active_reference_state_deltas=state_deltas,
+                  active_reference_power_w=reference_power,
+                  active_reference_total_energy_j=reference.get("energy_counter_j") if reference.get("energy_counter_j") is not None else reference.get("integrated_power_energy_j"))
+    tensor = record.get("workload") in _TENSOR_WORKLOADS
+    memory = record.get("workload") in _MEMORY_WORKLOADS
+    ops_rate, byte_rate = result.get("throughput_ops_s"), result.get("throughput_bytes_s")
+    result["paired_active_reference_pj_per_flop"] = contrast / ops_rate * 1e12 if tensor and contrast is not None and ops_rate and ops_rate > 0 else None
+    result["paired_active_reference_pj_per_logical_bit"] = contrast / byte_rate / 8 * 1e12 if memory and contrast is not None and byte_rate and byte_rate > 0 else None
+    treatment_idle, reference_idle = _idle_at(pre, post, measure, "power_w"), _idle_at(pre, post, reference, "power_w")
+    result["paired_active_reference_drift_adjusted_power_w"] = (treatment_power - treatment_idle) - (reference_power - reference_idle) if result.get("operational_idle_increment_eligible") and None not in (treatment_power, treatment_idle, reference_power, reference_idle) else None
+    result["phases"]["active_reference"] = {key: value for key, value in reference.items() if not key.startswith("_")}
+
+
+def _treatment_design_stratum(record, benchmark):
+    protocol = record.get("treatment_protocol") or benchmark.get("treatment_protocol") or {}
+    return {"kind": protocol.get("kind", "unspecified_legacy_protocol"),
+            "reference_kind": protocol.get("reference_kind"),
+            "paired_reference_context_allocated": benchmark.get("paired_reference_context_allocated", protocol.get("paired_reference_context_allocated"))}
+
 def analyze_trial(record: Mapping[str, Any], policy: AnalysisPolicy | Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Calculate operational incremental energy for one sustained trial.
 
@@ -274,22 +397,28 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
     if phase_records.get("active_control"):
         phases["active_control"] = _phase_stats(phase_records["active_control"], "active_control", policy)
     measure, pre, post = phases["measure"], phases["idle_pre"], phases["idle_post"]
-    issues = [issue for phase in phases.values() for issue in phase["issues"]]
+    # Total treatment energy remains interpretable when an idle/reference arm
+    # fails. Baseline failures gate only baseline-dependent contrasts.
+    issues = list(measure["issues"])
     issues.extend(epoch_issues)
+    baseline_issues = [issue for name in ("idle_pre", "idle_post") for issue in phases[name]["issues"]]
     warnings = [warning for phase in phases.values() for warning in phase["warnings"]]
     config = dict(record.get("config") or {})
     device = record.get("device") or {}
     gpu_uuid = config.get("gpu_uuid") or device.get("uuid") or record.get("gpu_uuid")
     if not record.get("trial_id"):
         issues.append("missing_trial_id")
-    for field in ("graphics_clock_mhz", "memory_clock_mhz"):
+    treatment_clock_fields = ["graphics_clock_mhz", "memory_clock_mhz"]
+    if any(_finite(sample.get("sm_clock_mhz")) is not None for sample in measure.get("_selected", [])):
+        treatment_clock_fields.append("sm_clock_mhz")
+    for field in treatment_clock_fields:
         requested, actual = _finite(config.get(field)), _finite(measure.get(field))
         if requested is not None and requested > 0:
             if actual is None:
                 issues.append(f"missing_clock_telemetry:{field}")
             elif abs(actual - requested) / requested > policy.clock_tolerance_fraction:
                 issues.append(f"clock_mismatch:{field}")
-        else:
+        elif field != "sm_clock_mhz":
             warnings.append(f"uncontrolled_clock:{field}")
         low, high = _finite(measure.get(f"{field}_min")), _finite(measure.get(f"{field}_max"))
         if actual and low is not None and high is not None and (high - low) / actual > policy.max_clock_drift_fraction:
@@ -300,7 +429,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
     selected = measure.get("_selected", [])
     if selected and any(_finite(sample.get("temperature_c")) is None for sample in selected):
         issues.append("missing_temperature_telemetry")
-    for field in ("graphics_clock_mhz", "memory_clock_mhz"):
+    for field in treatment_clock_fields:
         if selected and any((_finite(sample.get(field)) or 0) <= 0 for sample in selected):
             issues.append(f"missing_clock_telemetry:{field}")
     if selected and any(_throttle_mask(sample.get("throttle_reasons")) is None for sample in selected):
@@ -322,21 +451,25 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
             issues.append(key)
     measurement_pid = quality.get("measurement_pid")
     other_pids = set()
-    inventory_samples = [sample for phase in phases.values() for sample in phase.get("_selected", [])]
-    for sample in inventory_samples:
-        for field in ("compute_processes", "graphics_processes"):
-            inventory = sample.get(field)
-            if not isinstance(inventory, list):
-                issues.append(f"missing_process_inventory:{field}")
-                continue
-            if inventory and measurement_pid is None:
-                issues.append("missing_measurement_pid")
-            for process in inventory:
-                pid = process.get("pid") if isinstance(process, dict) else process
-                if pid is not None and pid != measurement_pid:
-                    other_pids.add(pid)
-        if sample.get("mps_compute_processes"):
-            issues.append("mps_active")
+    for phase_name, phase in phases.items():
+        destination = issues if phase_name == "measure" else baseline_issues
+        for sample in phase.get("_selected", []):
+            for field in ("compute_processes", "graphics_processes"):
+                inventory = sample.get(field)
+                if not isinstance(inventory, list):
+                    destination.append(f"missing_process_inventory:{field}")
+                    continue
+                if inventory and measurement_pid is None:
+                    destination.append("missing_measurement_pid")
+                for process in inventory:
+                    pid = process.get("pid") if isinstance(process, dict) else process
+                    if pid is not None and pid != measurement_pid:
+                        if phase_name == "measure":
+                            other_pids.add(pid)
+                        else:
+                            destination.append("baseline_other_gpu_processes")
+            if sample.get("mps_compute_processes"):
+                destination.append("mps_active")
     processes = quality.get("other_compute_processes", record.get("other_compute_processes"))
     if processes:
         issues.append("other_compute_processes")
@@ -355,7 +488,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
     if pre_power is not None and post_power is not None:
         denominator = max((pre_power + post_power) / 2, 1e-9)
         if abs(pre_power - post_power) / denominator > policy.max_idle_drift_fraction:
-            issues.append("idle_baseline_drift")
+            baseline_issues.append("idle_baseline_drift")
     duration = _finite(measure.get("duration_s"))
     total = _finite(measure.get("energy_counter_j"))
     energy_source = "energy_counter_delta"
@@ -365,9 +498,9 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
     idle_energy = idle_power * duration if idle_power is not None and duration else None
     incremental = total - idle_energy if total is not None and idle_energy is not None else None
     if idle_power is None:
-        issues.append("missing_idle_baseline")
+        baseline_issues.append("missing_idle_baseline")
     if incremental is not None and incremental < 0:
-        issues.append("negative_incremental_energy")
+        baseline_issues.append("negative_incremental_energy")
     device_duration = _finite(benchmark.get("duration_s"))
     measured_duration = _finite(benchmark.get("host_duration_s")) or device_duration
     if device_duration and measured_duration and abs(device_duration - measured_duration) / measured_duration > 0.05:
@@ -423,11 +556,15 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         except (ValueError, KeyError, TypeError):
             warnings.append("tensor_theoretical_peak_unavailable")
     baseline_deltas = {}
+    baseline_power_cap_matched = True
     baseline_clock_matched = True
     baseline_temperature_matched = True
+    baseline_clock_fields = ["graphics_clock_mhz", "memory_clock_mhz"]
+    if any(_finite(sample.get("sm_clock_mhz")) is not None for phase in (measure, pre, post) for sample in phase.get("_selected", [])):
+        baseline_clock_fields.append("sm_clock_mhz")
     for name, baseline_phase in (("idle_pre", pre), ("idle_post", post)):
         deltas = {}
-        for field in ("graphics_clock_mhz", "memory_clock_mhz"):
+        for field in baseline_clock_fields:
             active_clock, idle_clock = _finite(measure.get(field)), _finite(baseline_phase.get(field))
             deltas[field] = active_clock - idle_clock if active_clock is not None and idle_clock is not None else None
             if active_clock is None or idle_clock is None or active_clock <= 0 or abs(active_clock - idle_clock) / active_clock > policy.clock_tolerance_fraction:
@@ -440,7 +577,13 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
             baseline_temperature_matched = False
         if active_temp is not None and any((temp := _finite(sample.get("temperature_c"))) is None or abs(temp - active_temp) > policy.max_temperature_drift_c for sample in baseline_phase.get("_selected", [])):
             baseline_temperature_matched = False
+        active_caps = {_finite(sample.get("power_limit_w")) for sample in measure.get("_selected", [])}
+        baseline_caps = {_finite(sample.get("power_limit_w")) for sample in baseline_phase.get("_selected", [])}
+        if None in active_caps or None in baseline_caps or len(active_caps) != 1 or active_caps != baseline_caps:
+            baseline_power_cap_matched = False
         baseline_deltas[name] = deltas
+    if not baseline_power_cap_matched:
+        warnings.append("idle_active_power_cap_mismatch_or_unavailable; idle contrast is withheld from optimization")
     if not baseline_clock_matched:
         warnings.append("idle_active_clock_mismatch_or_unavailable; incremental power includes activation and frequency-state differences")
     if not baseline_temperature_matched:
@@ -451,8 +594,11 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "repeat_index": record.get("repeat", config.get("repeat", config.get("repeat_index"))),
         "gpu_name": device.get("name", record.get("gpu_name")), "config": config,
         "valid": not issues, "issues": sorted(set(issues)), "warnings": sorted(set(warnings)),
+        "baseline_valid": not baseline_issues, "baseline_issues": sorted(set(baseline_issues)),
+        "treatment_outcome_kind": "measured whole-device total energy per counted treatment work",
         "target_verified": target_verified,
         "benchmark_sha256": (record.get("provenance") or {}).get("benchmark_sha256"),
+        "treatment_design_stratum": _treatment_design_stratum(record, benchmark),
         "measurement_stratum": {"ecc_mode": device.get("ecc_mode"), "mig_mode": device.get("mig_mode"),
                                 "driver_version": device.get("driver_version"), "nvml_version": device.get("nvml_version"),
                                 "runtime_versions": {key: (record.get("cuda_device") or {}).get(key) for key in ("cuda_runtime_version", "cuda_driver_version", "cuda_compile_version", "cublas_version")},
@@ -485,6 +631,11 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "tensor_peak_clock_source": peak_clock_source if tensor_peak is not None else None,
         "tensor_utilization_vs_dense_clock_peak": ops_rate / 1e12 / tensor_peak if ops_rate is not None and tensor_peak and tensor_peak > 0 else None,
         "board_power_w": board_power, "idle_power_w": idle_power, "incremental_power_w": incremental_power,
+        "operational_idle_increment_power_w": incremental_power,
+        "operational_idle_increment_energy_j": incremental,
+        "operational_idle_increment_eligible": not issues and not baseline_issues and count_alignment_exact and baseline_clock_matched and baseline_temperature_matched and baseline_power_cap_matched,
+        "idle_baseline_estimator": "linear interpolation between pre/post trimmed idle mean power at treatment midpoint; integral exact for the assumed linear drift",
+        "idle_increment_interpretation": "operational whole-device contrast against powered idle; activation, clock distribution, refresh and background changes may remain; physical leakage/switching are not isolated",
         "total_energy_j": total, "idle_energy_j": idle_energy, "incremental_energy_j": incremental,
         "integrated_power_energy_j": measure.get("integrated_power_energy_j"),
         "energy_counter_j": measure.get("energy_counter_j"), "energy_source": energy_source,
@@ -507,15 +658,29 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "power_usage_semantics": device.get("power_usage_semantics"),
         "baseline_kind": "powered-idle baseline; includes leakage, clocks, refresh, and device background activity",
         "baseline_clock_matched": baseline_clock_matched,
-        "baseline_temperature_matched": baseline_temperature_matched,
+        "baseline_power_scope": "same measured device/API rail; idle is an operational state, not a leakage meter",
+        "baseline_temperature_matched": baseline_temperature_matched, "baseline_power_cap_matched": baseline_power_cap_matched,
+        "baseline_clock_domains_compared": baseline_clock_fields,
+        "baseline_sm_clock_uses_graphics_proxy": "sm_clock_mhz" not in baseline_clock_fields,
         "active_minus_idle_state_deltas": baseline_deltas,
-        "dynamic_attribution_eligible": not issues and target_verified and count_alignment_exact and baseline_clock_matched and baseline_temperature_matched,
+        "dynamic_attribution_eligible": not issues and not baseline_issues and target_verified and count_alignment_exact and baseline_clock_matched and baseline_temperature_matched and baseline_power_cap_matched,
         "dynamic_attribution_note": "Eligibility indicates matched-baseline/profiler prerequisites only. It does not prove isolation of physical switching power or static leakage.",
         "attribution": "whole-device incremental energy per benchmark operation or logical byte; not isolated block energy",
         "policy": asdict(policy), "phases": {}, "model_features": record.get("model_features"),
         "feature_units": record.get("feature_units"), "feature_provenance": record.get("feature_provenance"),
         "power_provenance": record.get("power_provenance"),
     }
+    # FLOP is a floating-point operation: one fused multiply-add counts as two.
+    # Logical bits count payload requested by the benchmark; cache-sector and
+    # DRAM bits are different denominators and are never silently substituted.
+    tensor = record.get("workload") in _TENSOR_WORKLOADS
+    memory = record.get("workload") in _MEMORY_WORKLOADS
+    for prefix, power in (("total_", board_power), ("operational_idle_increment_", incremental_power)):
+        result[prefix + "pj_per_flop"] = power / ops_rate * 1e12 if tensor and power is not None and ops_rate and ops_rate > 0 else None
+        result[prefix + "pj_per_logical_bit"] = power / byte_rate / 8 * 1e12 if memory and power is not None and byte_rate and byte_rate > 0 else None
+    result["flop_count_convention"] = "multiply-add=2 FLOPs; reported dense FP16 tensor operations" if tensor else None
+    result["logical_bit_count_convention"] = "8 bits per logical byte; copy counts both read and write payload" if memory else None
+    result["physical_traffic_energy"] = _physical_traffic_estimates(result, assessment, byte_rate)
     if record.get("workload") == "l2_latency":
         result["latency_diagnostics"] = dict(benchmark)
     for name, phase in phases.items():
@@ -524,10 +689,10 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         control = phases["active_control"]
         control_idle = _idle_at(pre, post, control, "power_w")
         control_power = _finite(control.get("power_w"))
-        control_increment = control_power - control_idle if control_power is not None and control_idle is not None else None
-        result["active_control_incremental_power_w"] = control_increment
-        result["control_subtracted_power_w"] = incremental_power - control_increment if incremental_power is not None and control_increment is not None else None
-        result["control_subtraction_note"] = "Instruction and scheduling differences can bias this counterfactual; it is not pure block power."
+        result["active_control_incremental_power_w"] = control_power - control_idle if control_power is not None and control_idle is not None else None
+        result["control_subtracted_power_w"] = None
+        result["control_subtraction_note"] = "Standalone activation control is descriptive; paired protocol and state checks are required for an active-reference contrast."
+    _paired_reference_contrast(record, phase_records, result, pre, post, measure, policy)
     return result
 
 
@@ -535,7 +700,12 @@ _METRICS = ("board_power_w", "idle_power_w", "incremental_power_w", "throughput_
             "pj_per_op", "pj_per_logical_byte", "total_pj_per_op", "total_pj_per_logical_byte",
             "memory_rail_power_w", "memory_rail_incremental_power_w", "graphics_clock_mhz", "sm_clock_mhz", "memory_clock_mhz",
             "temperature_c", "idle_fraction_of_measured_power", "idle_fraction_of_power_limit", "power_limit_utilization",
-            "tensor_peak_tflops_at_achieved_clock", "tensor_utilization_vs_dense_clock_peak")
+            "tensor_peak_tflops_at_achieved_clock", "tensor_utilization_vs_dense_clock_peak",
+            "total_pj_per_flop", "total_pj_per_logical_bit",
+            "operational_idle_increment_power_w", "operational_idle_increment_energy_j",
+            "operational_idle_increment_pj_per_flop", "operational_idle_increment_pj_per_logical_bit",
+            "paired_active_reference_power_w", "paired_active_reference_energy_j",
+            "paired_active_reference_pj_per_flop", "paired_active_reference_pj_per_logical_bit")
 _REPEAT_KEYS = {"repeat", "repeat_id", "repeat_index", "trial_id", "output_dir", "output_path"}
 
 
@@ -548,7 +718,8 @@ def _group_key(trial: Mapping[str, Any]) -> str:
     return json.dumps({"gpu_uuid": trial.get("gpu_uuid"), "workload": trial.get("workload"),
                        "config": config, "uncontrolled_achieved_clocks": achieved,
                        "benchmark_sha256": trial.get("benchmark_sha256"),
-                       "measurement_stratum": trial.get("measurement_stratum")}, sort_keys=True, separators=(",", ":"))
+                       "measurement_stratum": trial.get("measurement_stratum"),
+                       "treatment_design_stratum": trial.get("treatment_design_stratum")}, sort_keys=True, separators=(",", ":"))
 
 
 def _median_ci(values: list[float], seed: int) -> list[float] | None:
@@ -561,7 +732,9 @@ def _median_ci(values: list[float], seed: int) -> list[float] | None:
 
 def _clock_stratum(group: Mapping[str, Any], cross_clock: bool) -> dict[str, Any]:
     key = {"gpu_uuid": group["gpu_uuid"], "workload": group["workload"],
-           "benchmark_sha256": group.get("benchmark_sha256"), "measurement_stratum": group.get("measurement_stratum")}
+           "benchmark_sha256": group.get("benchmark_sha256"), "measurement_stratum": group.get("measurement_stratum"),
+           "treatment_design_stratum": group.get("treatment_design_stratum"),
+           "access": group["config"].get("access", "read") if group["workload"] in _MEMORY_WORKLOADS else None}
     if not cross_clock:
         key.update(graphics_clock_mhz=group["config"].get("graphics_clock_mhz") or group.get("graphics_clock_mhz"),
                    memory_clock_mhz=group["config"].get("memory_clock_mhz") or group.get("memory_clock_mhz"),
@@ -578,6 +751,8 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
         if exploratory_only == group["clock_comparison_controlled"]:
             continue
         if verified_only and not group["verified_selection_eligible"]:
+            continue
+        if not total_energy and not group.get("operational_idle_increment_eligible"):
             continue
         tensor = group["workload"] in _TENSOR_WORKLOADS
         metric = ("total_" if total_energy else "") + ("pj_per_op" if tensor else "pj_per_logical_byte")
@@ -619,6 +794,95 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
                            "selection_scope": "best measured among tested configurations; sweep completeness and physical target attribution are not implied"})
     return selections
 
+
+
+def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, across_memory_domains=False):
+    """Choose each GPU's energy optimum using utilization at its own frequency.
+
+    Global-peak throughput constraints answer a different question and remain
+    available separately. Every support point below is actually observed; no
+    interpolation can establish an optimum at an untested clock.
+    """
+    populations = [group for group in groups if group["workload"] in _TENSOR_WORKLOADS | _MEMORY_WORKLOADS
+                   and group["valid_repeats"] >= min_repeats and group["clock_comparison_controlled"]]
+    peaks = {}
+    for group in populations:
+        throughput = "throughput_ops_s" if group["workload"] in _TENSOR_WORKLOADS else "throughput_bytes_s"
+        value = _finite(group.get(throughput))
+        if value is None or value <= 0:
+            continue
+        clock_key = json.dumps(_clock_stratum(group, False), sort_keys=True)
+        peaks[clock_key] = max(peaks.get(clock_key, 0), value)
+    buckets = {}
+    objectives = (("total", "total_", None),
+                  ("operational_idle_increment", "operational_idle_increment_", "operational_idle_increment_eligible"),
+                  ("paired_active_reference", "paired_active_reference_", "paired_active_reference_eligible"))
+    for group in populations:
+        if not group["verified_selection_eligible"]:
+            continue
+        throughput = "throughput_ops_s" if group["workload"] in _TENSOR_WORKLOADS else "throughput_bytes_s"
+        clock_peak = peaks.get(json.dumps(_clock_stratum(group, False), sort_keys=True))
+        if clock_peak is None or (_finite(group.get(throughput)) or 0) < fraction * clock_peak:
+            continue
+        tensor = group["workload"] in _TENSOR_WORKLOADS
+        for objective, prefix, eligibility in objectives:
+            if eligibility and not group.get(eligibility):
+                continue
+            metric = prefix + ("pj_per_flop" if tensor else "pj_per_logical_bit")
+            metric_value = _finite(group.get(metric))
+            if metric_value is None or metric_value <= 0:
+                continue
+            stratum = _clock_stratum(group, True)
+            if not across_memory_domains:
+                stratum["memory_clock_mhz"] = group["config"].get("memory_clock_mhz")
+            stratum["objective"] = objective
+            buckets.setdefault(json.dumps(stratum, sort_keys=True), []).append((group, metric, throughput, clock_peak))
+    results = []
+    for key, candidates in sorted(buckets.items()):
+        best = min(candidates, key=lambda item: (item[0][item[1]], -item[0][item[2]], item[0]["group_id"]))
+        group, metric, throughput, clock_peak = best
+        best_ci = group["ci95"].get(metric)
+        def support(candidate):
+            point, point_metric, point_throughput, point_peak = candidate
+            return {"group_id": point["group_id"], "graphics_clock_mhz": point.get("graphics_clock_mhz"),
+                    "memory_clock_mhz": point.get("memory_clock_mhz"),
+                    "requested_graphics_clock_mhz": point["config"].get("graphics_clock_mhz"),
+                    "requested_memory_clock_mhz": point["config"].get("memory_clock_mhz"),
+                    "metric_value": point[point_metric], "metric_ci95": point["ci95"].get(point_metric),
+                    "throughput": point[point_throughput], "throughput_fraction_of_own_clock_observed_peak": point[point_throughput] / point_peak,
+                    "config": point["config"], "valid_repeats": point["valid_repeats"],
+                    "paired_reference_order_counts": point.get("paired_reference_order_counts")}
+        near = [candidate for candidate in candidates if candidate[0][metric] <= group[metric] * (1 + near_fraction)]
+        overlapping = [candidate for candidate in candidates if best_ci and candidate[0]["ci95"].get(metric)
+                       and candidate[0]["ci95"][metric][0] <= best_ci[1] and candidate[0]["ci95"][metric][1] >= best_ci[0]]
+        sort_points = lambda points: sorted((support(candidate) for candidate in points), key=lambda point: (point["requested_memory_clock_mhz"], point["requested_graphics_clock_mhz"], point["group_id"]))
+        stratum = json.loads(key)
+        comparable = [point for point in populations if _clock_stratum(point, True) == {name: value for name, value in stratum.items() if name not in ("objective", "memory_clock_mhz")}
+                      and (across_memory_domains or point["config"].get("memory_clock_mhz") == stratum["memory_clock_mhz"])]
+        observed_pairs = sorted({(point["config"].get("graphics_clock_mhz"), point["config"].get("memory_clock_mhz")) for point in comparable})
+        eligible_pairs = sorted({(point[0]["config"].get("graphics_clock_mhz"), point[0]["config"].get("memory_clock_mhz")) for point in candidates})
+        as_pairs = lambda pairs: [{"graphics_clock_mhz": graphics, "memory_clock_mhz": memory} for graphics, memory in pairs]
+        results.append({"stratum": json.loads(key), "gpu_name": group.get("gpu_name"), "best_group_id": group["group_id"],
+                        "objective": json.loads(key)["objective"], "metric": metric, "metric_value": group[metric], "metric_ci95": best_ci,
+                        "config": group["config"], "winning_requested_graphics_clock_mhz": group["config"].get("graphics_clock_mhz"),
+                        "winning_requested_memory_clock_mhz": group["config"].get("memory_clock_mhz"),
+                        "winning_achieved_graphics_clock_mhz": group.get("graphics_clock_mhz"),
+                        "winning_achieved_memory_clock_mhz": group.get("memory_clock_mhz"),
+                        "throughput": group[throughput], "own_clock_observed_max_throughput": clock_peak,
+                        "throughput_fraction_of_own_clock_observed_peak": group[throughput] / clock_peak,
+                        "throughput_threshold_fraction": fraction, "candidate_groups": len(candidates),
+                        "observed_valid_frequency_pairs": as_pairs(observed_pairs), "eligible_frequency_pairs": as_pairs(eligible_pairs),
+                        "observed_frequency_pairs_without_eligible_candidate": as_pairs(sorted(set(observed_pairs) - set(eligible_pairs))),
+                        "selection_scope": "best observed eligible measured point; incomplete geometry, frequency or profiler coverage cannot establish the global hardware optimum",
+                        "near_optimum_relative_tolerance": near_fraction,
+                        "near_optimum_support_points": sort_points(near),
+                        "uncertainty_overlap_support_points": sort_points(overlapping),
+                        "all_eligible_support_points": sort_points(candidates),
+                        "optimal_interval_kind": "discrete measured support points; unmeasured gaps and continuous intervals are not inferred",
+                        "optimization_scope": "across measured graphics and memory frequency domains" if across_memory_domains else "across measured graphics frequencies at one fixed memory domain",
+                        "utilization_basis": "complete observed geometry sweep maximum at each frequency pair; no theoretical saturation proof",
+                        "energy_scope": "whole-device energy per counted logical payload bit or dense tensor FLOP; physical component energy is not isolated"})
+    return results
 
 def _verification_coverage(groups, fraction, min_repeats, cross_clock):
     buckets = {}
@@ -683,12 +947,15 @@ def _associate_controls(groups: list[dict[str, Any]], min_repeats: int) -> list[
         if group["workload"] not in _TENSOR_WORKLOADS | _MEMORY_WORKLOADS or group["valid_repeats"] < min_repeats:
             continue
         matches = [control for control in controls if control["gpu_uuid"] == group["gpu_uuid"]
+                   and control.get("benchmark_sha256") == group.get("benchmark_sha256")
+                   and control.get("measurement_stratum") == group.get("measurement_stratum")
+                   and control.get("treatment_design_stratum") == group.get("treatment_design_stratum")
                    and all(control["config"].get(field) == group["config"].get(field) for field in match_fields)]
         if matches:
             matched.append({"workload_group_id": group["group_id"], "control_groups": [
                 {"group_id": control["group_id"], "board_power_w": control["board_power_w"],
                  "incremental_activation_power_w": control["incremental_power_w"]} for control in matches],
-                "matching_fields": ["gpu_uuid", *match_fields],
+                "matching_fields": ["gpu_uuid", "benchmark_sha256", "measurement_stratum", "treatment_design_stratum", *match_fields],
                 "note": "Descriptive activation controls only. Different instruction mixes prevent automatic component-energy subtraction."})
     return matched
 
@@ -697,6 +964,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
               policy: AnalysisPolicy | Mapping[str, Any] | None = None, min_repeats: int = 3) -> dict[str, Any]:
     if not 0 < throughput_fraction <= 1 or min_repeats < 1:
         raise ValueError("throughput_fraction must be in (0, 1], min_repeats must be positive")
+    policy = policy if isinstance(policy, AnalysisPolicy) else AnalysisPolicy(**(policy or {}))
     trials = []
     seen_ids = set()
     duplicate_ids = []
@@ -728,6 +996,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
         group = {"group_id": digest, "gpu_uuid": repeats[0]["gpu_uuid"], "workload": repeats[0]["workload"],
                  "config": {k: v for k, v in repeats[0]["config"].items() if k not in _REPEAT_KEYS},
                  "benchmark_sha256": repeats[0]["benchmark_sha256"], "measurement_stratum": repeats[0]["measurement_stratum"],
+                 "treatment_design_stratum": repeats[0]["treatment_design_stratum"],
                  "repeats": len(repeats), "valid_repeats": len(valid), "trial_ids": [t["trial_id"] for t in repeats],
                  "duplicate_repeat_indices_ignored": duplicate_repeat_indices,
                  "target_verified": bool(valid) and all(t["target_verified"] for t in valid),
@@ -735,6 +1004,11 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
                  "count_energy_time_alignment_exact": bool(valid) and all(t["count_energy_time_alignment_exact"] for t in valid),
                  "clock_comparison_controlled": bool(valid) and all(t["clock_comparison_controlled"] for t in valid),
                  "diagnostic_only": repeats[0]["diagnostic_only"],
+                 "gpu_name": repeats[0]["gpu_name"],
+                 "baseline_valid": bool(valid) and all(t["baseline_valid"] for t in valid),
+                 "operational_idle_increment_eligible": bool(valid) and all(t["operational_idle_increment_eligible"] for t in valid),
+                 "paired_active_reference_eligible": bool(valid) and all(t["paired_active_reference_eligible"] for t in valid),
+                 "paired_reference_order_counts": {order: sum(t.get("paired_active_reference_protocol", {}).get("order") == order for t in valid) for order in ("AB", "BA")},
                  "confidence": "repeat_median" if len(valid) >= min_repeats else "insufficient_valid_repeats", "ci95": {}}
         for metric in _METRICS:
             values = [value for t in valid if (value := _finite(t.get(metric))) is not None]
@@ -742,10 +1016,18 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             group["ci95"][metric] = _median_ci(values, int(digest, 16))
         statuses = {trial["ncu_status"] for trial in valid}
         group["ncu_status"] = "fail" if "fail" in statuses else "pass" if statuses == {"pass"} else "unprofiled" if statuses == {"unprofiled"} else "inconclusive"
+        group["paired_reference_both_orders_observed"] = all(group["paired_reference_order_counts"].values())
+        group["paired_reference_counterbalanced"] = (group["paired_reference_both_orders_observed"]
+                                                       and group["paired_reference_order_counts"]["AB"] == group["paired_reference_order_counts"]["BA"])
+        group["paired_reference_order_count_imbalance"] = group["paired_reference_order_counts"]["AB"] - group["paired_reference_order_counts"]["BA"]
+        group["paired_active_reference_eligible"] = group["paired_active_reference_eligible"] and group["paired_reference_counterbalanced"]
+        arm_medians = {order: _median(trial.get("paired_active_reference_power_w") for trial in valid if trial.get("paired_active_reference_protocol", {}).get("order") == order) for order in ("AB", "BA")}
+        group["paired_reference_order_medians_power_w"] = arm_medians
+        group["paired_reference_order_effect_power_w"] = arm_medians["AB"] - arm_medians["BA"] if None not in arm_medians.values() else None
         group["ncu_target_suitability"] = group["target_verified"]
         group["ncu_utilization_status"] = "diagnostic_only" if valid and all(trial["ncu_utilization_status"] == "diagnostic_only" for trial in valid) else "inconclusive"
         groups.append(group)
-    return {"schema_version": 1, "trials": trials, "groups": groups, "duplicate_trial_ids_ignored": duplicate_ids,
+    return {"schema_version": 2, "trials": trials, "groups": groups, "duplicate_trial_ids_ignored": duplicate_ids,
             "within_clock_best": _selections(groups, throughput_fraction, min_repeats, False),
             "cross_clock_best": _selections(groups, throughput_fraction, min_repeats, True),
             "within_clock_best_total_energy": _selections(groups, throughput_fraction, min_repeats, False, total_energy=True),
@@ -756,14 +1038,24 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             "verified_target_within_clock_best": _selections(groups, throughput_fraction, min_repeats, False, True),
             "verified_target_cross_clock_best": _selections(groups, throughput_fraction, min_repeats, True, True),
             "verified_target_coverage": _verification_coverage(groups, throughput_fraction, min_repeats, False) + _verification_coverage(groups, throughput_fraction, min_repeats, True),
+            "empirical_gpu_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction),
+            "empirical_gpu_overall_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction, across_memory_domains=True),
+            "metric_aliases": {"pj_per_op": "legacy operational idle increment per reported benchmark operation; tensor FLOP uses explicit operational_idle_increment_pj_per_flop",
+                               "pj_per_logical_byte": "legacy operational idle increment per logical byte; divide by 8 for logical-bit metric",
+                               "incremental_power_w": "operational_idle_increment_power_w; a baseline contrast, not physical switching power"},
             "selection_policy": {"throughput_fraction": throughput_fraction, "min_repeats": min_repeats,
+                                 "primary_energy_objective": "whole-device total energy per logical bit or FLOP",
+                                 "frequency_utilization_constraint": "own-frequency complete measured geometry peak; global-near-peak optima are reported separately",
+                                 "baseline_objectives": "separate matched operational idle increment and paired active-reference contrast; never automatically substituted for total energy",
                                  "ci_method": "deterministic percentile bootstrap of repeat medians (1000 draws); n=3 intervals are coarse"},
             "notes": ["No fabricated measurement or architecture-specific idle wattage is supplied.",
                       "A device power limit is not measured consumption, and headline FLOP/s is not achieved throughput.",
                       "Idle subtraction cannot separate physical static leakage from refresh/clock/background power.",
                       "L1/L2/HBM logical bytes are not guaranteed physical traffic; numeric profiler evidence is recomputed for target verification.",
                       "Verified selections require exact matching work/power windows; old records retain explicitly qualified stationary-rate estimates.",
-                      "Uncontrolled clocks are exploratory and excluded from fixed/cross-clock optimization selections."]}
+                      "Uncontrolled default-clock trials are comparative and excluded from controlled-frequency optimum searches.",
+                      "Each GPU UUID has its own empirically selected optimum; 1110 MHz is a mandatory supported sweep point, not a preset optimum.",
+                      "Near-optimum and uncertainty-overlap sets contain only measured support points; no continuous interval or unmeasured gap is claimed."]}
 
 
 def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[str, str]:
@@ -773,7 +1065,7 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
     json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
     csv_path = destination / "trials.csv"
     fields = ["trial_id", "gpu_uuid", "gpu_name", "workload", "valid", "target_verified", "ncu_status", "ncu_target_suitability", "ncu_utilization_status", "profiler_suitability_status",
-              "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "duration_s", *_METRICS,
+              "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
               "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source"]
     with csv_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)

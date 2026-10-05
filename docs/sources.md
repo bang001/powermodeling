@@ -1,6 +1,6 @@
 # Primary sources and experimental decisions
 
-Reviewed 2026-10-04 (UTC). These links support architectural facts and API semantics. Measurement durations, 95% throughput threshold, grid sizes and analysis rejection tolerances are project policies, not NVIDIA guarantees. No hardware energy result is claimed by this document.
+Reviewed 2026-10-05 (UTC). These links support architectural facts and API semantics. Measurement durations, 95% throughput threshold, grid sizes and analysis rejection tolerances are project policies, not NVIDIA guarantees. No hardware energy result is claimed by this document.
 
 | ID | Primary source | Relevant section and consequence |
 |---|---|---|
@@ -21,14 +21,15 @@ Reviewed 2026-10-04 (UTC). These links support architectural facts and API seman
 | S15 | [cuBLAS documentation](https://docs.nvidia.com/cuda/cublas/index.html), [CUDA C++ Programming Guide 12.9.1](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-c-programming-guide/index.html) | GEMM datatype/computation mode and warp-level matrix operations must be explicit. FP16 input with FP32 accumulation is distinct from CUDA-core half arithmetic. Record toolkit/cuBLAS version and verify actual emitted tensor instructions separately. |
 | S16 | [Nsight Compute CLI](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html) | `--profile-from-start off` enables application-controlled profiler start/stop; `--devices` selects CUDA device indices for profiling and metric queries. `--log-file` separates tool output, `--csv --page raw --print-units base` preserves machine-readable base units. Kernel/application replay, clock control and cache control must be explicit; setup and warmup do not belong in target evidence. |
 | S17 | [Nsight Compute 2025.2 support and downloads](https://developer.nvidia.com/tools-overview/nsight-compute/get-started-2025_2), [Nsight Compute 2025.3 release notes](https://developer.nvidia.com/tools-overview/nsight-compute/get-started-2025_3) | 2025.2 lists GV100, A100 and H100; its 2025.2 Update 1 supports CUDA 12.9 Update 1. 2025.3 explicitly drops Volta GV100/GV10b support. A comparison compiler with `sm_70` does not guarantee that the selected profiler supports V100; use an appropriate `--ncu` executable and check its driver requirements. |
+| S18 | [NVML supported graphics clocks](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html), [NVML R550 default applications clock semantics](https://docs.nvidia.com/deploy/archive/R550/nvml-api/group__nvmlDeviceQueries.html) | Supported graphics clocks are queried for each memory-clock domain. The default applications pair is distinct from the current clock policy and achieved frequencies. Current NVML marks applications-clock APIs deprecated; capability errors are recorded and an unknown default is not invented. This project uses the CUDA 12 comparison toolchain and includes supported exact 1110 MHz anchors plus approximate 90 MHz grid points as experimental policies. |
 
 ## Claims that require measurements
 
-- The minimum pJ/FLOP or pJ/byte of a specific GPU and its idle power.
+- The minimum pJ/FLOP or pJ/logical-bit of a specific SXM GPU and its idle power.
 - Whether a working set is actually served predominantly by L1, L2 or HBM.
 - Which SM/address combinations are near/far on a given board.
 - Whether a memory-power scope is available and what circuitry its sensor includes.
 - The lowest SM/memory frequency pair that retains the observed maximum bandwidth.
 - The additive validity of coefficients when Tensor and memory paths operate concurrently.
 
-The code records observables and analysis assumptions. Board-wide idle subtraction and workload slopes remain operational estimates unless independently validated with counters/rails and suitable mixed-workload holdouts.
+The code records observables and analysis assumptions. Whole-device total energy, matched powered-idle increments and paired active-reference contrasts are separate objectives. Baseline contrasts and workload slopes remain operational estimates unless independently validated with counters/rails and suitable mixed-workload holdouts.

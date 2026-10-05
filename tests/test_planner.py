@@ -1,8 +1,10 @@
 """Plan failures must precede device allocation or clock mutation."""
 import copy
+import json
+from pathlib import Path
 import unittest
 
-from powermodeling.planner import benchmark_command, expand_plan, numeric_expression, resolve_clocks
+from powermodeling.planner import benchmark_command, expand_plan, numeric_expression, resolve_clock_plan, resolve_clocks
 
 
 class PlannerTests(unittest.TestCase):
@@ -67,7 +69,7 @@ class PlannerTests(unittest.TestCase):
     def test_hbm_stride_aliasing_and_default_footprint(self):
         with self.assertRaises(ValueError):
             expand_plan(self.config("hbm", {"working_set_bytes": "l2_bytes*8", "stride_elements": 32}), self.device())
-        self.assertEqual(len(expand_plan(self.config("hbm"), self.device())["trials"]), 3)
+        self.assertEqual(len(expand_plan(self.config("hbm"), self.device())["trials"]), 4)
 
     def test_profile_command_has_explicit_region_and_one_measured_batch(self):
         trial = expand_plan(self.config(), self.device())["trials"][0]
@@ -81,6 +83,159 @@ class PlannerTests(unittest.TestCase):
         a, b = expand_plan(config, self.device()), expand_plan(copy.deepcopy(config), self.device())
         self.assertEqual(a["trials"], b["trials"])
         self.assertEqual(len({trial["condition_id"] for trial in a["trials"]}), 2)
+
+    def supported(self):
+        return {"supported_pairs": [
+            {"graphics_mhz": g, "memory_mhz": m}
+            for m, graphics in ((1000, [900, 945, 990, 1035, 1080, 1110, 1170, 1260]),
+                                (1500, [930, 1005, 1080, 1155, 1230, 1305]))
+            for g in graphics], "default_applications_graphics_mhz": 1170,
+            "default_applications_memory_mhz": 1000,
+            "applications_graphics_mhz": 990, "applications_memory_mhz": 1000}
+
+    def test_grid_uses_nearest_advertised_pairs_with_endpoints_and_exact_anchor(self):
+        pairs, coverage = resolve_clock_plan({"clock_sweep": {"graphics_step_mhz": 90,
+            "memory_mhz": [1000]}}, self.supported())
+        fixed = [pair["graphics_mhz"] for pair in pairs if pair["memory_mhz"] == 1000]
+        self.assertEqual(fixed, [900, 990, 1080, 1110, 1170, 1260])
+        self.assertEqual(coverage["memory_domains"][0]["requested_grid_mhz"], [900, 990, 1080, 1170, 1260])
+        self.assertEqual(coverage["memory_domains"][0]["actual_gaps_mhz"], [90, 90, 30, 60, 90])
+        self.assertEqual(coverage["memory_domains"][0]["required_points"][0]["status"], "included")
+        self.assertIn({"graphics_mhz": None, "memory_mhz": None}, pairs)
+
+    def test_unsupported_exact_anchor_has_explicit_reason_and_no_nearest_alias(self):
+        pairs, coverage = resolve_clock_plan({"clock_sweep": {"graphics_step_mhz": 90,
+            "memory_mhz": [1500]}}, self.supported())
+        domain = coverage["memory_domains"][0]
+        self.assertNotIn({"graphics_mhz": 1110, "memory_mhz": 1500}, pairs)
+        self.assertEqual(domain["required_points"], [{"mhz": 1110, "status": "unavailable",
+            "reason": "not_an_advertised_discrete_graphics_clock"}])
+        self.assertFalse(coverage["required_anchor_coverage_complete"])
+        self.assertTrue(any(point["error_mhz"] != 0 for point in domain["grid_mapping"]))
+
+    def test_anchor_outside_domain_is_never_added_or_used_as_operating_bound(self):
+        supported = {"supported_pairs": [{"graphics_mhz": 1200, "memory_mhz": 1500},
+                                        {"graphics_mhz": 1350, "memory_mhz": 1500}]}
+        pairs, coverage = resolve_clock_plan({}, supported)
+        self.assertEqual(coverage["memory_domains"][0]["min_graphics_mhz"], 1200)
+        self.assertEqual(coverage["memory_domains"][0]["required_points"][0]["reason"], "outside_advertised_operating_range")
+        self.assertNotIn(1110, [pair["graphics_mhz"] for pair in pairs])
+
+    def test_each_memory_domain_has_own_bounds_and_anchor_coverage(self):
+        pairs, coverage = resolve_clock_plan({"clock_sweep": {"all_memory_clocks": True}}, self.supported())
+        self.assertEqual(coverage["selected_memory_mhz"], [1000, 1500])
+        self.assertEqual([(d["min_graphics_mhz"], d["max_graphics_mhz"]) for d in coverage["memory_domains"]],
+                         [(900, 1260), (930, 1305)])
+        self.assertEqual(len(pairs), len({(p["graphics_mhz"], p["memory_mhz"]) for p in pairs}))
+
+    def test_shipped_dvfs_sweeps_middle_memory_domain_as_well_as_endpoints(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / "configs" / "dvfs.json").read_text())
+        supported = self.supported()
+        supported["supported_pairs"].extend({"graphics_mhz": g, "memory_mhz": 1250}
+                                           for g in [990, 1110, 1200])
+        plan = expand_plan(config, self.device(), supported)
+        coverage = plan["clock_sweep_coverage"]
+        self.assertEqual(coverage["selected_memory_mhz"], [1000, 1250, 1500])
+        self.assertEqual(coverage["memory_selection_policy"], "all_supported_memory_domains")
+        middle = [trial for trial in plan["trials"] if trial["clocks"]["memory_mhz"] == 1250]
+        self.assertTrue(middle)
+        self.assertTrue(any(trial["clocks"]["graphics_mhz"] == 1110 for trial in middle))
+
+    def test_default_grid_and_required_aliases_keep_one_physical_trial_condition(self):
+        supported = self.supported()
+        supported["default_applications_graphics_mhz"] = 1110
+        pairs, coverage = resolve_clock_plan({"clock_sweep": {"memory_mhz": [1000]}}, supported)
+        row = next(row for row in coverage["clock_conditions"] if row["clocks"] == {"graphics_mhz": 1110, "memory_mhz": 1000})
+        self.assertIn("required_exact_1110_mhz", row["selection_reasons"])
+        self.assertIn("advertised_default_fixed_pair", row["selection_reasons"])
+        self.assertEqual(sum(p["graphics_mhz"] == 1110 for p in pairs), 1)
+
+    def test_unknown_default_does_not_use_current_or_incoming_application_clock(self):
+        supported = self.supported()
+        supported.pop("default_applications_graphics_mhz")
+        supported.pop("default_applications_memory_mhz")
+        pairs, coverage = resolve_clock_plan({}, supported)
+        self.assertEqual(coverage["advertised_default"]["status"], "unavailable")
+        self.assertFalse(coverage["default_policy_reference"]["factory_default_policy_verified"])
+        self.assertEqual(coverage["default_policy_reference"]["status"], "included_unverified_factory_default")
+        null_row = next(row for row in coverage["clock_conditions"] if row["clocks"]["graphics_mhz"] is None)
+        self.assertEqual(null_row["clock_policy"], "incoming_policy_reference")
+
+    def test_default_fixedpair_can_be_separate_from_selected_memory_sweep(self):
+        pairs, coverage = resolve_clock_plan({"clock_sweep": {"memory_mhz": [1500]}}, self.supported())
+        self.assertIn({"graphics_mhz": 1170, "memory_mhz": 1000}, pairs)
+        self.assertEqual(coverage["selected_memory_mhz"], [1500])
+        self.assertEqual(len(coverage["memory_domains"]), 1)
+
+    def test_sparse_native_grid_reports_large_gap_without_fabricating_clock(self):
+        supported = {"supported_pairs": [{"graphics_mhz": g, "memory_mhz": 1000} for g in [900, 1200, 1500]]}
+        pairs, coverage = resolve_clock_plan({}, supported)
+        self.assertEqual(coverage["memory_domains"][0]["actual_gaps_mhz"], [300, 300])
+        self.assertEqual({p["graphics_mhz"] for p in pairs}, {None, 900, 1200, 1500})
+
+    def test_invalid_sweep_policies_and_unadvertised_explicit_pairs_fail(self):
+        cases = [
+            {"clock_sweep": {"graphics_step_mhz": 0}},
+            {"clock_sweep": {"graphics_step_mhz": True}},
+            {"clock_sweep": {"graphics_step_mhz": 90, "graphics_quantiles": [1]}},
+            {"clock_sweep": {"memory_mhz": [1000], "memory_quantiles": [1]}},
+            {"clock_sweep": {"memory_mhz": [1234]}},
+            {"clock_sweep": {"required_graphics_mhz": [1110, 1110]}},
+            {"clock_sweep": {"include_default_policy": 1}},
+            {"clock_pairs": [{"graphics_mhz": 900, "memory_mhz": 1000}], "clock_sweep": {}},
+            {"clock_pairs": [{"graphics_mhz": 1110, "memory_mhz": 1500}]},
+        ]
+        for config in cases:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                resolve_clocks(config, self.supported())
+        with self.assertRaisesRegex(ValueError, "invent operating ranges"):
+            resolve_clocks({}, {})
+
+    def test_additional_anchors_cannot_remove_study_mandatory_1110_point(self):
+        pairs, coverage = resolve_clock_plan({"clock_sweep": {"memory_mhz": [1000],
+            "required_graphics_mhz": [990]}}, self.supported())
+        self.assertEqual(coverage["required_graphics_mhz"], [990, 1110])
+        self.assertIn({"graphics_mhz": 1110, "memory_mhz": 1000}, pairs)
+
+    def test_plan_records_clock_coverage_sxm_and_alias_provenance(self):
+        plan = expand_plan({"clock_sweep": {"memory_mhz": [1000]},
+                            "experiments": [{"workload": "tensor"}]}, self.device(), self.supported())
+        self.assertEqual(plan["device"]["target_form_factor"], "SXM")
+        self.assertEqual(plan["clock_sweep_coverage"]["requested_step_mhz"], 90)
+        self.assertTrue(all("clock_policy" in t and "clock_selection_reasons" in t for t in plan["trials"]))
+        self.assertEqual(len({t["trial_id"] for t in plan["trials"]}), len(plan["trials"]))
+
+    def test_paired_orders_are_balanced_by_repeat_without_splitting_condition(self):
+        plan = expand_plan(self.config("tensor"), self.device())
+        self.assertEqual(len({t["condition_id"] for t in plan["trials"]}), 1)
+        orders = [t["treatment_protocol"]["order"] for t in sorted(plan["trials"], key=lambda t: t["repeat"])]
+        self.assertNotEqual(orders[0], orders[1])
+        self.assertEqual(orders[0], orders[2])
+        self.assertEqual(orders.count("AB"), 2)
+        self.assertEqual(orders.count("BA"), 2)
+        self.assertEqual(plan["estimated_minimum_seconds"], 4*(2*12+3*3+2*6))
+        self.assertIn("--paired-reference", benchmark_command("bench", plan["trials"][0]))
+        self.assertIn("--paired-reference", benchmark_command("bench", plan["trials"][0], profiling=True))
+        self.assertIn("--profile-region", benchmark_command("bench", plan["trials"][0], profiling=True))
+
+    def test_three_repeat_legacy_diagnostic_retains_explicit_order_imbalance(self):
+        config = self.config("tensor")
+        config["repeats"] = 3
+        plan = expand_plan(config, self.device())
+        orders = [trial["treatment_protocol"]["order"] for trial in plan["trials"]]
+        self.assertEqual(sorted((orders.count("AB"), orders.count("BA"))), [1, 2])
+        self.assertTrue(all("imbalance" in trial["treatment_protocol"]["order_balance_note"] for trial in plan["trials"]))
+
+    def test_pairing_defaults_and_opt_out_are_explicit(self):
+        for workload in ("control", "l2_latency", "gemm"):
+            plan = expand_plan(self.config(workload), self.device())
+            self.assertNotIn("treatment_protocol", plan["trials"][0])
+        config = self.config("tensor")
+        config["paired_reference"] = False
+        self.assertNotIn("treatment_protocol", expand_plan(config, self.device())["trials"][0])
+        config = self.config("gemm")
+        config["experiments"][0]["paired_reference"] = True
+        self.assertEqual(expand_plan(config, self.device())["trials"][0]["treatment_protocol"]["reference_matching"], "coarse_unmatched_geometry")
 
 
 if __name__ == "__main__":

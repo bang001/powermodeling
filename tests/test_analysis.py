@@ -19,7 +19,7 @@ def synthetic_trial(workload="tensor", active_power=150.0, throughput=1e12, repe
             t = start + index / 4
             samples.append({"t_s": t, "power_w": power, "energy_mj": (accumulated + power * (t - start)) * 1000,
                             "graphics_clock_mhz": 1200, "memory_clock_mhz": 1000, "temperature_c": 50,
-                            "throttle_reasons": 0, "compute_processes": [], "graphics_processes": []})
+                            "throttle_reasons": 0, "power_limit_w": 400, "compute_processes": [], "graphics_processes": []})
         phases[name] = {"start_s": start, "end_s": end, "samples": samples}
         accumulated += power * (end - start)
     return {"trial_id": f"synthetic-{repeat}-{next(_TRIAL_SERIAL)}", "workload": workload, "status": "complete",
@@ -44,6 +44,75 @@ def verified_profile(record):
             sample["memory_clock_mhz"] = 1593
     record["samples"] = [sample for phase in record["phases"].values() for sample in phase["samples"]]
     record["validation"] = {"profiler_evidence": evidence}
+    return record
+
+
+def empirical_record(uuid, gfx, memory=1593, workload="hbm", access="read", power=150, throughput=100, repeat=0, blocks=80):
+    """Synthetic fixture only: exercise independent GPU/frequency decisions."""
+    from test_ncu_validation import pass_fixture, change
+    from powermodeling.validation import SM_HZ
+    record = synthetic_trial(workload, active_power=power, throughput=throughput, repeat=repeat)
+    _, evidence = pass_fixture(workload, access)
+    binding, _ = pass_fixture(workload, access)
+    record["config"].update(binding["config"])
+    record["config"].update(gpu_uuid=uuid, graphics_clock_mhz=gfx, memory_clock_mhz=memory, blocks=blocks)
+    record["benchmark"].update({key: value for key, value in binding["benchmark"].items() if key not in ("logical_bytes", "kernel_launches")})
+    record["benchmark"]["blocks"] = blocks
+    record["benchmark"]["batch_launches"] = 1
+    record["condition_id"] = f"{uuid}-{gfx}-{memory}-{workload}-{access}-{blocks}"
+    record["provenance"] = binding["provenance"]
+    record["device"]["name"] = "Synthetic SXM fixture, not a hardware measurement"
+    record["config"]["target_form_factor"] = "SXM"
+    for phase in record["phases"].values():
+        for sample in phase["samples"]:
+            sample.update(graphics_clock_mhz=gfx, memory_clock_mhz=memory, power_limit_w=400)
+    record["samples"] = [sample for phase in record["phases"].values() for sample in phase["samples"]]
+    evidence["condition_id"] = record["condition_id"]
+    evidence["gpu_uuid"] = uuid
+    evidence["profile_context"]["gpu_uuid"] = uuid
+    for sample in evidence["profile_context"]["profile_active_nvml_samples"]:
+        sample.update(graphics_clock_mhz=gfx, memory_clock_mhz=memory)
+    evidence["profile_provenance"]["observed_gpu_uuid"] = uuid
+    evidence["profile_provenance"]["observed_device_records"][0]["uuid"] = uuid
+    evidence["profile_provenance"]["requested_clocks"] = {"graphics_mhz": gfx, "memory_mhz": memory}
+    evidence["profile_provenance"]["parameters"]["blocks"] = blocks
+    evidence["profile_benchmark"]["blocks"] = blocks
+    change(evidence, SM_HZ, gfx * 1e6)
+    record["validation"] = {"profiler_evidence": evidence}
+    return record
+
+
+def paired_record(power=150, reference_power=80, order="AB", workload="hbm"):
+    record = empirical_record("GPU-paired", 1200, workload=workload, power=power)
+    reference_phase = copy.deepcopy(record["phases"]["measure"])
+    reference = copy.deepcopy(record["benchmark"])
+    for sample in reference_phase["samples"]:
+        sample["power_w"] = reference_power
+    reference.update(operations=0, logical_bytes=0, sanity={"requested_sm_coverage_complete": True})
+    for epoch in reference["measure_epochs"]:
+        epoch.update(operations=0, logical_bytes=0)
+    shifted = "measure" if order == "AB" else "active_reference"
+    record["phases"]["active_reference"] = reference_phase
+    for name in (shifted, "idle_post"):
+        phase = record["phases"][name]
+        phase["start_s"] += 12
+        phase["end_s"] += 12
+        for sample in phase["samples"]:
+            sample["t_s"] += 12
+    benchmark_shift = record["benchmark"] if order == "AB" else reference
+    for epoch in benchmark_shift["measure_epochs"]:
+        epoch["start_s"] += 12
+        epoch["end_s"] += 12
+    for phase in record["phases"].values():
+        for sample in phase["samples"]:
+            sample.pop("energy_mj", None)
+    record["samples"] = [{"phase": name, **sample} for name, phase in record["phases"].items() for sample in phase["samples"]]
+    record["active_reference"] = reference
+    record["benchmark"]["paired_reference_context_allocated"] = True
+    record["validation"]["profiler_evidence"]["profile_benchmark"]["paired_reference_context_allocated"] = True
+    record["treatment_protocol"] = {"kind": "paired_active_reference", "order": order,
+        "same_process": True, "same_allocations": True, "same_clock_policy": True,
+        "launch_geometry_matched": workload != "gemm", "reference_kind": "issue_loop", "reference_workload": "control"}
     return record
 
 
@@ -106,7 +175,7 @@ class AnalysisTests(unittest.TestCase):
         trial = analyze_trial(record)
         self.assertFalse(trial["valid"])
         self.assertIn("short_plateau:measure", trial["issues"])
-        self.assertIn("missing_idle_baseline", trial["issues"])
+        self.assertIn("missing_idle_baseline", trial["baseline_issues"])
         record = synthetic_trial()
         record["phases"]["measure"]["samples"] = [s for s in record["phases"]["measure"]["samples"] if not 10 < s["t_s"] < 14]
         trial = analyze_trial(record)
@@ -371,7 +440,7 @@ class AnalysisTests(unittest.TestCase):
     def test_unknown_process_inventory_is_not_empty_inventory(self):
         record = synthetic_trial()
         record["phases"]["idle_pre"]["samples"][10]["graphics_processes"] = None
-        self.assertIn("missing_process_inventory:graphics_processes", analyze_trial(record)["issues"])
+        self.assertIn("missing_process_inventory:graphics_processes", analyze_trial(record)["baseline_issues"])
 
     def test_seed_and_binary_are_separate_conditions_and_duplicate_ids_not_repeats(self):
         a = synthetic_trial("hbm", repeat=0)
@@ -415,7 +484,208 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("missing_clock_telemetry:graphics_clock_mhz", analyze_trial(record)["issues"])
         record = synthetic_trial()
         record["phases"]["idle_pre"]["samples"][12]["power_w"] = -1
-        self.assertIn("negative_power:idle_pre", analyze_trial(record)["issues"])
+        self.assertIn("negative_power:idle_pre", analyze_trial(record)["baseline_issues"])
+
+    def test_total_is_preserved_when_idle_is_missing_and_increment_optimum_is_withheld(self):
+        records = [empirical_record("GPU-total", 1200, workload="hbm", repeat=i) for i in range(3)]
+        for record in records:
+            record["phases"].pop("idle_post")
+        trial = analyze_trial(records[0])
+        self.assertTrue(trial["valid"], trial["issues"])
+        self.assertFalse(trial["baseline_valid"])
+        self.assertIsNotNone(trial["total_pj_per_logical_bit"])
+        self.assertFalse(trial["operational_idle_increment_eligible"])
+        summary = summarize(records)
+        self.assertEqual(summary["within_clock_best"], [])
+        self.assertEqual(len(summary["within_clock_best_total_energy"]), 1)
+        self.assertEqual([point["objective"] for point in summary["empirical_gpu_energy_optima"]], ["total"])
+
+    def test_idle_downclock_cannot_win_incremental_objective_but_total_can(self):
+        records = [empirical_record("GPU-idle", 1200, repeat=i) for i in range(3)]
+        for record in records:
+            for sample in record["phases"]["idle_pre"]["samples"]:
+                sample["graphics_clock_mhz"] = 300
+        summary = summarize(records)
+        self.assertEqual(summary["within_clock_best"], [])
+        self.assertEqual(len(summary["cross_clock_best_total_energy"]), 1)
+        self.assertEqual([point["objective"] for point in summary["empirical_gpu_energy_optima"]], ["total"])
+
+    def test_logical_bit_and_flop_units_and_physical_denominator_remain_distinct(self):
+        memory = analyze_trial(empirical_record("GPU-unit", 1200, workload="hbm", throughput=1e12))
+        self.assertEqual(memory["total_pj_per_logical_bit"], 150 / 8)
+        self.assertEqual(memory["operational_idle_increment_pj_per_logical_bit"], 100 / 8)
+        self.assertIsNone(memory["total_pj_per_flop"])
+        self.assertIsNone(memory["physical_traffic_energy"]["physical_pj_per_bit"])
+        self.assertIn("energy_window", memory["physical_traffic_energy"]["status"])
+        tensor = analyze_trial(empirical_record("GPU-unit", 1200, workload="tensor", throughput=1e12))
+        self.assertEqual(tensor["total_pj_per_flop"], 150)
+        self.assertEqual(tensor["operational_idle_increment_pj_per_flop"], 100)
+        self.assertIn("multiply-add=2", tensor["flop_count_convention"])
+
+    def test_each_gpu_selects_its_own_frequency_energy_optimum_using_local_utilization(self):
+        records = []
+        winning = {"GPU-v100-synthetic": 930, "GPU-a100-synthetic": 1110, "GPU-h100-synthetic": 1380}
+        for uuid, winner in winning.items():
+            for gfx in (930, 1110, 1380):
+                throughput = gfx / 10
+                # Nonwinning power/FLOP deliberately higher, but every own-clock
+                # geometry trial reaches that clock's observed throughput peak.
+                ratio = 1 if gfx == winner else 2
+                for repeat in range(3):
+                    records.append(empirical_record(uuid, gfx, workload="tensor", power=ratio * throughput,
+                                                    throughput=throughput, repeat=repeat))
+        summary = summarize(records)
+        selected = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
+        self.assertEqual({point["stratum"]["gpu_uuid"]: point["winning_requested_graphics_clock_mhz"] for point in selected}, winning)
+        self.assertTrue(all(point["throughput_fraction_of_own_clock_observed_peak"] == 1 for point in selected))
+        global_peak = [point for point in summary["cross_clock_best_total_energy"] if point["stratum"]["gpu_uuid"] == "GPU-v100-synthetic"][0]
+        self.assertEqual(global_peak["config"]["graphics_clock_mhz"], 1380)
+
+    def test_memory_domain_access_and_unmeasured_gaps_are_separate(self):
+        records = []
+        for memory, gfx, power in ((1215, 930, 100), (1215, 1110, 100), (1215, 1380, 160), (1593, 930, 150), (1593, 1380, 90)):
+            for access in ("read", "copy"):
+                for repeat in range(3):
+                    records.append(empirical_record("GPU-domain", gfx, memory, access=access, power=power, repeat=repeat))
+        summary = summarize(records)
+        total = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
+        self.assertEqual(len(total), 4)
+        first = next(point for point in total if point["stratum"]["memory_clock_mhz"] == 1215 and point["stratum"]["access"] == "read")
+        self.assertEqual({point["requested_graphics_clock_mhz"] for point in first["near_optimum_support_points"]}, {930, 1110})
+        self.assertNotIn(1020, {point["requested_graphics_clock_mhz"] for point in first["all_eligible_support_points"]})
+        self.assertNotIn("optimal_interval_mhz", first)
+        self.assertIn("discrete", first["optimal_interval_kind"])
+
+    def test_failed_or_unprofiled_own_frequency_peak_does_not_lower_eligibility_bar(self):
+        records = []
+        for repeat in range(3):
+            records.append(empirical_record("GPU-coverage", 930, throughput=80, repeat=repeat))
+            peak = empirical_record("GPU-coverage", 930, throughput=100, blocks=160, repeat=repeat)
+            peak["validation"] = {}
+            records.append(peak)
+        self.assertEqual(summarize(records)["empirical_gpu_energy_optima"], [])
+
+    def test_default_clock_is_comparative_and_cannot_set_controlled_optimum(self):
+        records = []
+        for repeat in range(3):
+            records.append(empirical_record("GPU-default", 1110, repeat=repeat))
+            default = empirical_record("GPU-default", 1380, power=51, repeat=repeat)
+            default["config"].update(graphics_clock_mhz=None, memory_clock_mhz=None)
+            records.append(default)
+        points = summarize(records)["empirical_gpu_energy_optima"]
+        self.assertTrue(all(point["winning_requested_graphics_clock_mhz"] == 1110 for point in points))
+
+    def test_paired_active_reference_ab_ba_signed_contrast_and_state_checks(self):
+        for order in ("AB", "BA"):
+            trial = analyze_trial(paired_record(order=order))
+            self.assertTrue(trial["valid"], trial["issues"])
+            self.assertTrue(trial["paired_active_reference_eligible"], trial["paired_active_reference_issues"])
+            self.assertEqual(trial["paired_active_reference_power_w"], 70)
+            self.assertEqual(trial["paired_active_reference_pj_per_logical_bit"], 70 / 100 / 8 * 1e12)
+        negative = analyze_trial(paired_record(power=70, reference_power=80))
+        self.assertEqual(negative["paired_active_reference_power_w"], -10)
+        self.assertFalse(negative["paired_active_reference_eligible"])
+        self.assertTrue(negative["valid"])
+        mismatch = paired_record()
+        for sample in mismatch["phases"]["active_reference"]["samples"]:
+            sample["memory_clock_mhz"] = 1000
+        trial = analyze_trial(mismatch)
+        self.assertFalse(trial["paired_active_reference_eligible"])
+        self.assertIn("paired_state_mismatch:memory_clock_mhz", trial["paired_active_reference_issues"])
+        self.assertTrue(trial["valid"])
+
+    def test_unpaired_control_does_not_auto_subtract_and_gemm_reference_is_coarse(self):
+        record = synthetic_trial()
+        control = copy.deepcopy(record["phases"]["measure"])
+        record["phases"]["active_control"] = control
+        self.assertIsNone(analyze_trial(record)["control_subtracted_power_w"])
+        trial = analyze_trial(paired_record(workload="gemm"))
+        self.assertFalse(trial["paired_active_reference_eligible"])
+        self.assertIn("paired_protocol_unverified:launch_geometry_matched", trial["paired_active_reference_issues"])
+
+    def test_paired_optimum_requires_both_orders_and_reports_order_sensitivity(self):
+        records = []
+        for repeat, order in enumerate(("AB", "BA", "AB", "BA")):
+            record = paired_record(order=order, reference_power=80 if order == "AB" else 82)
+            record["config"]["repeat"] = repeat
+            records.append(record)
+        summary = summarize(records)
+        group = summary["groups"][0]
+        self.assertTrue(group["paired_reference_counterbalanced"])
+        self.assertEqual(group["paired_reference_order_counts"], {"AB": 2, "BA": 2})
+        self.assertEqual(group["paired_reference_order_effect_power_w"], 2)
+        paired = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "paired_active_reference"]
+        self.assertEqual(len(paired), 1)
+        unbalanced = []
+        for repeat in range(3):
+            record = paired_record(order="AB")
+            record["config"]["repeat"] = repeat
+            unbalanced.append(record)
+        summary = summarize(unbalanced)
+        self.assertFalse(summary["groups"][0]["paired_active_reference_eligible"])
+        self.assertFalse(any(point["objective"] == "paired_active_reference" for point in summary["empirical_gpu_energy_optima"]))
+
+    def test_paired_unpaired_and_allocation_contexts_are_independent_repeat_and_clock_strata(self):
+        records = []
+        for repeat in range(3):
+            unpaired = empirical_record("GPU-paired", 1200, repeat=repeat)
+            unpaired["benchmark"]["paired_reference_context_allocated"] = False
+            unpaired["validation"]["profiler_evidence"]["profile_benchmark"]["paired_reference_context_allocated"] = False
+            unpaired["treatment_protocol"] = {"kind": "powered_idle_bracket", "reference_kind": None}
+            paired = paired_record(order="AB" if repeat % 2 else "BA")
+            paired["config"]["repeat"] = repeat
+            records.extend((unpaired, paired))
+        summary = summarize(records)
+        self.assertEqual(len(summary["groups"]), 2)
+        self.assertEqual([group["valid_repeats"] for group in summary["groups"]], [3, 3])
+        self.assertTrue(all(not group["duplicate_repeat_indices_ignored"] for group in summary["groups"]))
+        self.assertEqual({group["treatment_design_stratum"]["kind"] for group in summary["groups"]}, {"paired_active_reference", "powered_idle_bracket"})
+        total = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
+        self.assertEqual(len(total), 2)
+        self.assertEqual({point["stratum"]["treatment_design_stratum"]["paired_reference_context_allocated"] for point in total}, {True, False})
+        paired_group = next(group for group in summary["groups"] if group["treatment_design_stratum"]["kind"] == "paired_active_reference")
+        self.assertEqual(paired_group["paired_reference_order_counts"], {"AB": 1, "BA": 2})
+
+    def test_unequal_order_counts_are_observed_but_not_counterbalanced_optima(self):
+        records = []
+        for repeat, order in enumerate(("AB", "BA", "AB")):
+            record = paired_record(order=order)
+            record["config"]["repeat"] = repeat
+            records.append(record)
+        summary = summarize(records)
+        group = summary["groups"][0]
+        self.assertTrue(group["paired_reference_both_orders_observed"])
+        self.assertFalse(group["paired_reference_counterbalanced"])
+        self.assertEqual(group["paired_reference_order_count_imbalance"], 1)
+        self.assertIsNotNone(group["paired_active_reference_power_w"])
+        self.assertFalse(any(point["objective"] == "paired_active_reference" for point in summary["empirical_gpu_energy_optima"]))
+
+    def test_idle_and_reference_compare_actual_sm_domain_when_available(self):
+        record = paired_record()
+        for phase in record["phases"].values():
+            for sample in phase["samples"]:
+                sample["sm_clock_mhz"] = 1200
+        for sample in record["phases"]["idle_pre"]["samples"]:
+            sample["sm_clock_mhz"] = 900
+        for sample in record["phases"]["active_reference"]["samples"]:
+            sample["sm_clock_mhz"] = 1000
+        trial = analyze_trial(record)
+        self.assertFalse(trial["operational_idle_increment_eligible"])
+        self.assertFalse(trial["paired_active_reference_eligible"])
+        self.assertIn("paired_state_mismatch:sm_clock_mhz", trial["paired_active_reference_issues"])
+        self.assertIn("sm_clock_mhz", trial["baseline_clock_domains_compared"])
+        self.assertFalse(trial["baseline_sm_clock_uses_graphics_proxy"])
+        proxy = analyze_trial(paired_record())
+        self.assertTrue(proxy["baseline_sm_clock_uses_graphics_proxy"])
+        self.assertTrue(proxy["paired_reference_sm_clock_uses_graphics_proxy"])
+
+    def test_treatment_sm_drift_is_not_hidden_by_constant_graphics_clock(self):
+        record = synthetic_trial()
+        for index, sample in enumerate(record["phases"]["measure"]["samples"]):
+            sample["sm_clock_mhz"] = 1200 if index % 2 else 900
+        trial = analyze_trial(record)
+        self.assertFalse(trial["valid"])
+        self.assertIn("clock_drift:sm_clock_mhz", trial["issues"])
 
 
 if __name__ == "__main__":

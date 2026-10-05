@@ -28,6 +28,7 @@ CLOCKS = {"supported_pairs": [
 
 def small_plan(controlled=False):
     return expand_plan({
+        "paired_reference": False,
         "clock_pairs": [{"graphics_mhz": 1200 if controlled else None,
                          "memory_mhz": 1000 if controlled else None}],
         "experiments": [{"workload": "tensor", "parameters": {
@@ -193,7 +194,7 @@ class IntegrationReviewTests(unittest.TestCase):
             with patch("powermodeling.cli._discover", side_effect=AssertionError("offline planning queried GPU")), redirect_stdout(io.StringIO()):
                 status = main(["plan", "--config", str(config), "--device-json", str(device), "--output", str(output)])
             self.assertEqual(status, 0)
-            self.assertEqual(len(json.loads(output.read_text())["trials"]), 3)
+            self.assertEqual(len(json.loads(output.read_text())["trials"]), 4)
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["analyze", "--input", str(Path(directory) / "absent"), "--output", directory]), 2)
 

@@ -211,8 +211,14 @@ def _trial_record(trial, cuda_device, command):
                    "graphics_clock_mhz": trial["clocks"]["graphics_mhz"],
                    "memory_clock_mhz": trial["clocks"]["memory_mhz"],
                    "seconds": trial["seconds"], "warmup_seconds": trial["warmup_seconds"],
-                   "idle_seconds": trial["idle_seconds"], "stage": trial["stage"]},
-        "benchmark": {}, "phases": {}, "samples": [], "events": [], "device": {},
+                   "idle_seconds": trial["idle_seconds"], "stage": trial["stage"],
+                   "clock_selection_policy": trial.get("clock_policy", "fixed_explicit" if trial["clocks"]["graphics_mhz"] is not None else "incoming_policy_reference"),
+                   "clock_selection_reasons": list(trial.get("clock_selection_reasons", [])),
+                   "target_form_factor": cuda_device.get("target_form_factor"),
+                   "form_factor_validation": cuda_device.get("form_factor_validation")},
+        "benchmark": {}, "active_reference": {}, "treatment_protocol": {},
+        "planned_treatment_protocol": trial.get("treatment_protocol"),
+        "phases": {}, "samples": [], "events": [], "device": {},
         "cuda_device": cuda_device, "telemetry": {},
         "validation": {"memory_target_verified": False, "locality": "unclassified", "profiler_evidence": None},
         "quality": {"valid": False, "benchmark_exit_code": None, "runner_errors": [],
@@ -220,7 +226,9 @@ def _trial_record(trial, cuda_device, command):
         "provenance": {"utc": datetime.now(timezone.utc).isoformat(), "command": command,
                        "benchmark_sha256": cuda_device.get("benchmark_sha256"), "python": sys.version,
                        "platform": platform.platform(), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-                       "mps_environment": _mps_environment()},
+                       "mps_environment": _mps_environment(),
+                       "declared_platform": {"target_form_factor": cuda_device.get("target_form_factor"),
+                                             "form_factor_validation": cuda_device.get("form_factor_validation")}},
     }
 
 
@@ -237,7 +245,10 @@ def capture_trial(executable, trial, device, cuda_device, sample_interval_s=0.05
     record["config"]["sample_interval_s"] = sample_interval_s
     quality = record["quality"]
     sampler, process, interrupted = None, None, None
-    timeout = max(120, 5 * (trial["seconds"] + trial["warmup_seconds"] + 2 * trial["idle_seconds"]))
+    paired_requested = (trial.get("treatment_protocol") or {}).get("kind") == "paired_active_reference"
+    arm_count = 2 if paired_requested else 1
+    warmup_count = 3 if paired_requested else 1
+    timeout = max(120, 5 * (arm_count * trial["seconds"] + warmup_count * trial["warmup_seconds"] + 2 * trial["idle_seconds"]))
     try:
         record["device"] = device.metadata()
         record["telemetry"] = record["device"].get("capabilities", {})
@@ -293,14 +304,66 @@ def capture_trial(executable, trial, device, cuda_device, sample_interval_s=0.05
         record["benchmark"] = results[0]
     else:
         quality["runner_errors"].append("Benchmark did not emit exactly one result")
+    protocols = [event for event in record["events"] if event.get("type") == "treatment_protocol"]
+    references = [event for event in record["events"] if event.get("type") == "active_reference_result"]
+    if len(protocols) == 1:
+        record["treatment_protocol"] = protocols[0]
+    elif paired_requested or protocols:
+        quality["runner_errors"].append("Benchmark did not emit exactly one treatment protocol")
+    actual_protocol = record["treatment_protocol"]
+    paired_actual = actual_protocol.get("kind") == "paired_active_reference"
+    if paired_requested:
+        planned = trial["treatment_protocol"]
+        if not paired_actual or actual_protocol.get("order") != planned.get("order"):
+            quality["runner_errors"].append("Actual treatment/reference protocol differed from the planned randomized order")
+    if paired_actual and not paired_requested:
+        quality["runner_errors"].append("Unexpected paired protocol outside the planned treatment/reference design")
+    if paired_actual:
+        if len(references) == 1:
+            record["active_reference"] = references[0]
+        else:
+            quality["runner_errors"].append("Paired trial did not emit exactly one active-reference result")
+    elif references:
+        quality["runner_errors"].append("Unexpected active-reference result outside a paired protocol")
     devices = [event for event in record["events"] if event.get("type") == "device"]
     if len(devices) != 1 or devices[0].get("uuid") != cuda_device["uuid"] or cuda_device["uuid"] != device.uuid:
         quality["runner_errors"].append("Actual benchmark CUDA UUID did not match selected physical NVML GPU")
     try:
         record["phases"] = _phase_records(record["events"], record["samples"])
-        required = [record["phases"][name] for name in ("idle_pre", "measure", "idle_post")]
+        if paired_actual:
+            order = actual_protocol.get("order")
+            if order not in ("AB", "BA"):
+                raise ValueError("Paired protocol order must be AB or BA")
+            arm_order = ["active_reference", "measure"] if order == "AB" else ["measure", "active_reference"]
+            if actual_protocol.get("phase_order") != arm_order:
+                raise ValueError("Paired protocol phase_order disagrees with AB/BA order")
+            required_names = ["idle_pre"]
+            for arm in arm_order:
+                required_names.extend(["warmup_reference" if arm == "active_reference" else "warmup_treatment", arm])
+            required_names.append("idle_post")
+            for arm in arm_order:
+                preparation = record["phases"]["warmup_reference" if arm == "active_reference" else "warmup_treatment"]
+                if preparation["end_s"] > record["phases"][arm]["start_s"]:
+                    raise ValueError("Arm warmup overlaps or follows its measurement")
+                if preparation["start_s"] < record["phases"]["idle_pre"]["end_s"]:
+                    raise ValueError("Arm warmup must occur after the initial idle interval")
+            for key in ("same_process", "same_allocations", "same_clock_policy"):
+                if actual_protocol.get(key) is not True:
+                    raise ValueError(f"Paired protocol missing {key} assurance")
+            reference = record["active_reference"]
+            if reference.get("workload") != "control" or reference.get("reference_kind") != "issue_loop":
+                raise ValueError("Paired reference must be the declared issue-loop control")
+            if any(reference.get(key) != record["benchmark"].get(key) for key in ("blocks", "threads", "batch_launches", "iterations_per_launch")):
+                raise ValueError("Paired reference launch geometry/batching/iterations differ from treatment")
+            if reference.get("sanity", {}).get("requested_sm_coverage_complete") is not True:
+                raise ValueError("Paired reference did not cover every requested SM")
+            if actual_protocol.get("launch_geometry_matched") is not (trial["workload"] != "gemm"):
+                raise ValueError("Paired launch-geometry assurance disagrees with workload")
+        else:
+            required_names = ["idle_pre", "measure", "idle_post"]
+        required = [record["phases"][name] for name in required_names]
         if any(left["end_s"] > right["start_s"] for left, right in zip(required, required[1:])):
-            raise ValueError("Benchmark idle/measure phases overlap or are out of order")
+            raise ValueError("Benchmark idle/measure/reference phases overlap or are out of order")
     except (ValueError, KeyError, TypeError) as exc:
         quality["runner_errors"].append(f"Invalid benchmark phases: {exc}")
     quality.update(_sample_exclusivity(record["samples"], (quality["measurement_pid"],)))
@@ -329,6 +392,10 @@ def run_plan(plan, executable, output_dir, cuda_device, apply_clocks=False,
         raise ValueError("Plan GPU UUID differs from selected CUDA device; regenerate the plan")
     if plan["device"].get("benchmark_sha256") != cuda_device.get("benchmark_sha256"):
         raise ValueError("Benchmark binary differs from plan; regenerate the plan and use a new output directory")
+    # Carry user-declared platform metadata while retaining freshly observed
+    # CUDA UUID/name/capacities. SXM is a module form factor, not an HBM version.
+    cuda_device = {**cuda_device, **{key: plan["device"][key] for key in
+                   ("target_form_factor", "form_factor_validation") if key in plan["device"]}}
     trials = plan["trials"][:limit] if limit else plan["trials"]
     if not apply_clocks and any(any(value is not None for value in t["clocks"].values()) for t in trials):
         raise ValueError("Plan requests clock changes; pass --apply-clocks on an exclusively owned GPU")

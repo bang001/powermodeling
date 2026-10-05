@@ -159,6 +159,66 @@ class ModelTests(unittest.TestCase):
         isolated = {**rows[0], "trial_id": "isolated-heldout", "x": 2, "y": 0, "incremental_power_w": 40, "split": "validation"}
         self.assertFalse(fit_model(rows + [mixed, isolated], ["x", "y"])["additive_validated"])
 
+    def test_analysis_total_and_idle_models_use_separate_baseline_gates(self):
+        from test_analysis import empirical_record
+        from powermodeling.analysis import analyze_trial
+        rows = []
+        for index in range(6):
+            record = empirical_record("GPU-baseline-model", 1200, workload="hbm", power=100 + 2 * index)
+            record["phases"].pop("idle_post")
+            row = analyze_trial(record)
+            row.update(model_features={"x": index}, feature_units={"x": "synthetic-unit/s"},
+                       feature_provenance={"x": "synthetic mathematical fixture"},
+                       power_provenance="synthetic fixture only, not a measured GPU")
+            rows.append(row)
+        total = fit_model(rows, ["x"], target="board_power_w")
+        self.assertEqual(total["status"], "fitted", total["issues"])
+        self.assertEqual(total["energy_objective"], "measured total treatment power")
+        idle = fit_model(rows, ["x"])
+        self.assertEqual(idle["status"], "rejected")
+        self.assertTrue(all("invalid_or_missing" in row["reason"] for row in idle["skipped_rows"]))
+        for row in rows:
+            row["incremental_power_w"] = row["board_power_w"] - 50
+        idle = fit_model(rows, ["x"])
+        self.assertTrue(all("matched_idle_baseline" in row["reason"] for row in idle["skipped_rows"]))
+
+    def test_paired_model_requires_eligible_signed_contrast_and_both_orders(self):
+        from test_analysis import paired_record
+        from powermodeling.analysis import analyze_trial
+        rows = []
+        for index in range(6):
+            record = paired_record(power=100 + 2 * index, reference_power=80, order="AB" if index % 2 else "BA")
+            row = analyze_trial(record)
+            row.update(model_features={"x": index}, feature_units={"x": "synthetic-unit/s"},
+                       feature_provenance={"x": "synthetic mathematical fixture"},
+                       power_provenance="synthetic fixture only, not a measured GPU")
+            rows.append(row)
+        model = fit_model(rows, ["x"], target="paired_active_reference_power_w")
+        self.assertEqual(model["status"], "fitted", model["issues"])
+        self.assertAlmostEqual(model["coefficients"]["x"], 2)
+        import copy
+        confounded = copy.deepcopy(rows)
+        for index, row in enumerate(confounded):
+            row["validation_binding"]["condition_id"] = "only-AB" if index < 3 else "only-BA"
+            row["validation"]["profiler_evidence"]["condition_id"] = row["validation_binding"]["condition_id"]
+            row["paired_active_reference_protocol"]["order"] = "AB" if index < 3 else "BA"
+        confounded_model = fit_model(confounded, ["x"], target="paired_active_reference_power_w")
+        self.assertIn("paired_reference_model_requires_equal_AB_BA_counts_per_condition_and_partition", confounded_model["issues"])
+        unbalanced = fit_model(rows[:-1], ["x"], target="paired_active_reference_power_w")
+        self.assertIn("paired_reference_model_requires_equal_valid_AB_and_BA_counts", unbalanced["issues"])
+        for row in rows:
+            row["paired_active_reference_protocol"]["order"] = "AB"
+        model = fit_model(rows, ["x"], target="paired_active_reference_power_w")
+        self.assertIn("paired_reference_model_requires_both_AB_and_BA_orders", model["issues"])
+        rows[0]["paired_active_reference_eligible"] = False
+        model = fit_model(rows, ["x"], target="paired_active_reference_power_w")
+        self.assertIn("paired_reference_model_requires", model["skipped_rows"][0]["reason"])
+
+    def test_different_treatment_allocation_contexts_require_separate_models(self):
+        rows = self.rows()
+        rows[0]["treatment_design_stratum"] = {"kind": "paired_active_reference", "paired_reference_context_allocated": True}
+        self.assertIn("multiple_power_or_software_strata_require_separate_models", fit_model(rows, ["x", "y"])["issues"])
+
 
 if __name__ == "__main__":
     unittest.main()

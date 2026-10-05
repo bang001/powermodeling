@@ -120,7 +120,8 @@ be supplied explicitly, including measured/known zero; missing is not zero.
         "include_intercept": include_intercept, "coefficients": None, "intercept_w": None,
         "additive_validated": False, "issues": [], "warnings": [],
         "mixed_validation_feature_points": [],
-        "interpretation": "Empirical incremental device power per stated measured-rate unit; coefficients do not isolate physical block leakage or switching energy.",
+        "interpretation": "Empirical whole-device power or operational contrast per stated measured-rate unit; coefficients do not isolate physical block leakage or switching energy.",
+        "energy_objective": "measured total treatment power" if target == "board_power_w" else "paired active-reference operational contrast" if target == "paired_active_reference_power_w" else "operational powered-idle increment" if target in ("incremental_power_w", "operational_idle_increment_power_w") else "explicit user-supplied target",
     }
     if not features or len(set(features)) != len(features):
         result["issues"].append("features_must_be_nonempty_and_unique")
@@ -157,6 +158,12 @@ be supplied explicitly, including measured/known zero; missing is not zero.
             if row.get("valid") is not True or row.get("verified_selection_eligible") is not True or assessment.get("status") != "pass" or assessment.get("suitable_verified") is not True:
                 skipped.append({"index": index, "trial_id": row.get("trial_id"), "reason": "analysis_row_requires_passing_numeric_profiler_and_matching_work_energy_window"})
                 continue
+            if target in ("incremental_power_w", "operational_idle_increment_power_w") and row.get("operational_idle_increment_eligible") is not True:
+                skipped.append({"index": index, "trial_id": row.get("trial_id"), "reason": "idle_increment_model_requires_valid_clock_and_temperature_matched_idle_baseline"})
+                continue
+            if target == "paired_active_reference_power_w" and (row.get("paired_active_reference_eligible") is not True or row.get("paired_active_reference_issues")):
+                skipped.append({"index": index, "trial_id": row.get("trial_id"), "reason": "paired_reference_model_requires_matching_protocol_states_geometry_and_positive_contrast"})
+                continue
         config = row.get("config") or {}
         uuid = row.get("gpu_uuid", config.get("gpu_uuid"))
         clock_values = [config.get(field, row.get(field)) for field in ("graphics_clock_mhz", "memory_clock_mhz")]
@@ -178,6 +185,34 @@ be supplied explicitly, including measured/known zero; missing is not zero.
     if not calibration:
         result["issues"].append("no_complete_calibration_rows")
         return result
+    if target == "paired_active_reference_power_w" and any("paired_active_reference_protocol" in row for _, _, row in calibration + validation):
+        order_counts = {order: sum(row.get("paired_active_reference_protocol", {}).get("order") == order for _, _, row in calibration + validation) for order in ("AB", "BA")}
+        result["paired_reference_order_counts"] = order_counts
+        if not all(order_counts.values()):
+            result["issues"].append("paired_reference_model_requires_both_AB_and_BA_orders")
+            return result
+        if order_counts["AB"] != order_counts["BA"]:
+            result["issues"].append("paired_reference_model_requires_equal_valid_AB_and_BA_counts")
+            return result
+        # Equal global counts can hide an activity/order confound. Preserve
+        # balance inside each measured condition and calibration/holdout arm.
+        condition_orders = {}
+        for partition, entries in (("calibration", calibration), ("validation", validation)):
+            for values, _, row in entries:
+                if "paired_active_reference_protocol" not in row:
+                    continue
+                condition = (row.get("validation_binding") or {}).get("condition_id") or row.get("condition_id")
+                if not condition:
+                    condition = json.dumps({"config": {key: value for key, value in (row.get("config") or {}).items() if key not in ("repeat", "repeat_index", "repeat_id", "trial_id")}, "features": values}, sort_keys=True)
+                key = (partition, condition)
+                counts = condition_orders.setdefault(key, {"AB": 0, "BA": 0})
+                order = row["paired_active_reference_protocol"].get("order")
+                if order in counts:
+                    counts[order] += 1
+        result["paired_reference_condition_order_counts"] = [{"partition": partition, "condition_id": condition, "counts": counts} for (partition, condition), counts in sorted(condition_orders.items())]
+        if any(not all(counts.values()) or counts["AB"] != counts["BA"] for counts in condition_orders.values()):
+            result["issues"].append("paired_reference_model_requires_equal_AB_BA_counts_per_condition_and_partition")
+            return result
     definitions = {(tuple(row["feature_units"][feature] for feature in features),
                     tuple((row["feature_provenance"][feature].get("traffic_kind") if isinstance(row["feature_provenance"][feature], Mapping) else None) for feature in features))
                    for _, _, row in calibration + validation}
@@ -196,7 +231,7 @@ be supplied explicitly, including measured/known zero; missing is not zero.
     if len(gpu_ids) > 1:
         result["issues"].append("multiple_devices_require_separate_models")
         return result
-    execution_strata = {(row.get("benchmark_sha256"), json.dumps(row.get("measurement_stratum"), sort_keys=True)) for _, _, row in calibration + validation}
+    execution_strata = {(row.get("benchmark_sha256"), json.dumps(row.get("measurement_stratum"), sort_keys=True), json.dumps(row.get("treatment_design_stratum"), sort_keys=True)) for _, _, row in calibration + validation}
     if len(execution_strata) > 1:
         result["issues"].append("multiple_power_or_software_strata_require_separate_models")
         return result

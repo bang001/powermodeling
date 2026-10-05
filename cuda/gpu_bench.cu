@@ -74,9 +74,9 @@ struct Options {
   int batch_launches = 0;
   uint64_t fixed_batches = 0, warmup_batches = 0;
   uint64_t offset_bytes = 0, seed = 1;
-  std::string workload = "tensor", access = "read";
+  std::string workload = "tensor", access = "read", reference_order = "AB";
   std::vector<unsigned> sm_ids;
-  bool describe = false, profile_region = false;
+  bool describe = false, profile_region = false, paired_reference = false;
 };
 
 uint64_t parse_u64(const std::string& value, const char* flag) {
@@ -104,7 +104,8 @@ void usage() {
     "  --blocks N --threads 256 --iterations N --tensor-accumulators 1..8\n"
     "  --batch-launches N (default 16 microkernels, 1 GEMM)\n"
     "  --fixed-batches N --warmup-batches N (profiler mode; override timed loops)\n"
-    "  --profile-region (cudaProfilerStart/Stop bracket measure only)\n"
+    "  --profile-region (cudaProfilerStart/Stop bracket measure only; suppresses paired reference)\n"
+    "  --paired-reference --reference-order AB|BA (A=issue-loop reference, B=treatment)\n"
     "  --working-set-bytes N --stride-elements N --offset-bytes N\n"
     "  --access read|write|copy --sm-ids 0,1,... --seed N\n"
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
@@ -121,6 +122,7 @@ Options parse_options(int argc, char** argv) {
     if (flag == "--help" || flag == "-h") { usage(); std::exit(0); }
     if (flag == "--describe") { o.describe = true; continue; }
     if (flag == "--profile-region") { o.profile_region = true; continue; }
+    if (flag == "--paired-reference") { o.paired_reference = true; continue; }
     if (i + 1 >= argc) throw std::runtime_error("missing value for " + flag);
     std::string value = argv[++i];
     if (flag == "--device") o.device = parse_int(value, flag.c_str());
@@ -138,6 +140,7 @@ Options parse_options(int argc, char** argv) {
     else if (flag == "--offset-bytes") o.offset_bytes = parse_u64(value, flag.c_str());
     else if (flag == "--seed") o.seed = parse_u64(value, flag.c_str());
     else if (flag == "--tensor-accumulators") o.accumulators = parse_int(value, flag.c_str());
+    else if (flag == "--reference-order") o.reference_order = value;
     else if (flag == "--workload") o.workload = value;
     else if (flag == "--access") o.access = value;
     else if (flag == "--gemm-m") o.gemm_m = parse_int(value, flag.c_str());
@@ -156,6 +159,9 @@ Options parse_options(int argc, char** argv) {
     } else throw std::runtime_error("unknown option " + flag);
   }
   if (o.seconds <= 0) throw std::runtime_error("--seconds must be positive");
+  if (o.reference_order != "AB" && o.reference_order != "BA") throw std::runtime_error("--reference-order must be AB or BA");
+  if (o.paired_reference && !o.profile_region && o.workload != "control" && (o.seconds < 10 || o.warmup_seconds < 1 || o.idle_seconds < 6))
+    throw std::runtime_error("paired energy arms require seconds>=10, warmup-seconds>=1 and idle-seconds>=6");
   if (o.stride_elements == 0 || o.stride_elements > (1ULL << 32)) throw std::runtime_error("invalid --stride-elements");
   if (o.accumulators < 1 || o.accumulators > kMaxAccumulators) throw std::runtime_error("--tensor-accumulators must be 1..8");
   if (o.threads < 32 || o.threads > 1024 || o.threads % 32) throw std::runtime_error("--threads must be a multiple of 32 between 32 and 1024");
@@ -445,6 +451,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
   }
   const uint64_t requested_working_set_bytes = o.working_set_bytes;
   const uint64_t lanes = uint64_t(o.blocks) * o.threads;
+  const bool paired_context = o.paired_reference && o.workload != "control";
+  const bool paired_reference = paired_context && !o.profile_region;
   uint64_t words = memory ? o.working_set_bytes / 4 : 1;
   if (memory && o.access != "read") {
     // x=(tid+k*lanes)*stride modulo words. A whole lanes*stride tile
@@ -479,6 +487,11 @@ void experiment(Options o, const cudaDeviceProp& p) {
   Buffer<unsigned long long> sm_blocks(kSmSlots);
   Buffer<unsigned long long> sm_cycles(kSmSlots);
   Buffer<unsigned long long> sm_loads(kSmSlots);
+  // Separate reference sinks/counters preserve treatment outputs and admission
+  // counts even when the randomized order runs the reference second. Both
+  // arms retain exactly the same allocated context and buffers.
+  Buffer<uint32_t> reference_sink(checked_size(paired_context ? lanes : 1, sizeof(uint32_t), "reference sink"));
+  Buffer<unsigned long long> reference_sm_blocks(paired_context ? kSmSlots : 1);
   std::vector<unsigned char> mask_host(kSmSlots, o.sm_ids.empty() ? 1 : 0);
   for (unsigned id : o.sm_ids) mask_host[id] = 1;
   CUDA_CHECK(cudaMemcpy(mask.ptr, mask_host.data(), kSmSlots, cudaMemcpyHostToDevice));
@@ -487,6 +500,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
   CUDA_CHECK(cudaMemset(sm_blocks.ptr, 0, kSmSlots * sizeof(unsigned long long)));
   CUDA_CHECK(cudaMemset(sm_cycles.ptr, 0, kSmSlots * sizeof(unsigned long long)));
   CUDA_CHECK(cudaMemset(sm_loads.ptr, 0, kSmSlots * sizeof(unsigned long long)));
+  CUDA_CHECK(cudaMemset(reference_sink.ptr, 0, size_t(paired_context ? lanes : 1) * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMemset(reference_sm_blocks.ptr, 0, size_t(paired_context ? kSmSlots : 1) * sizeof(unsigned long long)));
   init_words<<<std::min(o.blocks, 4096), 256>>>(input.ptr, words + offset_words, o.seed);
   if (memory && o.access != "read") init_words<<<std::min(o.blocks, 4096), 256>>>(output.ptr, words + offset_words, o.seed ^ 0x9e3779b9ULL);
   init_halves<<<std::min(o.blocks, 4096), 256>>>(a.ptr, gemm_a_count, o.seed);
@@ -545,22 +560,82 @@ void experiment(Options o, const cudaDeviceProp& p) {
     // and elapsed window include launch gaps; they are not profiler busy time.
     for (int i = 0; i < o.batch_launches; ++i) single_launch();
   };
+  std::cout << "{\"type\":\"treatment_protocol\",\"kind\":"
+    << quote(paired_reference ? "paired_active_reference" : "powered_idle_bracket")
+    << ",\"order\":" << (paired_reference ? quote(o.reference_order) : "null")
+    << ",\"phase_order\":" << (paired_reference ? (o.reference_order == "AB" ? "[\"active_reference\",\"measure\"]" : "[\"measure\",\"active_reference\"]") : "[\"measure\"]")
+    << ",\"same_process\":true,\"same_allocations\":true,\"same_clock_policy\":true"
+    << ",\"paired_reference_context_allocated\":" << (paired_context ? "true" : "false")
+    << ",\"launch_geometry_matched\":" << (paired_reference && o.workload != "gemm" ? "true" : "false")
+    << ",\"reference_workload\":" << (paired_reference ? "\"control\"" : "null")
+    << ",\"reference_kind\":" << (paired_reference ? "\"issue_loop\"" : "null")
+    << ",\"reference_iterations\":" << (paired_reference ? o.iterations : 0)
+    << ",\"arm_seconds\":" << o.seconds << ",\"arm_warmup_seconds\":" << o.warmup_seconds
+    << ",\"reference_scope\":\"paired integer issue-loop operational contrast; launch geometry, iterations, SM admission mask and batching match custom kernels; instruction mix, residency, register pressure, occupancy and duration per launch are not counterfactual equivalents; not isolated component energy\"}"
+    << std::endl;
   run_phase("warmup", o.warmup_seconds, o.warmup_batches, launch);
   idle_phase("idle_pre", o.idle_seconds);
-  CUDA_CHECK(cudaMemset(sm_blocks.ptr, 0, kSmSlots * sizeof(unsigned long long)));
-  CUDA_CHECK(cudaMemset(sm_cycles.ptr, 0, kSmSlots * sizeof(unsigned long long)));
-  CUDA_CHECK(cudaMemset(sm_loads.ptr, 0, kSmSlots * sizeof(unsigned long long)));
-  std::vector<unsigned long long> epoch_observed(kSmSlots);
+  std::vector<unsigned long long> epoch_observed(kSmSlots), reference_observed(kSmSlots);
   auto snapshot_admissions = [&]() -> uint64_t {
     if (o.workload == "gemm") return 0;
     CUDA_CHECK(cudaMemcpy(epoch_observed.data(), sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     return std::accumulate(epoch_observed.begin(), epoch_observed.end(), uint64_t(0));
   };
-  // A timed warmup must not shift the first measured pointer-chain nonce.
-  // Fixed-count profiler replay starts from the same deterministic sequence.
-  launch_nonce = o.seed;
-  RunTiming timing = run_phase("measure", o.seconds, o.fixed_batches, launch, snapshot_admissions, o.profile_region);
+  auto snapshot_reference_admissions = [&]() -> uint64_t {
+    CUDA_CHECK(cudaMemcpy(reference_observed.data(), reference_sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    return std::accumulate(reference_observed.begin(), reference_observed.end(), uint64_t(0));
+  };
+  RunTiming timing, reference_timing;
+  auto treatment_arm = [&]() {
+    // Each crossover arm prepares its own target state after the prior arm.
+    // Warmup is outside every energy/counter measurement window.
+    if (paired_reference) run_phase("warmup_treatment", o.warmup_seconds, o.warmup_batches, launch);
+    CUDA_CHECK(cudaMemset(sm_blocks.ptr, 0, kSmSlots * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(sm_cycles.ptr, 0, kSmSlots * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(sm_loads.ptr, 0, kSmSlots * sizeof(unsigned long long)));
+    // A timed warmup must not shift the first measured pointer-chain nonce.
+    launch_nonce = o.seed;
+    timing = run_phase("measure", o.seconds, o.fixed_batches, launch, snapshot_admissions, o.profile_region);
+  };
+  auto reference_launch = [&]() {
+    for (int i = 0; i < o.batch_launches; ++i)
+      control_kernel<<<o.blocks, o.threads>>>(reference_sink.ptr, o.iterations, mask.ptr, filtered, reference_sm_blocks.ptr);
+  };
+  auto reference_arm = [&]() {
+    run_phase("warmup_reference", o.warmup_seconds, o.warmup_batches, reference_launch);
+    CUDA_CHECK(cudaMemset(reference_sm_blocks.ptr, 0, kSmSlots * sizeof(unsigned long long)));
+    reference_timing = run_phase("active_reference", o.seconds, o.fixed_batches, reference_launch, snapshot_reference_admissions);
+  };
+  if (paired_reference && o.reference_order == "AB") reference_arm();
+  treatment_arm();
+  if (paired_reference && o.reference_order == "BA") reference_arm();
   idle_phase("idle_post", o.idle_seconds);
+  if (paired_reference) {
+    CUDA_CHECK(cudaMemcpy(reference_observed.data(), reference_sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    uint64_t reference_admitted = std::accumulate(reference_observed.begin(), reference_observed.end(), uint64_t(0));
+    if (!reference_admitted) throw std::runtime_error("no active-reference blocks were admitted by the SM filter");
+    std::vector<unsigned> missing_reference;
+    for (unsigned id : o.sm_ids) if (!reference_observed[id]) missing_reference.push_back(id);
+    std::cout << std::setprecision(17)
+      << "{\"type\":\"active_reference_result\",\"workload\":\"control\",\"reference_kind\":\"issue_loop\""
+      << ",\"duration_s\":" << reference_timing.device_s << ",\"host_duration_s\":" << reference_timing.host_s
+      << ",\"batches\":" << reference_timing.batches << ",\"batch_launches\":" << o.batch_launches
+      << ",\"iterations_per_launch\":" << o.iterations << ",\"blocks\":" << o.blocks << ",\"threads\":" << o.threads
+      << ",\"admitted_blocks\":" << reference_admitted << ",\"operations\":0,\"logical_bytes\":0"
+      << ",\"operation_unit\":\"not FLOPs or target bytes; integer issue-loop reference\",\"measure_epochs\":[";
+    for (size_t i = 0; i < reference_timing.epochs.size(); ++i) {
+      const WorkEpoch& epoch = reference_timing.epochs[i];
+      std::cout << (i ? "," : "") << "{\"host_monotonic_start_ns\":" << epoch.start_ns
+        << ",\"host_monotonic_end_ns\":" << epoch.end_ns
+        << ",\"start_s\":" << double(epoch.start_ns) * 1e-9 << ",\"end_s\":" << double(epoch.end_ns) * 1e-9
+        << ",\"batches\":" << epoch.batches << ",\"admitted_blocks\":" << epoch.admitted_blocks
+        << ",\"kernel_launches\":" << epoch.batches * o.batch_launches
+        << ",\"operations\":0,\"logical_bytes\":0,\"counts_exact\":true,\"counter_readback_ns\":" << epoch.counter_readback_ns << "}";
+    }
+    std::cout << "],\"sanity\":{\"requested_sm_coverage_complete\":" << (missing_reference.empty() ? "true" : "false")
+      << "},\"scope\":\"active integer issue-loop reference measured in same CUDA process and allocated context; no target-operation normalization and no physical component attribution\"}" << std::endl;
+    if (!missing_reference.empty()) throw std::runtime_error("requested active-reference SM coverage incomplete; reject this trial");
+  }
   std::vector<unsigned long long> observed(kSmSlots);
   CUDA_CHECK(cudaMemcpy(observed.data(), sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
   unsigned long long admitted_blocks = 0; std::vector<unsigned> active;
@@ -591,7 +666,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
     // transfer, not a full memory correctness test or validation of cache residency.
   }
   uint64_t allocated_bytes = (words + offset_words + (memory && o.access != "read" ? words + offset_words : 1) + lanes) * 4
-    + (gemm_a_count + gemm_b_count) * 2 + gemm_c_count * 4 + kSmSlots * 25;
+    + (gemm_a_count + gemm_b_count) * 2 + gemm_c_count * 4 + kSmSlots * 25
+    + (paired_context ? lanes * 4 + kSmSlots * sizeof(unsigned long long) : 12);
   uint64_t reachable_words = memory ? (latency ? words : (o.workload == "l1" ? slice / std::gcd(slice, o.stride_elements) * o.blocks : words / std::gcd(words, o.stride_elements))) : 0;
   // Sector footprint is a full-period bound, not observed traffic. For total
   // word counts divisible by 8 and offset aligned to 32B it is exact for the
@@ -660,6 +736,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"sanity\":{\"finite_output_sample\":" << (finite ? "true" : "false")
     << ",\"requested_sm_coverage_complete\":" << (missing.empty() ? "true" : "false") << "}"
     << ",\"profile_region\":" << (o.profile_region ? "true" : "false")
+    << ",\"paired_reference_context_allocated\":" << (paired_context ? "true" : "false")
     << ",\"measure_epochs\":[";
   for (size_t i = 0; i < timing.epochs.size(); ++i) {
     const WorkEpoch& epoch = timing.epochs[i];

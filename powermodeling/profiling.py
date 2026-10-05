@@ -314,7 +314,7 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
         raise ValueError("Profiled application CUDA UUID differs from plan")
     # Application replay emits one result per pass. Require exact deterministic
     # counter-relevant metadata/payload, allowing elapsed timing to differ.
-    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches")
+    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated")
     deterministic = bool(benchmarks) and all(all(item.get(k) == benchmarks[0].get(k) for k in determinism_fields) for item in benchmarks)
     context = _profile_context(profile_context, events)
     evidence = {"schema_version": 2, "condition_id": trial["condition_id"], "trial_id": trial_id,

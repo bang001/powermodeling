@@ -92,11 +92,74 @@ class RunnerAuditTests(unittest.TestCase):
             validate_trial_ids([TRIAL, dict(TRIAL)])
         validate_trial_ids([{"trial_id": "a0123456789bcdef-r0"}, {"trial_id": "fixture-trial_1.2"}])
 
-    def capture(self, process=Process, sampler=Sampler):
+    def capture(self, process=Process, sampler=Sampler, trial=TRIAL):
         with patch("powermodeling.telemetry.Sampler", sampler), \
                 patch("powermodeling.runner.subprocess.Popen", process), \
                 patch("powermodeling.runner.platform.platform", return_value="fixture-platform"):
-            return capture_trial("fixture", TRIAL, Device(), DEVICE)
+            return capture_trial("fixture", trial, Device(), DEVICE)
+
+    def paired_output(self, order="AB", malformed=None):
+        arm_order = ["active_reference", "measure"] if order == "AB" else ["measure", "active_reference"]
+        protocol = {"type": "treatment_protocol", "kind": "paired_active_reference", "order": order,
+                    "phase_order": arm_order, "same_process": True, "same_allocations": True,
+                    "same_clock_policy": True, "launch_geometry_matched": True,
+                    "reference_workload": "control", "reference_kind": "issue_loop"}
+        geometry = {"blocks": 80, "threads": 256, "batch_launches": 16, "iterations_per_launch": 1024}
+        events = [{"type": "device", "uuid": DEVICE["uuid"]}, protocol]
+        windows, cursor = [("idle_pre", 0, 6)], 6
+        for arm in arm_order:
+            windows.append(("warmup_reference" if arm == "active_reference" else "warmup_treatment", cursor, cursor + 3))
+            cursor += 3
+            windows.append((arm, cursor, cursor + 12))
+            cursor += 12
+        windows.append(("idle_post", cursor, cursor + 6))
+        for name, begin, end in windows:
+            for event, stamp in (("start", begin), ("end", end)):
+                if malformed == "missing_warmup" and name == "warmup_reference": continue
+                events.append({"type": "phase", "phase": name, "event": event, "host_monotonic_ns": stamp * 10**9})
+        events.append({"type": "result", **geometry, "duration_s": 12, "host_duration_s": 12, "operations": 12e12})
+        reference = {"type": "active_reference_result", "workload": "control", "reference_kind": "issue_loop",
+                     **geometry, "duration_s": 12, "host_duration_s": 12, "operations": 0, "logical_bytes": 0,
+                     "sanity": {"requested_sm_coverage_complete": True}, "measure_epochs": []}
+        if malformed == "geometry": reference["threads"] = 128
+        if malformed != "missing_reference": events.append(reference)
+        if malformed == "duplicate_reference": events.append(dict(reference))
+        if malformed == "wrong_order": protocol["order"] = "BA" if order == "AB" else "AB"
+        if malformed == "unmatched_allocations": protocol["same_allocations"] = False
+        return "\n".join(json.dumps(event) for event in events)
+
+    def test_paired_capture_preserves_each_arm_and_randomized_order(self):
+        class PairedSampler(Sampler):
+            def __init__(self, device, interval_s):
+                self.samples = [{"t_s": index / 2, "power_w": 50,
+                                 "compute_processes": [], "graphics_processes": []} for index in range(85)]
+        for order in ("AB", "BA"):
+            class PairedProcess(Process):
+                stdout_text = self.paired_output(order)
+            trial = {**TRIAL, "treatment_protocol": {"kind": "paired_active_reference", "order": order},
+                     "clock_policy": "fixed_supported_sweep", "clock_selection_reasons": ["grid_90mhz"]}
+            with self.subTest(order=order):
+                record = self.capture(process=PairedProcess, sampler=PairedSampler, trial=trial)
+                self.assertEqual(record["status"], "complete", record["quality"]["runner_errors"])
+                self.assertEqual(record["treatment_protocol"]["order"], order)
+                self.assertEqual(record["active_reference"]["operations"], 0)
+                self.assertEqual(record["active_reference"]["reference_kind"], "issue_loop")
+                self.assertEqual(record["config"]["clock_selection_policy"], "fixed_supported_sweep")
+                self.assertIn("active_reference", record["phases"])
+
+    def test_missing_or_mismatched_paired_arm_cannot_pass(self):
+        trial = {**TRIAL, "treatment_protocol": {"kind": "paired_active_reference", "order": "AB"}}
+        for malformed in ("missing_reference", "duplicate_reference", "geometry", "missing_warmup", "wrong_order", "unmatched_allocations"):
+            class InvalidPair(Process):
+                stdout_text = self.paired_output(malformed=malformed)
+            with self.subTest(malformed=malformed):
+                record = self.capture(process=InvalidPair, trial=trial)
+                self.assertEqual(record["status"], "failed")
+                self.assertTrue(record["quality"]["runner_errors"])
+                self.assertIn('"type": "treatment_protocol"', record["quality"]["benchmark_stdout"])
+        class UnplannedPair(Process):
+            stdout_text = self.paired_output()
+        self.assertEqual(self.capture(process=UnplannedPair)["status"], "failed")
 
     def test_null_graphics_inventory_and_malformed_pid_reject_exclusivity(self):
         for inventory in (None, "unavailable", [{"pid": None}], [{"pid": True}]):

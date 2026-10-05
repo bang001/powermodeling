@@ -34,6 +34,7 @@ class AnalysisPolicy:
     max_idle_drift_fraction: float = 0.10
     counter_disagreement_fraction: float = 0.10
     near_optimum_fraction: float = 0.05
+    min_geometries: int = 2
 
     def __post_init__(self):
         for field, value in asdict(self).items():
@@ -41,6 +42,8 @@ class AnalysisPolicy:
                 raise ValueError(f"Analysis policy {field} must be finite and nonnegative")
         if type(self.min_samples) is not int or self.min_samples < 2:
             raise ValueError("min_samples must be an integer >=2")
+        if type(self.min_geometries) is not int or self.min_geometries < 2:
+            raise ValueError("min_geometries must be an integer >=2; one geometry cannot qualify utilization")
         if self.min_measure_s <= 0 or self.min_idle_s <= 0 or self.max_sample_gap_s <= 0:
             raise ValueError("Measurement, idle and sample-gap durations must be positive")
 
@@ -557,6 +560,8 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
             warnings.append("tensor_theoretical_peak_unavailable")
     baseline_deltas = {}
     baseline_power_cap_matched = True
+    baseline_state_issues = []
+    baseline_state_domains = set()
     baseline_clock_matched = True
     baseline_temperature_matched = True
     baseline_clock_fields = ["graphics_clock_mhz", "memory_clock_mhz"]
@@ -581,7 +586,19 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         baseline_caps = {_finite(sample.get("power_limit_w")) for sample in baseline_phase.get("_selected", [])}
         if None in active_caps or None in baseline_caps or len(active_caps) != 1 or active_caps != baseline_caps:
             baseline_power_cap_matched = False
+        for field in ("enforced_power_limit_w", "pstate"):
+            active_values = {_finite(sample.get(field)) for sample in measure.get("_selected", [])}
+            baseline_values = {_finite(sample.get(field)) for sample in baseline_phase.get("_selected", [])}
+            if any(value is not None for value in active_values | baseline_values):
+                baseline_state_domains.add(field)
+                deltas[field] = ((_median(sample.get(field) for sample in measure.get("_selected", [])) or 0)
+                                 - (_median(sample.get(field) for sample in baseline_phase.get("_selected", [])) or 0)) if None not in active_values and None not in baseline_values else None
+                if None in active_values or None in baseline_values or len(active_values) != 1 or active_values != baseline_values:
+                    baseline_state_issues.append(f"idle_state_mismatch_or_unverified:{name}:{field}")
         baseline_deltas[name] = deltas
+    baseline_issues.extend(baseline_state_issues)
+    if baseline_state_issues:
+        warnings.append("idle_active_pstate_or_enforced_cap_mismatch_or_unavailable; operational idle contrast is withheld from optimization")
     if not baseline_power_cap_matched:
         warnings.append("idle_active_power_cap_mismatch_or_unavailable; idle contrast is withheld from optimization")
     if not baseline_clock_matched:
@@ -599,6 +616,10 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "target_verified": target_verified,
         "benchmark_sha256": (record.get("provenance") or {}).get("benchmark_sha256"),
         "treatment_design_stratum": _treatment_design_stratum(record, benchmark),
+        "resource_geometry": {field: benchmark.get(field, config.get(field)) for field in (
+            ("gemm_m", "gemm_n", "gemm_k") if record.get("workload") == "gemm" else
+            ("blocks", "threads", "tensor_accumulators") if record.get("workload") in _TENSOR_WORKLOADS else
+            ("blocks", "threads"))},
         "measurement_stratum": {"ecc_mode": device.get("ecc_mode"), "mig_mode": device.get("mig_mode"),
                                 "driver_version": device.get("driver_version"), "nvml_version": device.get("nvml_version"),
                                 "runtime_versions": {key: (record.get("cuda_device") or {}).get(key) for key in ("cuda_runtime_version", "cuda_driver_version", "cuda_compile_version", "cublas_version")},
@@ -660,6 +681,8 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "baseline_clock_matched": baseline_clock_matched,
         "baseline_power_scope": "same measured device/API rail; idle is an operational state, not a leakage meter",
         "baseline_temperature_matched": baseline_temperature_matched, "baseline_power_cap_matched": baseline_power_cap_matched,
+        "baseline_state_matched": not baseline_state_issues, "baseline_state_issues": baseline_state_issues,
+        "baseline_state_domains_compared": sorted(baseline_state_domains),
         "baseline_clock_domains_compared": baseline_clock_fields,
         "baseline_sm_clock_uses_graphics_proxy": "sm_clock_mhz" not in baseline_clock_fields,
         "active_minus_idle_state_deltas": baseline_deltas,
@@ -719,7 +742,8 @@ def _group_key(trial: Mapping[str, Any]) -> str:
                        "config": config, "uncontrolled_achieved_clocks": achieved,
                        "benchmark_sha256": trial.get("benchmark_sha256"),
                        "measurement_stratum": trial.get("measurement_stratum"),
-                       "treatment_design_stratum": trial.get("treatment_design_stratum")}, sort_keys=True, separators=(",", ":"))
+                       "treatment_design_stratum": trial.get("treatment_design_stratum"),
+                       "resource_geometry": trial.get("resource_geometry")}, sort_keys=True, separators=(",", ":"))
 
 
 def _median_ci(values: list[float], seed: int) -> list[float] | None:
@@ -796,7 +820,8 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
 
 
 
-def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, across_memory_domains=False):
+def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_geometries=2,
+                            across_memory_domains=False, single_geometry_exploratory=False):
     """Choose each GPU's energy optimum using utilization at its own frequency.
 
     Global-peak throughput constraints answer a different question and remain
@@ -806,6 +831,8 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, acros
     populations = [group for group in groups if group["workload"] in _TENSOR_WORKLOADS | _MEMORY_WORKLOADS
                    and group["valid_repeats"] >= min_repeats and group["clock_comparison_controlled"]]
     peaks = {}
+    geometries = {}
+    verified_geometries = {}
     for group in populations:
         throughput = "throughput_ops_s" if group["workload"] in _TENSOR_WORKLOADS else "throughput_bytes_s"
         value = _finite(group.get(throughput))
@@ -813,6 +840,12 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, acros
             continue
         clock_key = json.dumps(_clock_stratum(group, False), sort_keys=True)
         peaks[clock_key] = max(peaks.get(clock_key, 0), value)
+        geometry = group.get("resource_geometry") or {}
+        if geometry and all(_finite(value) is not None and _finite(value) > 0 for value in geometry.values()):
+            signature = json.dumps(geometry, sort_keys=True)
+            geometries.setdefault(clock_key, set()).add(signature)
+            if group["verified_selection_eligible"]:
+                verified_geometries.setdefault(clock_key, set()).add(signature)
     buckets = {}
     objectives = (("total", "total_", None),
                   ("operational_idle_increment", "operational_idle_increment_", "operational_idle_increment_eligible"),
@@ -821,7 +854,14 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, acros
         if not group["verified_selection_eligible"]:
             continue
         throughput = "throughput_ops_s" if group["workload"] in _TENSOR_WORKLOADS else "throughput_bytes_s"
-        clock_peak = peaks.get(json.dumps(_clock_stratum(group, False), sort_keys=True))
+        clock_key = json.dumps(_clock_stratum(group, False), sort_keys=True)
+        clock_peak = peaks.get(clock_key)
+        geometry_count = len(verified_geometries.get(clock_key, set()))
+        if single_geometry_exploratory:
+            if geometry_count != 1:
+                continue
+        elif geometry_count < min_geometries:
+            continue
         if clock_peak is None or (_finite(group.get(throughput)) or 0) < fraction * clock_peak:
             continue
         tensor = group["workload"] in _TENSOR_WORKLOADS
@@ -851,7 +891,13 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, acros
                     "metric_value": point[point_metric], "metric_ci95": point["ci95"].get(point_metric),
                     "throughput": point[point_throughput], "throughput_fraction_of_own_clock_observed_peak": point[point_throughput] / point_peak,
                     "config": point["config"], "valid_repeats": point["valid_repeats"],
-                    "paired_reference_order_counts": point.get("paired_reference_order_counts")}
+                    "paired_reference_order_counts": point.get("paired_reference_order_counts"),
+                    "resource_geometry": point.get("resource_geometry"),
+                    "own_clock_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(point, False), sort_keys=True), set())),
+                    "own_clock_verified_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(point, False), sort_keys=True), set())),
+                    "own_clock_observed_distinct_geometry_count": len(geometries.get(json.dumps(_clock_stratum(point, False), sort_keys=True), set())),
+                    "geometry_evidence_status": "single_geometry_reference_only" if single_geometry_exploratory else "multiple_resource_geometries_compared",
+                    "saturation_proven": False}
         near = [candidate for candidate in candidates if candidate[0][metric] <= group[metric] * (1 + near_fraction)]
         overlapping = [candidate for candidate in candidates if best_ci and candidate[0]["ci95"].get(metric)
                        and candidate[0]["ci95"][metric][0] <= best_ci[1] and candidate[0]["ci95"][metric][1] >= best_ci[0]]
@@ -871,16 +917,22 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, acros
                         "throughput": group[throughput], "own_clock_observed_max_throughput": clock_peak,
                         "throughput_fraction_of_own_clock_observed_peak": group[throughput] / clock_peak,
                         "throughput_threshold_fraction": fraction, "candidate_groups": len(candidates),
+                        "own_clock_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(group, False), sort_keys=True), set())),
+                        "own_clock_verified_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(group, False), sort_keys=True), set())),
+                        "own_clock_observed_distinct_geometry_count": len(geometries.get(json.dumps(_clock_stratum(group, False), sort_keys=True), set())),
+                        "geometry_evidence_status": "single_geometry_reference_only" if single_geometry_exploratory else "multiple_resource_geometries_compared",
+                        "min_geometries_required": min_geometries, "saturation_proven": False,
+                        "selection_status": "exploratory_single_geometry_only" if single_geometry_exploratory else "geometry_comparison_qualified_best_observed",
                         "observed_valid_frequency_pairs": as_pairs(observed_pairs), "eligible_frequency_pairs": as_pairs(eligible_pairs),
                         "observed_frequency_pairs_without_eligible_candidate": as_pairs(sorted(set(observed_pairs) - set(eligible_pairs))),
-                        "selection_scope": "best observed eligible measured point; incomplete geometry, frequency or profiler coverage cannot establish the global hardware optimum",
+                        "selection_scope": "diagnostic single-geometry energy minimum; self-reference throughput ratio does not qualify high utilization" if single_geometry_exploratory else "best observed eligible measured point; incomplete geometry, frequency or profiler coverage cannot establish the global hardware optimum",
                         "near_optimum_relative_tolerance": near_fraction,
                         "near_optimum_support_points": sort_points(near),
                         "uncertainty_overlap_support_points": sort_points(overlapping),
                         "all_eligible_support_points": sort_points(candidates),
                         "optimal_interval_kind": "discrete measured support points; unmeasured gaps and continuous intervals are not inferred",
                         "optimization_scope": "across measured graphics and memory frequency domains" if across_memory_domains else "across measured graphics frequencies at one fixed memory domain",
-                        "utilization_basis": "complete observed geometry sweep maximum at each frequency pair; no theoretical saturation proof",
+                        "utilization_basis": "only one verified measured resource geometry; own-frequency peak ratio does not qualify utilization" if single_geometry_exploratory else "at least min_geometries independently verified execution-resource geometries; throughput bar uses all valid observed groups and geometry count alone does not prove physical saturation",
                         "energy_scope": "whole-device energy per counted logical payload bit or dense tensor FLOP; physical component energy is not isolated"})
     return results
 
@@ -997,6 +1049,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
                  "config": {k: v for k, v in repeats[0]["config"].items() if k not in _REPEAT_KEYS},
                  "benchmark_sha256": repeats[0]["benchmark_sha256"], "measurement_stratum": repeats[0]["measurement_stratum"],
                  "treatment_design_stratum": repeats[0]["treatment_design_stratum"],
+                 "resource_geometry": repeats[0]["resource_geometry"],
                  "repeats": len(repeats), "valid_repeats": len(valid), "trial_ids": [t["trial_id"] for t in repeats],
                  "duplicate_repeat_indices_ignored": duplicate_repeat_indices,
                  "target_verified": bool(valid) and all(t["target_verified"] for t in valid),
@@ -1038,12 +1091,15 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             "verified_target_within_clock_best": _selections(groups, throughput_fraction, min_repeats, False, True),
             "verified_target_cross_clock_best": _selections(groups, throughput_fraction, min_repeats, True, True),
             "verified_target_coverage": _verification_coverage(groups, throughput_fraction, min_repeats, False) + _verification_coverage(groups, throughput_fraction, min_repeats, True),
-            "empirical_gpu_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction),
-            "empirical_gpu_overall_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction, across_memory_domains=True),
+            "empirical_gpu_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction, policy.min_geometries),
+            "empirical_gpu_overall_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction, policy.min_geometries, across_memory_domains=True),
+            "exploratory_single_geometry_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction, policy.min_geometries, single_geometry_exploratory=True),
+            "exploratory_single_geometry_overall_energy_optima": _empirical_energy_optima(groups, throughput_fraction, min_repeats, policy.near_optimum_fraction, policy.min_geometries, across_memory_domains=True, single_geometry_exploratory=True),
             "metric_aliases": {"pj_per_op": "legacy operational idle increment per reported benchmark operation; tensor FLOP uses explicit operational_idle_increment_pj_per_flop",
                                "pj_per_logical_byte": "legacy operational idle increment per logical byte; divide by 8 for logical-bit metric",
                                "incremental_power_w": "operational_idle_increment_power_w; a baseline contrast, not physical switching power"},
-            "selection_policy": {"throughput_fraction": throughput_fraction, "min_repeats": min_repeats,
+            "selection_policy": {"throughput_fraction": throughput_fraction, "min_repeats": min_repeats, "min_geometries": policy.min_geometries,
+                                 "geometry_requirement": "at least min_geometries distinct verified execution-resource geometries per frequency; throughput peak still uses all valid groups; repeat/seed/footprint-only variants do not qualify; count alone is not saturation proof",
                                  "primary_energy_objective": "whole-device total energy per logical bit or FLOP",
                                  "frequency_utilization_constraint": "own-frequency complete measured geometry peak; global-near-peak optima are reported separately",
                                  "baseline_objectives": "separate matched operational idle increment and paired active-reference contrast; never automatically substituted for total energy",
@@ -1065,7 +1121,7 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
     json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
     csv_path = destination / "trials.csv"
     fields = ["trial_id", "gpu_uuid", "gpu_name", "workload", "valid", "target_verified", "ncu_status", "ncu_target_suitability", "ncu_utilization_status", "profiler_suitability_status",
-              "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
+              "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "baseline_state_matched", "baseline_state_issues", "baseline_state_domains_compared", "resource_geometry", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
               "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source"]
     with csv_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)

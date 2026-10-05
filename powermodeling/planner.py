@@ -75,6 +75,66 @@ def _clock_key(pair):
     return pair["graphics_mhz"], pair["memory_mhz"]
 
 
+def _study_design(config):
+    design = config.get("study_design", "legacy_unspecified")
+    if design not in ("energy_sweep", "diagnostic", "legacy_unspecified"):
+        raise ValueError("study_design must be energy_sweep, diagnostic or legacy_unspecified")
+    return design
+
+
+def _strict_clock_policy(config):
+    """The declared energy study cannot silently become a partial clock probe."""
+    if _study_design(config) != "energy_sweep":
+        return
+    if "clock_pairs" in config:
+        raise ValueError("energy_sweep requires the discovered90MHz clock grid, not explicit clock_pairs")
+    sweep = config.get("clock_sweep", {})
+    if not isinstance(sweep, dict):
+        raise ValueError("clock_sweep must be an object")
+    if ("graphics_quantiles" in sweep or type(sweep.get("graphics_step_mhz", 90)) is not int
+            or sweep.get("graphics_step_mhz", 90) != 90):
+        raise ValueError("energy_sweep requires graphics_step_mhz=90; graphics quantile exceptions are not allowed")
+    if sweep.get("all_memory_clocks") is not True or "memory_mhz" in sweep or "memory_quantiles" in sweep:
+        raise ValueError("energy_sweep requires all_memory_clocks=true without a memory-domain subset")
+    if sweep.get("include_advertised_default", True) is not True:
+        raise ValueError("energy_sweep cannot omit the advertised default fixed pair")
+    if sweep.get("include_default_policy", True) is not True:
+        raise ValueError("energy_sweep cannot omit the separate incoming-policy reference")
+
+
+def _requirements_coverage(coverage, strict):
+    """Unknown default is unresolved; unsupported exact anchors are inapplicable."""
+    if not strict:
+        return {"requirements_status": "not_required", "execution_allowed": True,
+                "requirement_checks": [], "requirement_reasons": []}
+    checks = [
+        {"requirement": "graphics_step_90_mhz", "status": "satisfied", "reason": "requested90MHz grid maps to advertised graphics clocks"},
+        {"requirement": "all_memory_domains", "status": "satisfied", "reason": "every advertised memory-clock domain is selected",
+         "memory_mhz": coverage["selected_memory_mhz"]},
+    ]
+    default = coverage["advertised_default"]
+    if default["status"] == "included":
+        checks.append({"requirement": "advertised_default_fixed_pair", "status": "satisfied",
+                       "reason": "exact advertised default pair included", "clocks": {
+                           "graphics_mhz": default["graphics_mhz"], "memory_mhz": default["memory_mhz"]}})
+    else:
+        checks.append({"requirement": "advertised_default_fixed_pair", "status": "unresolved",
+                       "reason": "advertised default pair is unavailable; incoming-policy reference is not a substitute"})
+    checks.append({"requirement": "incoming_policy_reference", "status": "satisfied",
+                   "reason": "separate no-mutation reference included; factory-default policy is not asserted"})
+    supported = []
+    unsupported = []
+    for domain in coverage["memory_domains"]:
+        point = next(point for point in domain["required_points"] if point["mhz"] == 1110)
+        (supported if point["status"] == "included" else unsupported).append(domain["memory_mhz"])
+    checks.append({"requirement": "exact1110_when_supported", "status": "satisfied" if supported else "not_applicable",
+                   "reason": "exact1110MHz included in every supporting memory domain" if supported else "no advertised memory domain supports exact1110MHz",
+                   "included_memory_mhz": supported, "not_applicable_memory_mhz": unsupported})
+    reasons = [check["reason"] for check in checks if check["status"] == "unresolved"]
+    return {"requirements_status": "incomplete" if reasons else "complete",
+            "execution_allowed": not reasons, "requirement_checks": checks, "requirement_reasons": reasons}
+
+
 def resolve_clock_plan(config, supported):
     """Return real supported pairs plus explicit grid/default/anchor coverage.
 
@@ -85,6 +145,8 @@ def resolve_clock_plan(config, supported):
     """
     if not isinstance(config, dict) or not isinstance(supported, dict):
         raise ValueError("Experiment config and supported clock discovery must be objects")
+    _strict_clock_policy(config)
+    strict = _study_design(config) == "energy_sweep"
     if "clock_pairs" in config and "clock_sweep" in config:
         raise ValueError("Choose explicit clock_pairs or a discovered clock_sweep, not both")
     by_mem = _supported_domains(supported)
@@ -113,6 +175,7 @@ def resolve_clock_plan(config, supported):
                         {"clocks": pair, "clock_policy": "fixed_explicit" if pair["graphics_mhz"] is not None else "incoming_policy_reference",
                          "selection_reasons": ["explicit_configuration"]} for pair in normalized],
                     "note": "Explicit pairs are not advertised as a complete frequency sweep."}
+        coverage.update(_requirements_coverage(coverage, strict=False))
         return normalized, coverage
     sweep = config.get("clock_sweep", {})
     if not isinstance(sweep, dict):
@@ -186,7 +249,7 @@ def resolve_clock_plan(config, supported):
             add(g, memory, "supported_range_endpoint")
         points = []
         for anchor in required:
-            status = "included" if anchor in graphics else "unavailable"
+            status = "included" if anchor in graphics else "not_applicable" if strict else "unavailable"
             reason = ("exact_supported_pair" if status == "included" else
                       "outside_advertised_operating_range" if anchor < low or anchor > high else
                       "not_an_advertised_discrete_graphics_clock")
@@ -232,8 +295,9 @@ def resolve_clock_plan(config, supported):
         row["clocks"]["memory_mhz"] is None, row["clocks"]["memory_mhz"] or 0,
         row["clocks"]["graphics_mhz"] or 0))
     coverage["clock_conditions"] = ordered
-    coverage["required_anchor_coverage_complete"] = all(point["status"] == "included"
+    coverage["required_anchor_coverage_complete"] = all(point["status"] in ("included", "not_applicable")
         for domain in coverage["memory_domains"] for point in domain["required_points"])
+    coverage.update(_requirements_coverage(coverage, strict))
     return [row["clocks"] for row in ordered], coverage
 
 
@@ -261,6 +325,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
         raise ValueError("Discovered device capacities and SM count must be positive")
     trials = []
     conditions = set()
+    geometry_keys = {}
     paired_default = config.get("paired_reference", True)
     if type(paired_default) is not bool:
         raise ValueError("paired_reference must be boolean")
@@ -350,6 +415,8 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 reachable_sector_bytes=min(ws,(word_count//math.gcd(word_count,stride))*32)
                 if reachable_sector_bytes < names["l2_bytes"]*4:
                     raise ValueError("HBM stride aliases a potentially cache-resident footprint; enlarge working_set_bytes")
+            geometry_keys.setdefault(workload, set()).add(json.dumps({
+                "stage": spec.get("stage", "saturation"), "parameters": resolved, "paired_reference": paired}, sort_keys=True))
             for pair in clocks:
                 clock_annotation = clock_annotations[_clock_key(pair)]
                 condition = {"workload": workload, "stage": spec.get("stage", "saturation"),
@@ -383,12 +450,22 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                     trials.append(trial)
     rng = random.Random(config.get("randomization_seed", 2026))
     rng.shuffle(trials)
+    estimated_minimum = sum((2*seconds+3*warmup+2*idle)
+        if trial.get("treatment_protocol", {}).get("kind") == "paired_active_reference"
+        else seconds+warmup+2*idle for trial in trials)
+    by_workload = [{"workload": workload, "geometry_conditions": len(keys),
+                    "clock_conditions_per_geometry": len(clocks), "clock_geometry_conditions": len(keys)*len(clocks),
+                    "repeats": repeats, "trials": len(keys)*len(clocks)*repeats}
+                   for workload, keys in sorted(geometry_keys.items())]
     return {"schema_version":1, "device":device, "trials":trials,
+            "study_design": _study_design(config), "execution_allowed": clock_coverage["execution_allowed"],
             "clock_sweep_coverage": clock_coverage,
+            "sweep_dimensions": {"geometry_conditions": sum(len(keys) for keys in geometry_keys.values()),
+                "clock_conditions_per_geometry": len(clocks), "clock_geometry_conditions": len(conditions),
+                "repeats": repeats, "trials": len(trials), "by_workload": by_workload,
+                "runtime_note": "Every workload/geometry is crossed with every deduplicated clock condition and repeated. Estimated runtime includes both paired arms and all planned repetitions, excluding preparation, settling and overruns."},
             "sample_interval_s":interval, "randomization_seed": config.get("randomization_seed",2026),
-            "estimated_minimum_seconds": sum((2*seconds+3*warmup+2*idle)
-                if trial.get("treatment_protocol", {}).get("kind") == "paired_active_reference"
-                else seconds+warmup+2*idle for trial in trials),
+            "estimated_minimum_seconds": estimated_minimum,
             "notes":["Runtime estimate excludes allocation, preparation, clock settling and batch overruns.",
                      "Near/far labels require independent empirical locality evidence; offsets are exploratory."]}
 

@@ -198,6 +198,21 @@ class IntegrationReviewTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["analyze", "--input", str(Path(directory) / "absent"), "--output", directory]), 2)
 
+    def test_cli_incomplete_required_default_is_rejected_before_cuda_describe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = Path(directory) / "blocked-plan.json"
+            destination = Path(directory) / "uncreated"
+            plan.write_text(json.dumps({"study_design": "energy_sweep", "execution_allowed": False,
+                "clock_sweep_coverage": {"requirements_status": "incomplete",
+                    "requirement_reasons": ["advertised_default_unavailable"]}}))
+            error = io.StringIO()
+            with patch("powermodeling.cli.describe_benchmark") as describe, redirect_stderr(error):
+                status = main(["run", "--plan", str(plan), "--output", str(destination)])
+            self.assertEqual(status, 2)
+            self.assertIn("advertised_default_unavailable", error.getvalue())
+            describe.assert_not_called()
+            self.assertFalse(destination.exists())
+
     def test_cli_rejected_fit_is_saved_and_returns_failure(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             source=Path(directory)/"rows.json"

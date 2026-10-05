@@ -1,17 +1,13 @@
 {
-  "description": "Exploratory SM/offset/stride and dependent latency probes. No automatic near/far assignment.",
+  "description": "Exploratory SM/offset/stride and dependent latency probes. No automatic near/far assignment. All geometries are measured on the same90MHz all-memory energy grid with mandatory default and supported1110MHz anchors.",
   "seconds": 12,
   "warmup_seconds": 3,
   "idle_seconds": 6,
   "repeats": 4,
   "sample_interval_s": 0.05,
   "clock_sweep": {
-    "graphics_quantiles": [
-      1.0
-    ],
-    "memory_quantiles": [
-      1.0
-    ],
+    "graphics_step_mhz": 90,
+    "all_memory_clocks": true,
     "required_graphics_mhz": [
       1110
     ],
@@ -124,5 +120,6 @@
     }
   ],
   "target_form_factor": "SXM",
-  "paired_reference": true
+  "paired_reference": true,
+  "study_design": "energy_sweep"
 }

@@ -10,9 +10,9 @@
 |---|---|---|---|
 | 모두 SXM | SXM과 HBM은 form factor와 memory 기술로 서로 다른 분류; 이전 family/compute capability만으로 SKU를 충분히 제한하지 않았음 | SXM 선언/식별 근거와 GPU family 검증을 device에 보존. 이름상 PCIe·다른 GPU family는 거부하며 모호한 이름은 명시적 확인 필요 | 실제 V100/A100/H100 모듈 이름·용량·SM 수·power limit |
 | treatment와 idle | 이전 구현은 이미 전후 idle 보간·drift 검사를 했으므로 단일 idle snapshot의 무조건 차감은 아니었음. 그러나 same-process paired active reference는 없었음 | custom Tensor/L1/L2/HBM에 arm별 warmup·지속 측정·완료 epoch, 같은 context/버퍼/clock policy, seeded AB/BA pairing 추가. 전체·idle 증가분·paired 대비의 승인 범위를 분리 | control과 target actual clock·온도·cap·간섭·SM admission·repeat order |
-| 약 90 MHz | 이전 graphics quantile은 약 90 MHz interval을 보장하지 않았음 | DVFS 모든 광고 memory domain에서 `graphics_step_mhz:90`, 지원값 매핑·끝점·실제 간격을 기록. saturation/locality quantile은 별도 목적임을 명시 | 실제 장치의 지원 list, 요청/실제 MHz, clock-domain plateau |
-| default·1110 | 기존 relative quantile만으로 해당 기준점 포함이 보장되지 않았음 | exact 1110 지원 pair만 포함, 미지원 이유를 기록. advertised-default fixed pair와 무설정 incoming-policy reference를 분리 | default API 지원·clock method, 이전 lock 정책 여부. null pair를 factory default로 단정하지 않음 |
-| GPU별 최적 pJ/bit·pJ/FLOP | global-near-peak만으로 선택하면 각 주파수에서 활용된 에너지 최적점을 놓칠 수 있었음 | 각 UUID의 own-frequency geometry peak 기반 실측 단가 최솟값과 measured support points, 별도 global-near-peak 선택. total/idle/paired objective 분리 | 모든 후보 NCU·품질·활용 승인, 최소점 주변 추가 측정·반복 불확실성 |
+| 약 90 MHz | 이전 graphics quantile은 약 90 MHz interval을 보장하지 않았음 | saturation·DVFS·locality 모두 모든 광고 memory domain에서 `graphics_step_mhz:90`, 지원값 매핑·끝점·실제 간격을 기록 | 실제 장치의 지원 list, 요청/실제 MHz, clock-domain plateau |
+| default·1110 | 기존 relative quantile만으로 해당 기준점 포함이 보장되지 않았음 | exact 1110 지원 pair만 포함, 지원 불가는 not-applicable 사유. advertised-default fixed pair와 무설정 incoming-policy reference를 분리; default 미확정 energy-sweep plan은 실행 전에 차단; 기록된 native 지원 목록에서 필수 90 MHz grid를 재계산하고 geometry·treatment-design별 실제 clock trial coverage 재검사 | default API 지원·clock method, 이전 lock 정책 여부. null pair를 factory default로 단정하지 않음 |
+| GPU별 최적 pJ/bit·pJ/FLOP | global-near-peak만으로 선택하면 각 주파수에서 활용된 에너지 최적점을 놓칠 수 있었음 | 각 UUID의 clock pair별 최소 2 검증 resource geometry 비교와 전체 유효 관측 peak 기반 승인 단가 최솟값·support points. 단일 geometry는 별도 exploratory 진단; global-near-peak 선택 분리. total/idle/paired objective 분리 | 모든 후보 NCU·품질·활용 승인, 최소점 주변 추가 측정·반복 불확실성 |
 | visualization 문서 | 설계 내용을 한 번에 읽을 독립 HTML이 없었음 | [experiment-design.html](experiment-design.html)에 계층/단위, paired timeline, supported-grid 도식, 판정 순서, 로컬 plan/summary 뷰어 추가 | HTML에서 표시되는 숫자는 사용자 결과 provenance를 확인해야 하며 문서에 측정 숫자는 없음 |
 
 baseline가 실패해도 treatment 자체의 유효한 전체 에너지는 보존한다. 차감 objective에는 별도의 상태 일치 요건을 적용하고, 음의 관측 contrast는 부호를 보존한 진단값으로 남기되 최적값을 만들지 않는다. 기본 config는 4회 반복이며 paired 최적점에는 AB/BA 유효 반복 수가 같아야 한다. odd 반복은 imbalance 진단을 보존하고 paired 최적점으로 승인하지 않는다. issue-loop control은 다른 명령·memory·occupancy 경로를 사용하므로 이 대비를 순수 component dynamic이라고 주장하지 않는다.
@@ -49,10 +49,10 @@ baseline가 실패해도 treatment 자체의 유효한 전체 에너지는 보�
 | L2 locality | 의존 pointer chase의 SM/offset latency·독립 fabric 지도 | 후보 지도만 생성; bandwidth saturation과 near/far energy 검증은 별도 |
 | 클럭·DVFS | 지원 pair·actual clock·throttling·변경 실패·복원·resume policy | MHz가 같아도 전압·공정·power cap·온도가 같다는 보장은 없음 |
 | NVML 센서 | UUID 대응, capability probe, null/error, power/energy/scope timestamp | A100 GA100 현재 전력과 H100 평균 전력 차이 기록; rail 범위는 실측 지원 확인 |
-| 전후 idle·paired 기준 | 전후 보간, baseline quality와 전체 품질 분리, 같은 process AB/BA arm·actual state·geometry·epoch 확인 | idle 증가분과 paired operational contrast를 분리; control이 완전한 counterfactual이 아니며 순수 static/dynamic 분리의 증명은 아님 |
+| 전후 idle·paired 기준 | 전후 보간, baseline와 전체 품질 분리, 같은 process AB/BA arm·actual clock/온도/cap·조회 가능한 pstate/enforced cap·geometry·epoch 확인 | idle 증가분과 paired operational contrast를 분리; control이 완전한 counterfactual이 아니며 순수 static/dynamic 분리의 증명은 아님 |
 | 시간·적분·처리량 | monotonic phase, 완료 epoch, exact count, matched energy window | CUDA event elapsed는 launch gap 포함; power sensor의 지연·평균창은 남음 |
 | NCU 적절성 | 필수 metric·단위·valid range·target launch·clocks·identity·local-memory traffic | 판정 threshold는 프로젝트 정책; missing evidence, 짧은 active clock sample 누락과 L2 write/copy residency는 미확정 |
-| 최적값 분석 | UUID별 own-frequency geometry peak의 95%·검증·정렬·total/idle/paired 단가, discrete support point·CI·Pareto | 주파수별 efficiency와 전체 clock 최고 성능 제약을 분리. reference 미승인 objective는 winner 없음; 미측정 gap·연속 최적 구간 추론 금지 |
+| 최적값 분석 | UUID별 clock pair 최소 2 검증 resource geometry·전체 유효 관측 peak의 95%·검증·정렬·total/idle/paired 단가, discrete support point·CI·Pareto | 주파수별 efficiency와 전체 clock 최고 성능 제약을 분리. reference 미승인/단일 geometry는 승인 winner 없음. 단일 geometry 탐색 진단 분리; 2개 비교가 실제 포화 증명은 아님; 미측정 gap·연속 최적 구간 추론 금지 |
 | 모델 | explicit measured feature·단위/provenance·rank/condition·독립 holdout | empirical workload 모델; 혼합 calibration 없는 계수 단순 합산 금지 |
 | CLI·provenance | validate-run/profile/evaluate/attach/analyze, 원본 보존, UUID·binary·condition | batch validation checkpoint·coverage 기록; 실패 evidence도 남김; binary hash·toolchain·PID로 결과 추적 |
 | 빌드·CI·문서 | Python 회귀 테스트와 CUDA 12의 `sm_70;sm_80;sm_90` 컴파일 | 컴파일/CPU 테스트가 실제 센서·cache 적절성 검증을 대신하지 않음 |
@@ -66,13 +66,13 @@ cmake --build build -j
 python -m powermodeling --help
 ```
 
-이번 SXM·paired-reference·90 MHz·per-GPU 최적점 변경을 포함한 Python 회귀 테스트 **184개가 로컬에서 통과했다**. CUDA 변경의 최종 다중 아키텍처 빌드 결과는 [PR #1](https://github.com/bang001/powermodeling/pull/1)의 해당 commit CI를 기준으로 확인한다. 테스트는 생성된 데이터와 NVML/subprocess mock으로 실패·반례를 검증한다. NCU timeout·중단 시 소유한 process group만 종료하고 부분 출력·실패 evidence·clock 복원 결과를 보존하는 경로도 포함한다. 독립 주소 열거에서 write/copy 소유권 9,543 조건과 finite footprint 30,720 조건을 확인했으며, 이는 주소 수학의 검증이다. CUDA 12 다중 아키텍처 빌드는 컴파일 가능성을 검증한다. 최종 실행 결과와 CI 상태는 [PR #1](https://github.com/bang001/powermodeling/pull/1)에 기록한다. 테스트 이름·조건은 `tests/`에서 확인할 수 있다.
+추가 clock coverage·resource geometry·baseline 상태 검사와 CLI 사전 차단을 포함한 Python 회귀 테스트 **204개가 로컬에서 통과했다**. Python compileall 및 diff-check도 통과했다. CUDA 변경의 최종 다중 아키텍처 빌드 결과는 [PR #1](https://github.com/bang001/powermodeling/pull/1)의 해당 commit CI를 기준으로 확인한다. 테스트는 생성된 데이터와 NVML/subprocess mock으로 실패·반례를 검증한다. NCU timeout·중단 시 소유한 process group만 종료하고 부분 출력·실패 evidence·clock 복원 결과를 보존하는 경로도 포함한다. 독립 주소 열거에서 write/copy 소유권 9,543 조건과 finite footprint 30,720 조건을 확인했으며, 이는 주소 수학의 검증이다. CUDA 12 다중 아키텍처 빌드는 컴파일 가능성을 검증한다. 최종 실행 결과와 CI 상태는 [PR #1](https://github.com/bang001/powermodeling/pull/1)에 기록한다. 테스트 이름·조건은 `tests/`에서 확인할 수 있다.
 
 ## HTML 문서 확인 범위
 
-[experiment-design.html](experiment-design.html)은 외부 script·stylesheet·font·image를 요청하지 않는 독립 파일이다. HTML 구조·중복 ID·anchor 연결과 embedded JavaScript 문법을 확인했다. 실제 planner/analyzer가 만든 **synthetic QA fixture**로 local JSON 읽기, clock coverage·default/1110 사유, objective 선택, 이산 support-point 표시, 탭/키보드 이동, invalid·oversize JSON, 안전한 text 삽입을 점검했다. 이 fixture는 GPU 실측 결과가 아니다.
+[experiment-design.html](experiment-design.html)은 외부 script·stylesheet·font·image를 요청하지 않는 독립 파일이다. HTML 구조·중복 ID·anchor 연결과 embedded JavaScript 문법을 확인했다. 최신 planner/analyzer가 만든 **synthetic QA fixture**로 local JSON 읽기, 검증된 다중 geometry의 eligible support points 6개, default 미확정 실행 차단, 단일 geometry 탐색 진단, 이전 geometry 근거 미확인 진단, objective 선택, 탭/키보드 이동, invalid·oversize JSON, 안전한 text 삽입을 점검했다. 이 fixture는 GPU 실측 결과가 아니다.
 
-정적 SVG 도식은 별도 렌더로 확인할 수 있다. 브라우저 binary가 없는 검토 환경에서는 전체 HTML의 desktop/mobile browser 렌더를 검증하지 못했으므로 이를 완료했다고 주장하지 않는다. 현재 문서의 측정값 없는 초기 화면, 개념도와 결과를 불러온 화면을 구분한다. 로컬 파일 읽기는 브라우저 안에서만 데이터를 처리하고 서버에 전송하지 않는다.
+정적 SVG 도식 4개를 개별 렌더하여 도형 배치와 경로를 점검했다. 검토 환경의 한국어 font 지원은 제한되어 있었다. 브라우저 binary가 없는 검토 환경에서는 전체 HTML의 desktop/mobile browser 렌더를 검증하지 못했으므로 이를 완료했다고 주장하지 않는다. 현재 문서의 측정값 없는 초기 화면, 개념도와 결과를 불러온 화면을 구분한다. 로컬 파일 읽기는 브라우저 안에서만 데이터를 처리하고 서버에 전송하지 않는다.
 
 ## 실제 GPU에서 남은 확인
 

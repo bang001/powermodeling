@@ -39,6 +39,87 @@ def validate_trial_ids(records):
         seen.add(identifier)
 
 
+def validate_plan_execution(plan):
+    """Reject an incomplete required-clock study before GPU or file mutation.
+
+    Diagnostic and legacy plans keep their explicit scope. A full energy study
+    must retain every planned clock condition for each workload geometry; use
+    the run limit for a partial diagnostic instead of deleting required arms.
+    """
+    coverage = plan.get("clock_sweep_coverage") or {}
+    strict = plan.get("study_design") == "energy_sweep"
+    reasons = coverage.get("requirement_reasons") or []
+    if plan.get("execution_allowed") is False or (strict and plan.get("execution_allowed") is not True):
+        detail = "; ".join(str(reason) for reason in reasons) or "required clock coverage is unverified"
+        raise ValueError("Study clock requirements are incomplete; execution blocked: " + detail)
+    if not strict:
+        return
+    if coverage.get("requirements_status") != "complete":
+        raise ValueError("Study clock requirements must be complete before execution")
+    if coverage.get("strategy") != "nearest_supported_graphics_grid" or coverage.get("requested_step_mhz") != 90:
+        raise ValueError("Energy study requires the supported approximately 90 MHz graphics sweep")
+    supported_memory = coverage.get("supported_memory_mhz") or []
+    selected_memory = coverage.get("selected_memory_mhz") or []
+    domains = coverage.get("memory_domains") or []
+    if (not supported_memory or set(supported_memory) != set(selected_memory)
+            or set(supported_memory) != {domain.get("memory_mhz") for domain in domains}):
+        raise ValueError("Energy study must cover every advertised memory clock domain")
+    default = coverage.get("advertised_default") or {}
+    if default.get("status") != "included":
+        raise ValueError("Required advertised default clock pair is missing or unverified")
+    default_pair = (default.get("graphics_mhz"), default.get("memory_mhz"))
+    if any(type(value) is not int or value <= 0 for value in default_pair):
+        raise ValueError("Required advertised default clock pair is invalid")
+    declared = set()
+    for condition in coverage.get("clock_conditions") or []:
+        pair = condition.get("clocks") or {}
+        graphics, memory = pair.get("graphics_mhz"), pair.get("memory_mhz")
+        if (graphics is None) != (memory is None) or (graphics is not None and
+                any(type(value) is not int or value <= 0 for value in (graphics, memory))):
+            raise ValueError("Invalid clock condition in study coverage")
+        declared.add((graphics, memory))
+    if default_pair not in declared or (None, None) not in declared:
+        raise ValueError("Study coverage must include advertised default and incoming-policy reference")
+    native_pairs = []
+    for domain in domains:
+        selected_graphics = {graphics for graphics, memory in declared if memory == domain.get("memory_mhz")}
+        supported_graphics = domain.get("supported_graphics_mhz") or []
+        if (not supported_graphics or not selected_graphics
+                or not selected_graphics.issubset(set(supported_graphics))):
+            raise ValueError("Study clock conditions must use supported pairs in every memory domain")
+        if 1110 in domain.get("supported_graphics_mhz", []) and (1110, domain.get("memory_mhz")) not in declared:
+            raise ValueError("Study coverage omitted a supported exact 1110 MHz condition")
+        native_pairs.extend({"graphics_mhz": graphics, "memory_mhz": domain.get("memory_mhz")}
+                            for graphics in supported_graphics)
+    # Recompute the grid from advertised native pairs. Selected conditions and
+    # plotting metadata can be edited together with trials; their agreement
+    # alone cannot establish that the required sweep remains complete.
+    from .planner import resolve_clock_plan
+    pairs, rebuilt = resolve_clock_plan({"study_design": "energy_sweep", "clock_sweep": {
+        "graphics_step_mhz": 90, "all_memory_clocks": True,
+        "required_graphics_mhz": coverage.get("required_graphics_mhz", [1110]),
+        "include_advertised_default": True, "include_default_policy": True}}, {
+        "supported_pairs": native_pairs,
+        "default_applications_graphics_mhz": default_pair[0],
+        "default_applications_memory_mhz": default_pair[1]})
+    if rebuilt["execution_allowed"] is not True:
+        raise ValueError("Required advertised default clock pair is not in the discovered supported clock domains")
+    expected = {(pair["graphics_mhz"], pair["memory_mhz"]) for pair in pairs}
+    if declared != expected:
+        raise ValueError("Study clock coverage does not retain the required approximately 90 MHz grid and supported endpoints; regenerate the full plan")
+    by_geometry = {}
+    for trial in plan.get("trials") or []:
+        protocol = trial.get("treatment_protocol") or {}
+        design = {key: value for key, value in protocol.items()
+                  if key not in ("order", "phase_order", "order_balance_note")}
+        signature = json.dumps({"workload": trial.get("workload"), "stage": trial.get("stage"),
+                                "parameters": trial.get("parameters"), "treatment_design": design}, sort_keys=True)
+        pair = trial.get("clocks") or {}
+        by_geometry.setdefault(signature, set()).add((pair.get("graphics_mhz"), pair.get("memory_mhz")))
+    if not by_geometry or any(actual != expected for actual in by_geometry.values()):
+        raise ValueError("Study trials do not retain every required clock condition for each workload geometry; regenerate the full plan")
+
+
 def describe_benchmark(executable, device_index=0):
     result = subprocess.run([str(executable), "--device", str(device_index), "--describe"],
                             capture_output=True, text=True, check=True, timeout=60)
@@ -383,6 +464,7 @@ def capture_trial(executable, trial, device, cuda_device, sample_interval_s=0.05
 
 def run_plan(plan, executable, output_dir, cuda_device, apply_clocks=False,
              clock_method="applications", locked_restore=None, resume=False, limit=None):
+    validate_plan_execution(plan)
     from .telemetry import NvmlDevice
     from .clocks import clock_context
     validate_trial_ids(plan["trials"])

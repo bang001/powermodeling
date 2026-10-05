@@ -1,5 +1,5 @@
 {
-  "description": "SXM-only DVFS sweep: approximately90MHz graphics grid in discovered supported ranges at every advertised memory domain; includes exact1110MHz when supported, advertised default fixedpair and incoming-policy reference. Replace geometry with measured per-GPU saturation conditions.",
+  "description": "SXM energy sweep: approximately90MHz advertised graphics grid at every advertised memory domain, mandatory advertised default fixedpair and separate incoming-policy reference, exact1110MHz wherever supported. Multiple geometry candidates are measured at every pair; default discovery must be resolved before execution.",
   "seconds": 12,
   "warmup_seconds": 3,
   "idle_seconds": 6,
@@ -7,10 +7,10 @@
   "sample_interval_s": 0.05,
   "clock_sweep": {
     "graphics_step_mhz": 90,
+    "all_memory_clocks": true,
     "required_graphics_mhz": [
       1110
     ],
-    "all_memory_clocks": true,
     "include_default_policy": true,
     "include_advertised_default": true
   },
@@ -18,58 +18,109 @@
     {
       "workload": "control",
       "stage": "dvfs",
-      "parameters": {
-        "blocks": "sm_count*4",
-        "threads": 256
+      "parameters": {},
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "threads": [
+          128,
+          256
+        ]
       }
     },
     {
       "workload": "tensor",
       "stage": "dvfs",
       "parameters": {
-        "blocks": "sm_count*4",
-        "threads": 256,
         "tensor_accumulators": 4
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "threads": [
+          128,
+          256
+        ]
       }
     },
     {
       "workload": "gemm",
       "stage": "dvfs",
       "parameters": {
-        "gemm_m": 4096,
         "gemm_n": 4096,
         "gemm_k": 4096
+      },
+      "grid": {
+        "gemm_m": [
+          2048,
+          4096,
+          8192
+        ]
       }
     },
     {
       "workload": "l1",
       "stage": "dvfs",
       "parameters": {
-        "blocks": "sm_count*4",
-        "threads": 256,
-        "working_set_bytes": "sm_count*4*16384"
+        "working_set_bytes": "blocks*16384"
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "threads": [
+          128,
+          256
+        ]
       }
     },
     {
       "workload": "l2",
       "stage": "dvfs",
       "parameters": {
-        "blocks": "sm_count*4",
-        "threads": 256,
         "working_set_bytes": "l2_bytes*0.5"
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "threads": [
+          128,
+          256
+        ]
       }
     },
     {
       "workload": "hbm",
       "stage": "dvfs",
       "parameters": {
-        "blocks": "sm_count*4",
-        "threads": 256,
         "working_set_bytes": "max(l2_bytes*8,268435456)",
         "seed": 2026
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "threads": [
+          128,
+          256
+        ]
       }
     }
   ],
   "target_form_factor": "SXM",
-  "paired_reference": true
+  "paired_reference": true,
+  "study_design": "energy_sweep"
 }

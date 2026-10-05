@@ -1,6 +1,6 @@
 # V100·A100·H100 에너지 실험 설계
 
-이 실험의 목적은 **각 GPU를 충분히 활용하는 조건에서 실측 pJ/FLOP·pJ/bit가 가장 낮은 설정과 주변 측정점**을 찾는 것이다. 전력의 절대 최솟값만 찾으면 GPU를 쉬게 하는 설정이 선택된다. 각 주파수에서 관측한 전체 유효 geometry sweep 최고 처리량의 95% 이상을 유지하는 설정으로 효율 최적점을 찾고, 전체 clock sweep 최고 처리량의 95% 이상을 요구하는 성능 제약 선택도 별도로 보고한다. 전체 에너지·승인된 idle 증가분·승인된 paired-reference 대비를 각각 비교한다. Pareto 경계는 더 높은 처리량과 더 낮은 전력을 동시에 제공하는 다른 관측 설정이 없는 점들의 집합이다. 95%는 본 프로젝트의 운영 기준이며 NVIDIA의 보장값이 아니다.
+이 실험의 목적은 **각 GPU를 충분히 활용하는 조건에서 실측 pJ/FLOP·pJ/bit가 가장 낮은 설정과 주변 측정점**을 찾는 것이다. 전력의 절대 최솟값만 찾으면 GPU를 쉬게 하는 설정이 선택된다. 각 frequency pair에서 NCU·품질·정확한 시간 정렬을 통과한 최소 2개의 resource geometry를 실제로 비교하고, 비교한 유효 geometry의 관측 최고 처리량의 95% 이상을 유지하는 설정으로 효율 최적점을 찾고, 전체 clock sweep 최고 처리량의 95% 이상을 요구하는 성능 제약 선택도 별도로 보고한다. 전체 에너지·승인된 idle 증가분·승인된 paired-reference 대비를 각각 비교한다. Pareto 경계는 더 높은 처리량과 더 낮은 전력을 동시에 제공하는 다른 관측 설정이 없는 점들의 집합이다. 95%는 본 프로젝트의 운영 기준이며 NVIDIA의 보장값이 아니다.
 
 실측 전력이 없으면 idle 전력이나 각 블록의 에너지를 숫자로 확정하지 않는다. 이 저장소는 측정과 분석을 재현하는 도구이며, 예제나 CPU 테스트 결과는 GPU 측정 결과가 아니다.
 
@@ -28,10 +28,10 @@
 Treatment는 측정할 Tensor·L1·L2·HBM 작업이다. 기본 custom workload는 같은 process에서 issue-loop `control`과 짝지어 실행한다. geometry와 loop 규모는 공유하지만 control도 integer ALU·주소 계산·제어·launch·store 등을 수행한다. 대상과 register·occupancy·cache·명령 경로가 같은 물리적 counterfactual이라고 부르지 않는다. cuBLAS GEMM에는 library 내부 geometry가 있으므로 기본 paired reference를 적용하지 않는다. 명시적으로 GEMM과 coarse control을 비교해도 matched-component objective로 승인하지 않는다.
 
 1. **전체 단가**는 treatment 구간의 모든 GPU 관측 에너지를 완료한 work로 나눈다. baseline 문제와 분리해서 품질을 판단한다.
-2. **운영상 idle 증가분**은 전후 context-idle를 treatment 시점으로 보간한 기준을 사용한다. actual clock·온도·power cap·process inventory·drift가 일치하는지를 검사하며, 미일치 차감값은 진단에 남기고 승인된 최적점에서 제외한다.
-3. **Paired active-reference 대비**는 같은 process·context·버퍼·clock policy의 두 arm에서 각각 정렬한 평균 전력의 차이를 treatment rate로 나눈다. 실제 클럭·온도·cap·상태·geometry·시간 경계·interference가 승인되어야 한다. 순서에 따른 편향을 살피기 위해 AB/BA를 반복마다 교대한다. 음의 차이는 0으로 clamp하지 않고 부호를 보존하며 최적점 후보로 사용하지 않는다.
+2. **운영상 idle 증가분**은 전후 context-idle를 treatment 시점으로 보간한 기준을 사용한다. actual clock·온도·power cap·조회 가능한 pstate/enforced cap·process inventory·drift가 일치하는지를 검사하며, 미일치 차감값은 진단에 남기고 승인된 최적점에서 제외한다.
+3. **Paired active-reference 대비**는 같은 process·context·버퍼·clock policy의 두 arm에서 각각 정렬한 평균 전력의 차이를 treatment rate로 나눈다. 실제 클럭·온도·cap·조회 가능한 pstate/enforced cap·상태·geometry·시간 경계·interference가 승인되어야 한다. 순서에 따른 편향을 살피기 위해 AB/BA를 반복마다 교대한다. 음의 차이는 0으로 clamp하지 않고 부호를 보존하며 최적점 후보로 사용하지 않는다.
 
-`baseline_valid`, `baseline_issues`, `operational_idle_increment_eligible`, `paired_active_reference_eligible`와 개별 이유를 보고한다. idle 또는 reference가 불충분해도 treatment 자체의 전체 에너지가 유효하면 보존한다. 하나의 기준 차감 결과로 전체 결과를 모두 탈락시키거나 순수 dynamic 에너지로 이름 붙이지 않는다.
+`baseline_valid`·`baseline_issues`·`baseline_state_matched`·`baseline_state_issues`·`operational_idle_increment_eligible`·`paired_active_reference_eligible`와 개별 이유를 보고한다. idle 또는 reference가 불충분해도 treatment 자체의 전체 에너지가 유효하면 보존한다. 하나의 기준 차감 결과로 전체 결과를 모두 탈락시키거나 순수 dynamic 에너지로 이름 붙이지 않는다.
 
 평균 전력 `P`와 처리량 `R`이 같은 지속 실행 구간을 대표할 때 에너지 단가는 `e = P/R`이다. 클럭이 바뀌거나 온도가 계속 올라가는 구간의 전력과 다른 구간의 처리량을 섞으면 이 식의 의미가 달라진다. 파형을 적분한 에너지와 GPU의 누적 에너지 카운터 차이는 서로 교차 확인하지만 독립적인 계측기의 검증을 대신하지는 않는다.
 
@@ -121,22 +121,26 @@ memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보
 
 ### 지원 범위의 약 90 MHz grid와 필수 기준점
 
-이전 구현의 graphics quantile 선택은 약 90 MHz 간격을 보장하지 않았다. `configs/dvfs.json`은 이제 `graphics_step_mhz: 90`을 사용한다. 장치가 광고한 지원 pair에서 각 선택 memory domain의 최소/최대와 약 90 MHz 목표점을 만든 뒤 가까운 지원 graphics MHz에 매핑한다. 목표·선택값·오차·실제 인접 간격을 `plan.clock_sweep_coverage`에 남긴다. 지원 값 사이의 native gap과 추가 필수점 때문에 실제 간격은 정확히 90 MHz가 아닐 수 있다.
+이전 구현의 graphics quantile 선택은 약 90 MHz 간격을 보장하지 않았다. `configs/saturation.json`·`configs/dvfs.json`·`configs/locality.json`은 모두 `graphics_step_mhz: 90`을 사용한다. 장치가 광고한 지원 pair에서 각 선택 memory domain의 최소/최대와 약 90 MHz 목표점을 만든 뒤 가까운 지원 graphics MHz에 매핑한다. 목표·선택값·오차·실제 인접 간격을 `plan.clock_sweep_coverage`에 남긴다. 지원 값 사이의 native gap과 추가 필수점 때문에 실제 간격은 정확히 90 MHz가 아닐 수 있다.
 
 | 포함 조건 | 처리 | 미지원·중복 처리 |
 |---|---|---|
-| 정확한 `1110 MHz` | 선택한 각 memory domain에서 exact pair가 지원되면 반드시 포함 | 미지원이면 `unavailable`과 범위 밖/이산 지원값 아님 사유; 근사값으로 대체하지 않음 |
+| 정확한 `1110 MHz` | 선택한 각 memory domain에서 exact pair가 지원되면 반드시 포함 | 미지원 exact pair면 `not_applicable`과 범위 밖/이산 지원값 아님 사유; 근사값으로 대체하지 않음 |
 | 장치가 광고한 default 고정 pair | NVML default applications graphics/memory pair가 지원 목록에 있으면 포함 | default 조회 불가·지원 pair 불일치이면 미포함 이유를 기록; 기존 grid와 중복이면 사유를 병합 |
 | 현재-policy reference | `null/null`로 기존 driver policy를 변경하지 않는 비교 조건 포함 | incoming applications 설정과 실제 MHz 기록; 기존 lock 정책이 미확인이므로 factory default라고 확정하지 않음 |
 | 지원 범위 끝점 | 선택한 memory domain의 최소·최대 supported graphics MHz 포함 | 지원 범위 밖 MHz를 생성하지 않음 |
 
-`saturation.json`과 `locality.json`의 clock quantile은 geometry·latency 탐색의 상대 단계이며 90 MHz frequency 전수 sweep가 아니다. 이 계획에도 min/max·default·1110 필수점 coverage가 남는다. `dvfs.json`은 `all_memory_clocks: true`로 모든 광고된 memory domain을 선택한다. 필요하면 지원 `memory_mhz` 목록이나 `memory_quantiles`로 별도의 제한 계획을 만들되, 축소한 coverage를 전체 domain 탐색이라고 표시하지 않는다. 약 90 MHz는 graphics/core domain 간격이며 HBM memory frequency를 같은 간격으로 강제하는 설정이 아니다. 임의 MHz를 직접 넣은 explicit `clock_pairs`는 전체 sweep로 표시하지 않는다.
+세 energy-sweep 설정 모두 `all_memory_clocks: true`로 모든 광고된 memory domain을 선택하고 geometry 또는 locality 축을 함께 바꾼다. 약 90 MHz는 graphics/core domain 간격이며 HBM memory frequency를 같은 간격으로 강제하는 설정이 아니다. `study_design: "energy_sweep"` 계획은 요구사항 coverage를 검사한다. advertised default pair가 미확정이면 plan의 `execution_allowed: false`와 `requirements_status: "incomplete"`를 남기고 runner가 변경·실행 전에 차단한다. null/null current-policy reference는 advertised-default 확인을 대체하지 못한다. Runner는 기록된 native 지원 clock 목록에서 필수 약 90 MHz grid·끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 조건이 모두 포함되는지 실행 전에 검사한다. selected coverage와 trial 목록을 함께 축소해도 원래 기록된 지원 목록에 따른 필수 grid 검사로 누락을 확인한다.
+
+임의 MHz를 직접 넣은 explicit `clock_pairs`나 제한 memory domain은 full-study 요구 coverage가 확인되어야 energy sweep로 승인된다. `smoke.json`은 `study_design: "diagnostic"`으로 무설정 센서·실행 점검을 허용하는 예외이며 full frequency sweep 또는 효율 최적점 검증을 의미하지 않는다. 모든 미확정·적용 불가 조건은 `requirement_checks`와 `requirement_reasons`에서 확인한다.
 
 실측 최소점 주변을 정밀하게 보려면 지원 목록 안의 추가 15–30 MHz 이웃 등으로 새 계획·새 반복을 만든다. refinement는 선택 사항이며 실측되지 않은 주파수의 단가를 곡선 보간으로 채우지 않는다.
 
 HBM에서는 memory clock을 고정한 뒤 SM clock을 올려 bandwidth가 포화되는 지점을 찾고, SM clock을 고정한 뒤 memory clock을 바꾼다. 낮은 SM clock에서 HBM bandwidth가 떨어지는 이유는 memory clock만이 아니라 load 발행량·주소 계산·interconnect·L2의 공급 능력일 수 있다. tensor·L1·L2도 클럭별 plateau를 따로 찾는다.
 
-각 층에서 반복 중앙값을 사용한다. `empirical_gpu_energy_optima`는 GPU UUID·workload·access·고정 memory MHz·objective별로, 각 clock pair의 **전체 유효 geometry 관측 peak** 대비 `R >= 0.95 × R_max`를 만족하는 검증 후보 중 단가 최소를 선택한다. `empirical_gpu_overall_energy_optima`는 검증된 measured memory domain도 함께 비교한다. 전체 단가, 승인된 idle 증가분, 승인된 paired-reference 대비는 각각 선택한다. 최적 graphics/memory MHz가 V100·A100·H100마다 같다고 가정하지 않는다. `R_max`는 이론 peak가 아닌 관측값이다. current-policy reference와 고정 클럭 탐색은 분리하고 seed·binary·clock policy·환경이 다른 결과를 같은 repeat로 합치지 않는다.
+각 층에서 반복 중앙값을 사용한다. `empirical_gpu_energy_optima`는 GPU UUID·workload·access·고정 memory MHz·objective별로, 각 clock pair에서 **최소 2개의 검증된 resource geometry를 실제 비교하고 전체 유효 관측 population의 peak** 대비 `R >= 0.95 × R_max`를 만족하는 검증 후보 중 단가 최소를 선택한다. `empirical_gpu_overall_energy_optima`는 검증된 measured memory domain도 함께 비교한다. 전체 단가, 승인된 idle 증가분, 승인된 paired-reference 대비는 각각 선택한다. 최적 graphics/memory MHz가 V100·A100·H100마다 같다고 가정하지 않는다. `R_max`는 이론 peak가 아닌 관측값이다. current-policy reference와 고정 클럭 탐색은 분리하고 seed·binary·clock policy·환경이 다른 결과를 같은 repeat로 합치지 않는다.
+
+geometry 개수는 blocks·threads·Tensor accumulator 또는 GEMM dimensions처럼 자원 실행 배치를 바꾸는 설정으로 계산한다. seed·working set·data/주소 offset·stride만 바꾼 기록을 여러 resource geometry로 부풀리지 않는다. 검증된 resource geometry가 하나뿐이면 자기 자신 대비 100%이므로 높은 활용을 확인한 최적점으로 승인하지 않고 `exploratory_single_geometry_energy_optima`와 `exploratory_single_geometry_overall_energy_optima`에 별도 진단을 남긴다. `own_clock_verified_distinct_geometry_count`·`own_clock_observed_distinct_geometry_count`·`geometry_evidence_status`·`selection_policy.min_geometries`를 확인한다. `own_clock_distinct_geometry_count`는 검증된 geometry 수 alias다. 처리량 분모는 두 승인 geometry로만 낮추지 않고 전체 유효 관측 population의 peak를 유지한다. 2개 비교는 최소 근거이며 실제 plateau·포화 증명은 아니므로 `saturation_proven: false`로 표시한다. incomplete geometry/frequency/NCU coverage에서 global hardware optimum을 주장하지 않는다.
 
 각 winner에는 요청/실제 클럭, `metric_value`, `metric_ci95`, `near_optimum_support_points`(기본 최솟값의 5% 이내 실측 group), `uncertainty_overlap_support_points`, `all_eligible_support_points`를 남긴다. 근접 단가와 신뢰구간 겹침은 별개로 표시한다. support point 사이의 미측정 영역을 연속 최적 구간으로 보장하지 않는다. 3–4회처럼 적은 반복의 bootstrap 구간은 거칠어 작은 차이에는 반복과 최소점 주변 측정을 늘린다.
 

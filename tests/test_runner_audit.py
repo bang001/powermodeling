@@ -1,6 +1,7 @@
 """Regression checks for rejected evidence and reversible experiment ownership."""
 
 from contextlib import contextmanager, redirect_stdout
+import copy
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from powermodeling.runner import assess_exclusive_device, capture_trial, load_trials, run_plan, validate_trial_ids
+from powermodeling.runner import assess_exclusive_device, capture_trial, load_trials, run_plan, validate_plan_execution, validate_trial_ids
 
 
 DEVICE = {"uuid": "GPU-runner-audit", "device_index": 0, "benchmark_sha256": None}
@@ -78,6 +79,138 @@ def no_clock_mutation(device, **kwargs):
 
 
 class RunnerAuditTests(unittest.TestCase):
+    def dense_strict_plan(self):
+        from powermodeling.planner import expand_plan
+        supported = {"supported_pairs": [
+            {"graphics_mhz": graphics, "memory_mhz": 1000}
+            for graphics in (900, 990, 1080, 1110, 1170, 1260)],
+            "default_applications_graphics_mhz": 900, "default_applications_memory_mhz": 1000}
+        device = {**DEVICE, "sm_count": 80, "l2_bytes": 6*1024**2,
+                  "total_memory_bytes": 16*1024**3}
+        config = {"study_design": "energy_sweep", "clock_sweep": {
+            "graphics_step_mhz": 90, "all_memory_clocks": True},
+            "experiments": [{"workload": "tensor", "parameters": {"blocks": 80, "threads": 256}}]}
+        return expand_plan(config, device, supported)
+
+    def strict_plan(self):
+        pairs = [{"graphics_mhz": g, "memory_mhz": 1000 if g is not None else None}
+                 for g in (900, 1110, None)]
+        return {"study_design": "energy_sweep", "execution_allowed": True,
+                "device": DEVICE, "sample_interval_s": .05,
+                "clock_sweep_coverage": {
+                    "requirements_status": "complete",
+                    "strategy": "nearest_supported_graphics_grid", "requested_step_mhz": 90,
+                    "supported_memory_mhz": [1000], "selected_memory_mhz": [1000],
+                    "advertised_default": {"status": "included", "graphics_mhz": 900, "memory_mhz": 1000},
+                    "clock_conditions": [{"clocks": pair} for pair in pairs],
+                    "memory_domains": [{"memory_mhz": 1000, "supported_graphics_mhz": [900, 1110]}]},
+                "trials": [{**TRIAL, "trial_id": f"geometry-{blocks}-clock-{i}",
+                            "parameters": {"blocks": blocks}, "clocks": pair}
+                           for blocks in (80, 160) for i, pair in enumerate(pairs)]}
+
+    def test_unknown_required_default_blocks_before_device_and_output_mutation(self):
+        plan = self.strict_plan()
+        plan["execution_allowed"] = False
+        plan["clock_sweep_coverage"].update(requirements_status="incomplete",
+            requirement_reasons=["advertised_default_unavailable"])
+        with tempfile.TemporaryDirectory() as directory, patch("powermodeling.telemetry.NvmlDevice") as device:
+            destination = Path(directory) / "uncreated"
+            with self.assertRaisesRegex(ValueError, "advertised_default_unavailable"):
+                run_plan(plan, "fixture", destination, DEVICE, apply_clocks=True)
+            device.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_required_clock_must_be_retained_for_every_workload_geometry(self):
+        plan = self.strict_plan()
+        validate_plan_execution(plan)
+        # A default in another geometry cannot hide the missing comparison arm.
+        plan["trials"] = [trial for trial in plan["trials"]
+                          if not (trial["parameters"]["blocks"] == 160 and trial["clocks"]["graphics_mhz"] == 900)]
+        with self.assertRaisesRegex(ValueError, "each workload geometry"):
+            validate_plan_execution(plan)
+
+    def test_strict_plan_cannot_promote_incomplete_or_missing_1110_coverage(self):
+        plan = self.strict_plan()
+        plan["clock_sweep_coverage"]["requirements_status"] = "incomplete"
+        with self.assertRaisesRegex(ValueError, "must be complete"):
+            validate_plan_execution(plan)
+        plan = self.strict_plan()
+        plan["clock_sweep_coverage"]["clock_conditions"] = [condition for condition in plan["clock_sweep_coverage"]["clock_conditions"]
+                                                           if condition["clocks"]["graphics_mhz"] != 1110]
+        with self.assertRaisesRegex(ValueError, "supported exact 1110"):
+            validate_plan_execution(plan)
+
+    def test_complete_label_cannot_hide_wrong_step_or_missing_memory_domain(self):
+        plan = self.strict_plan()
+        plan["clock_sweep_coverage"]["requested_step_mhz"] = 180
+        with self.assertRaisesRegex(ValueError, "90 MHz"):
+            validate_plan_execution(plan)
+        plan = self.strict_plan()
+        plan["clock_sweep_coverage"]["supported_memory_mhz"].append(1500)
+        with self.assertRaisesRegex(ValueError, "every advertised memory"):
+            validate_plan_execution(plan)
+
+    def test_coordinated_grid_point_deletion_cannot_hide_incomplete_sweep(self):
+        plan = self.dense_strict_plan()
+        validate_plan_execution(plan)
+        coverage = plan["clock_sweep_coverage"]
+        coverage["clock_conditions"] = [condition for condition in coverage["clock_conditions"]
+                                        if condition["clocks"]["graphics_mhz"] != 990]
+        domain = coverage["memory_domains"][0]
+        domain["selected_graphics_mhz"].remove(990)
+        domain["grid_mapping"] = [point for point in domain["grid_mapping"] if point["selected_mhz"] != 990]
+        domain["requested_grid_mhz"].remove(990)
+        domain["actual_gaps_mhz"] = [b-a for a, b in zip(domain["selected_graphics_mhz"], domain["selected_graphics_mhz"][1:])]
+        plan["trials"] = [trial for trial in plan["trials"] if trial["clocks"]["graphics_mhz"] != 990]
+        with self.assertRaisesRegex(ValueError, "90 MHz grid"):
+            validate_plan_execution(plan)
+
+    def test_complementary_paired_and_unpaired_clock_subsets_do_not_complete_each_other(self):
+        plan = self.dense_strict_plan()
+        validate_plan_execution(plan)
+        for trial in plan["trials"]:
+            if trial["clocks"]["graphics_mhz"] in (900, 990, 1080):
+                trial.pop("treatment_protocol")
+        with self.assertRaisesRegex(ValueError, "each workload geometry"):
+            validate_plan_execution(plan)
+
+    def test_order_randomization_stays_one_design_but_distinct_reference_designs_do_not(self):
+        plan = self.dense_strict_plan()
+        self.assertEqual({trial["treatment_protocol"]["order"] for trial in plan["trials"]}, {"AB", "BA"})
+        validate_plan_execution(plan)
+        # A differently matched reference cannot supply missing frequency arms.
+        for trial in plan["trials"]:
+            if trial["clocks"]["graphics_mhz"] in (900, 990, 1080):
+                trial["treatment_protocol"]["reference_matching"] = "coarse_unmatched_geometry"
+        with self.assertRaisesRegex(ValueError, "each workload geometry"):
+            validate_plan_execution(plan)
+
+    def test_runtime_grid_rebuild_uses_planner_ties_endpoints_and_exact_anchor(self):
+        from powermodeling.planner import expand_plan
+        device = {**DEVICE, "sm_count": 80, "l2_bytes": 6*1024**2,
+                  "total_memory_bytes": 16*1024**3}
+        supported = {"supported_pairs": [{"graphics_mhz": g, "memory_mhz": 1000}
+                                        for g in (900, 945, 1035, 1110, 1140, 1275)],
+                     "default_applications_graphics_mhz": 1140, "default_applications_memory_mhz": 1000}
+        config = {"study_design": "energy_sweep", "clock_sweep": {
+            "graphics_step_mhz": 90, "all_memory_clocks": True},
+            "experiments": [{"workload": "tensor"}]}
+        plan = expand_plan(config, device, supported)
+        selected = {condition["clocks"]["graphics_mhz"]
+                    for condition in plan["clock_sweep_coverage"]["clock_conditions"]}
+        self.assertIn(945, selected)  # 990 MHz grid target ties945/1035; lower wins.
+        self.assertIn(1275, selected)  # Non-grid maximum is still mandatory.
+        self.assertIn(1110, selected)
+        validate_plan_execution(plan)
+        for missing in (945, 1275):
+            incomplete = copy.deepcopy(plan)
+            incomplete["clock_sweep_coverage"]["clock_conditions"] = [
+                condition for condition in incomplete["clock_sweep_coverage"]["clock_conditions"]
+                if condition["clocks"]["graphics_mhz"] != missing]
+            incomplete["trials"] = [trial for trial in incomplete["trials"]
+                                    if trial["clocks"]["graphics_mhz"] != missing]
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "90 MHz grid"):
+                validate_plan_execution(incomplete)
     def test_unsafe_and_duplicate_trial_ids_fail_before_device_or_output_mutation(self):
         for identifier in (None, "", ".", "..", "../escaped", "folder/trial", "folder\\trial", "bad\nname"):
             with self.subTest(identifier=identifier), tempfile.TemporaryDirectory() as directory, \

@@ -8,7 +8,7 @@ import sys
 
 from .planner import expand_plan, benchmark_command
 from .profiles import architecture
-from .runner import atomic_json, describe_benchmark, load_trials, run_plan
+from .runner import atomic_json, describe_benchmark, load_trials, run_plan, validate_plan_execution
 
 
 def read_json(path):
@@ -122,14 +122,20 @@ def main(argv=None):
             result=expand_plan(read_json(args.config),cuda,clocks,args.stage)
             atomic_json(args.output,result)
             result={"output":str(Path(args.output).resolve()),"trials":len(result["trials"]),
-                    "estimated_minimum_hours":result["estimated_minimum_seconds"]/3600}
+                    "estimated_minimum_hours":result["estimated_minimum_seconds"]/3600,
+                    "study_design": result["study_design"], "execution_allowed": result["execution_allowed"],
+                    "requirements_status": result["clock_sweep_coverage"]["requirements_status"],
+                    "requirement_reasons": result["clock_sweep_coverage"]["requirement_reasons"],
+                    "sweep_dimensions": result["sweep_dimensions"]}
         elif args.command=="run":
             if args.limit is not None and args.limit<=0: raise ValueError("--limit must be positive")
             restore=(read_json(args.locked_restore) if args.locked_restore else
                      {"graphics":None,"memory":None} if args.clock_reset_on_exit else None)
+            plan=read_json(args.plan)
+            validate_plan_execution(plan)
             cuda=describe_benchmark(args.bench,args.device)
             cuda["device_index"]=args.device
-            result=run_plan(read_json(args.plan),args.bench,args.output,cuda,args.apply_clocks,
+            result=run_plan(plan,args.bench,args.output,cuda,args.apply_clocks,
                             args.clock_method,restore,args.resume,args.limit)
         elif args.command=="analyze":
             from .analysis import summarize, write_summary

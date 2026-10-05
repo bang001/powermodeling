@@ -62,5 +62,6 @@
     }
   ],
   "target_form_factor": "SXM",
-  "paired_reference": true
+  "paired_reference": true,
+  "study_design": "diagnostic"
 }

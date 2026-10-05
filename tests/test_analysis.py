@@ -498,7 +498,8 @@ class AnalysisTests(unittest.TestCase):
         summary = summarize(records)
         self.assertEqual(summary["within_clock_best"], [])
         self.assertEqual(len(summary["within_clock_best_total_energy"]), 1)
-        self.assertEqual([point["objective"] for point in summary["empirical_gpu_energy_optima"]], ["total"])
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        self.assertEqual([point["objective"] for point in summary["exploratory_single_geometry_energy_optima"]], ["total"])
 
     def test_idle_downclock_cannot_win_incremental_objective_but_total_can(self):
         records = [empirical_record("GPU-idle", 1200, repeat=i) for i in range(3)]
@@ -508,7 +509,8 @@ class AnalysisTests(unittest.TestCase):
         summary = summarize(records)
         self.assertEqual(summary["within_clock_best"], [])
         self.assertEqual(len(summary["cross_clock_best_total_energy"]), 1)
-        self.assertEqual([point["objective"] for point in summary["empirical_gpu_energy_optima"]], ["total"])
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        self.assertEqual([point["objective"] for point in summary["exploratory_single_geometry_energy_optima"]], ["total"])
 
     def test_logical_bit_and_flop_units_and_physical_denominator_remain_distinct(self):
         memory = analyze_trial(empirical_record("GPU-unit", 1200, workload="hbm", throughput=1e12))
@@ -534,6 +536,8 @@ class AnalysisTests(unittest.TestCase):
                 for repeat in range(3):
                     records.append(empirical_record(uuid, gfx, workload="tensor", power=ratio * throughput,
                                                     throughput=throughput, repeat=repeat))
+                    records.append(empirical_record(uuid, gfx, workload="tensor", power=ratio * throughput * 1.2,
+                                                    throughput=throughput * .99, repeat=repeat, blocks=40))
         summary = summarize(records)
         selected = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
         self.assertEqual({point["stratum"]["gpu_uuid"]: point["winning_requested_graphics_clock_mhz"] for point in selected}, winning)
@@ -547,6 +551,8 @@ class AnalysisTests(unittest.TestCase):
             for access in ("read", "copy"):
                 for repeat in range(3):
                     records.append(empirical_record("GPU-domain", gfx, memory, access=access, power=power, repeat=repeat))
+                    records.append(empirical_record("GPU-domain", gfx, memory, access=access, power=power * 1.2,
+                                                    throughput=99, repeat=repeat, blocks=40))
         summary = summarize(records)
         total = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
         self.assertEqual(len(total), 4)
@@ -572,7 +578,10 @@ class AnalysisTests(unittest.TestCase):
             default = empirical_record("GPU-default", 1380, power=51, repeat=repeat)
             default["config"].update(graphics_clock_mhz=None, memory_clock_mhz=None)
             records.append(default)
-        points = summarize(records)["empirical_gpu_energy_optima"]
+        summary = summarize(records)
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        points = summary["exploratory_single_geometry_energy_optima"]
+        self.assertTrue(points)
         self.assertTrue(all(point["winning_requested_graphics_clock_mhz"] == 1110 for point in points))
 
     def test_paired_active_reference_ab_ba_signed_contrast_and_state_checks(self):
@@ -614,7 +623,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(group["paired_reference_counterbalanced"])
         self.assertEqual(group["paired_reference_order_counts"], {"AB": 2, "BA": 2})
         self.assertEqual(group["paired_reference_order_effect_power_w"], 2)
-        paired = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "paired_active_reference"]
+        paired = [point for point in summary["exploratory_single_geometry_energy_optima"] if point["objective"] == "paired_active_reference"]
         self.assertEqual(len(paired), 1)
         unbalanced = []
         for repeat in range(3):
@@ -623,7 +632,7 @@ class AnalysisTests(unittest.TestCase):
             unbalanced.append(record)
         summary = summarize(unbalanced)
         self.assertFalse(summary["groups"][0]["paired_active_reference_eligible"])
-        self.assertFalse(any(point["objective"] == "paired_active_reference" for point in summary["empirical_gpu_energy_optima"]))
+        self.assertFalse(any(point["objective"] == "paired_active_reference" for point in summary["empirical_gpu_energy_optima"] + summary["exploratory_single_geometry_energy_optima"]))
 
     def test_paired_unpaired_and_allocation_contexts_are_independent_repeat_and_clock_strata(self):
         records = []
@@ -640,7 +649,8 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual([group["valid_repeats"] for group in summary["groups"]], [3, 3])
         self.assertTrue(all(not group["duplicate_repeat_indices_ignored"] for group in summary["groups"]))
         self.assertEqual({group["treatment_design_stratum"]["kind"] for group in summary["groups"]}, {"paired_active_reference", "powered_idle_bracket"})
-        total = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        total = [point for point in summary["exploratory_single_geometry_energy_optima"] if point["objective"] == "total"]
         self.assertEqual(len(total), 2)
         self.assertEqual({point["stratum"]["treatment_design_stratum"]["paired_reference_context_allocated"] for point in total}, {True, False})
         paired_group = next(group for group in summary["groups"] if group["treatment_design_stratum"]["kind"] == "paired_active_reference")
@@ -658,7 +668,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(group["paired_reference_counterbalanced"])
         self.assertEqual(group["paired_reference_order_count_imbalance"], 1)
         self.assertIsNotNone(group["paired_active_reference_power_w"])
-        self.assertFalse(any(point["objective"] == "paired_active_reference" for point in summary["empirical_gpu_energy_optima"]))
+        self.assertFalse(any(point["objective"] == "paired_active_reference" for point in summary["empirical_gpu_energy_optima"] + summary["exploratory_single_geometry_energy_optima"]))
 
     def test_idle_and_reference_compare_actual_sm_domain_when_available(self):
         record = paired_record()
@@ -686,6 +696,110 @@ class AnalysisTests(unittest.TestCase):
         trial = analyze_trial(record)
         self.assertFalse(trial["valid"])
         self.assertIn("clock_drift:sm_clock_mhz", trial["issues"])
+
+    def test_single_geometry_self_peak_cannot_qualify_utilization(self):
+        records = [empirical_record("GPU-one-geometry", gfx, power=100 if gfx == 1110 else 150, repeat=repeat)
+                   for gfx in (930, 1110, 1380) for repeat in range(3)]
+        summary = summarize(records)
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        self.assertEqual(summary["empirical_gpu_overall_energy_optima"], [])
+        exploratory = [point for point in summary["exploratory_single_geometry_energy_optima"] if point["objective"] == "total"]
+        self.assertEqual(len(exploratory), 1)
+        self.assertEqual(exploratory[0]["winning_requested_graphics_clock_mhz"], 1110)
+        self.assertEqual(exploratory[0]["own_clock_distinct_geometry_count"], 1)
+        self.assertEqual(exploratory[0]["geometry_evidence_status"], "single_geometry_reference_only")
+        self.assertFalse(exploratory[0]["saturation_proven"])
+        self.assertEqual(exploratory[0]["selection_status"], "exploratory_single_geometry_only")
+        self.assertTrue(all(point["own_clock_distinct_geometry_count"] == 1 and not point["saturation_proven"] for point in exploratory[0]["all_eligible_support_points"]))
+
+    def test_seed_footprint_and_repeat_variants_do_not_count_as_resource_geometry(self):
+        records = []
+        for variant, seed in enumerate((2026, 2027, 2028)):
+            for repeat in range(3):
+                record = empirical_record("GPU-fake-geometry", 1110, repeat=repeat)
+                record["config"]["seed"] = seed
+                record["config"]["working_set_bytes"] = 65536 * (variant + 1)
+                record["benchmark"]["working_set_bytes"] = 65536 * (variant + 1)
+                record["validation"]["profiler_evidence"]["profile_benchmark"]["working_set_bytes"] = 65536 * (variant + 1)
+                records.append(record)
+        summary = summarize(records)
+        self.assertEqual(len(summary["groups"]), 3)
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        self.assertTrue(all(point["own_clock_distinct_geometry_count"] == 1 for point in summary["exploratory_single_geometry_energy_optima"]))
+
+    def test_multiple_resource_geometries_compare_execution_arguments_without_claiming_saturation(self):
+        records = [empirical_record("GPU-multiple", 1110, blocks=blocks, throughput=100 if blocks == 80 else 99,
+                                    power=150 if blocks == 80 else 160, repeat=repeat)
+                   for blocks in (40, 80) for repeat in range(3)]
+        summary = summarize(records)
+        total = next(point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total")
+        self.assertEqual(total["own_clock_distinct_geometry_count"], 2)
+        self.assertEqual(total["geometry_evidence_status"], "multiple_resource_geometries_compared")
+        self.assertFalse(total["saturation_proven"])
+        self.assertEqual(summary["exploratory_single_geometry_energy_optima"], [])
+        self.assertEqual(summary["selection_policy"]["min_geometries"], 2)
+        self.assertEqual(summarize(records, policy={"min_geometries": 3})["empirical_gpu_energy_optima"], [])
+        with self.assertRaises(ValueError):
+            AnalysisPolicy(min_geometries=1)
+
+    def test_idle_pstate_and_enforced_cap_mismatch_gate_only_baseline_contrast(self):
+        for field, active, idle in (("pstate", 0, 8), ("enforced_power_limit_w", 400, 300)):
+            record = empirical_record("GPU-idle-state", 1200)
+            for phase in record["phases"].values():
+                for sample in phase["samples"]:
+                    sample[field] = active
+            for sample in record["phases"]["idle_post"]["samples"]:
+                sample[field] = idle
+            trial = analyze_trial(record)
+            self.assertTrue(trial["valid"], trial["issues"])
+            self.assertIsNotNone(trial["total_pj_per_logical_bit"])
+            self.assertFalse(trial["operational_idle_increment_eligible"])
+            self.assertFalse(trial["baseline_state_matched"])
+            self.assertIn(f"idle_state_mismatch_or_unverified:idle_post:{field}", trial["baseline_state_issues"])
+            self.assertIn(field, trial["baseline_state_domains_compared"])
+        unavailable = analyze_trial(empirical_record("GPU-no-pstate", 1200))
+        self.assertEqual(unavailable["baseline_state_domains_compared"], [])
+        self.assertTrue(unavailable["baseline_state_matched"])
+
+    def test_gemm_dimensions_and_tensor_accumulators_count_as_actual_resource_geometry(self):
+        for workload, field, values in (("gemm", "gemm_m", (1024, 2048)), ("tensor", "tensor_accumulators", (4, 8))):
+            records = []
+            for value in values:
+                for repeat in range(3):
+                    record = empirical_record("GPU-resource-kind", 1200, workload=workload, repeat=repeat)
+                    record["benchmark"][field] = value
+                    record["validation"]["profiler_evidence"]["profile_benchmark"][field] = value
+                    records.append(record)
+            summary = summarize(records)
+            total = next(point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total")
+            self.assertEqual(total["own_clock_distinct_geometry_count"], 2)
+            self.assertFalse(total["saturation_proven"])
+
+    def test_unprofiled_second_geometry_cannot_promote_verified_single_geometry(self):
+        records = []
+        for repeat in range(3):
+            records.append(empirical_record("GPU-partial-geometry", 1110, blocks=80, throughput=100, repeat=repeat))
+            unprofiled = empirical_record("GPU-partial-geometry", 1110, blocks=40, throughput=99, repeat=repeat)
+            unprofiled["validation"] = {}
+            records.append(unprofiled)
+        summary = summarize(records)
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        point = next(point for point in summary["exploratory_single_geometry_energy_optima"] if point["objective"] == "total")
+        self.assertEqual(point["own_clock_verified_distinct_geometry_count"], 1)
+        self.assertEqual(point["own_clock_observed_distinct_geometry_count"], 2)
+        self.assertEqual(point["own_clock_observed_max_throughput"], 100)
+        self.assertFalse(point["saturation_proven"])
+        # A faster unprofiled shape keeps the original complete-population bar.
+        for record in records:
+            if not record["validation"]:
+                record["benchmark"]["operations"] *= 2
+                record["benchmark"]["logical_bytes"] *= 2
+                for epoch in record["benchmark"]["measure_epochs"]:
+                    epoch["operations"] *= 2
+                    epoch["logical_bytes"] *= 2
+        summary = summarize(records)
+        self.assertEqual(summary["empirical_gpu_energy_optima"], [])
+        self.assertEqual(summary["exploratory_single_geometry_energy_optima"], [])
 
 
 if __name__ == "__main__":

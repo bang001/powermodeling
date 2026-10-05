@@ -1,5 +1,5 @@
 {
-  "description": "Geometry/capacity saturation first. Refine around observed plateaus; advertised utilization is not proof of peak.",
+  "description": "Geometry/capacity saturation first. Refine around observed plateaus; advertised utilization is not proof of peak. All geometries are measured on the same90MHz all-memory energy grid with mandatory default and supported1110MHz anchors.",
   "seconds": 12,
   "warmup_seconds": 3,
   "idle_seconds": 6,
@@ -7,13 +7,8 @@
   "sample_interval_s": 0.05,
   "randomization_seed": 2026,
   "clock_sweep": {
-    "graphics_quantiles": [
-      0.6,
-      1.0
-    ],
-    "memory_quantiles": [
-      1.0
-    ],
+    "graphics_step_mhz": 90,
+    "all_memory_clocks": true,
     "required_graphics_mhz": [
       1110
     ],
@@ -130,5 +125,6 @@
     }
   ],
   "target_form_factor": "SXM",
-  "paired_reference": true
+  "paired_reference": true,
+  "study_design": "energy_sweep"
 }

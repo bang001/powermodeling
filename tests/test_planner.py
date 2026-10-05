@@ -1,8 +1,12 @@
 """Plan failures must precede device allocation or clock mutation."""
 import copy
+from contextlib import redirect_stdout, redirect_stderr
+import io
 import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from powermodeling.planner import benchmark_command, expand_plan, numeric_expression, resolve_clock_plan, resolve_clocks
 
@@ -15,6 +19,12 @@ class PlannerTests(unittest.TestCase):
     def config(self, workload="tensor", parameters=None):
         return {"clock_pairs": [{"graphics_mhz": 1200, "memory_mhz": 1215}],
                 "experiments": [{"workload": workload, "parameters": parameters or {}}]}
+
+    def strict_config(self):
+        return {"study_design": "energy_sweep", "clock_sweep": {
+            "graphics_step_mhz": 90, "all_memory_clocks": True,
+            "include_advertised_default": True, "include_default_policy": True},
+            "experiments": [{"workload": "tensor", "grid": {"blocks": [108, 216], "threads": [128, 256]}}]}
 
     def test_nonfinite_times_and_fractional_repeats_cannot_pass_constraints(self):
         for field, value in (("seconds", float("nan")), ("warmup_seconds", float("inf")),
@@ -204,6 +214,105 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan["clock_sweep_coverage"]["requested_step_mhz"], 90)
         self.assertTrue(all("clock_policy" in t and "clock_selection_reasons" in t for t in plan["trials"]))
         self.assertEqual(len({t["trial_id"] for t in plan["trials"]}), len(plan["trials"]))
+
+    def test_strict_study_rejects_clock_policy_exceptions(self):
+        policies = [
+            {"graphics_step_mhz": 60}, {"graphics_quantiles": [1]},
+            {"all_memory_clocks": False}, {"memory_quantiles": [1]}, {"memory_mhz": [1000]},
+            {"include_advertised_default": False}, {"include_default_policy": False},
+        ]
+        for changes in policies:
+            config = self.strict_config()
+            config["clock_sweep"].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                expand_plan(config, self.device(), self.supported())
+        config = self.config()
+        config["study_design"] = "energy_sweep"
+        with self.assertRaisesRegex(ValueError, "explicit clock_pairs"):
+            expand_plan(config, self.device(), self.supported())
+
+    def test_unknown_default_makes_strict_plan_incomplete_but_preserves_plan_size(self):
+        from powermodeling.runner import validate_plan_execution
+        supported = self.supported()
+        supported.pop("default_applications_graphics_mhz")
+        supported.pop("default_applications_memory_mhz")
+        plan = expand_plan(self.strict_config(), self.device(), supported)
+        self.assertFalse(plan["execution_allowed"])
+        self.assertEqual(plan["clock_sweep_coverage"]["requirements_status"], "incomplete")
+        self.assertIn("not a substitute", plan["clock_sweep_coverage"]["requirement_reasons"][0])
+        self.assertTrue(plan["trials"])
+        self.assertGreater(plan["estimated_minimum_seconds"], 0)
+        with self.assertRaisesRegex(ValueError, "execution blocked"):
+            validate_plan_execution(plan)
+
+    def test_strict_supported_1110_is_included_and_native_unsupported_domain_inapplicable(self):
+        from powermodeling.runner import validate_plan_execution
+        plan = expand_plan(self.strict_config(), self.device(), self.supported())
+        self.assertTrue(plan["execution_allowed"])
+        coverage = plan["clock_sweep_coverage"]
+        self.assertEqual(coverage["requirements_status"], "complete")
+        domains = {domain["memory_mhz"]: domain for domain in coverage["memory_domains"]}
+        self.assertEqual(domains[1000]["required_points"][0]["status"], "included")
+        self.assertEqual(domains[1500]["required_points"][0]["status"], "not_applicable")
+        self.assertTrue(coverage["required_anchor_coverage_complete"])
+        validate_plan_execution(plan)
+
+    def test_all_energy_configs_use_full_clock_design_and_dvfs_has_geometry_candidates(self):
+        root = Path(__file__).resolve().parents[1]
+        supported = self.supported()
+        supported["supported_pairs"].extend({"graphics_mhz": g, "memory_mhz": 1250} for g in [990, 1110, 1200])
+        supported.update(default_applications_graphics_mhz=1110, default_applications_memory_mhz=1250)
+        for name in ("saturation", "dvfs", "locality"):
+            config = json.loads((root / "configs" / (name + ".json")).read_text())
+            pairs, coverage = resolve_clock_plan(config, supported)
+            with self.subTest(config=name):
+                self.assertEqual(config["study_design"], "energy_sweep")
+                self.assertEqual(coverage["requested_step_mhz"], 90)
+                self.assertEqual(coverage["selected_memory_mhz"], [1000, 1250, 1500])
+                self.assertEqual(coverage["requirements_status"], "complete")
+                self.assertIn({"graphics_mhz": 1110, "memory_mhz": 1250}, pairs)
+        config = json.loads((root / "configs" / "dvfs.json").read_text())
+        plan = expand_plan(config, self.device(), supported)
+        for workload in ("tensor", "gemm", "l1", "l2", "hbm"):
+            candidates = {}
+            for trial in plan["trials"]:
+                if trial["workload"] == workload:
+                    pair = (trial["clocks"]["graphics_mhz"], trial["clocks"]["memory_mhz"])
+                    geometry = json.dumps(trial["parameters"], sort_keys=True)
+                    candidates.setdefault(pair, set()).add(geometry)
+            self.assertTrue(all(len(geometries) >= 2 for geometries in candidates.values()), workload)
+        dimensions = plan["sweep_dimensions"]
+        self.assertEqual(dimensions["clock_geometry_conditions"], dimensions["geometry_conditions"] * dimensions["clock_conditions_per_geometry"])
+        self.assertEqual(dimensions["trials"], dimensions["clock_geometry_conditions"] * 4)
+        self.assertEqual(sum(row["trials"] for row in dimensions["by_workload"]), len(plan["trials"]))
+        smoke = json.loads((root / "configs" / "smoke.json").read_text())
+        smoke_plan = expand_plan(smoke, self.device(), supported)
+        self.assertEqual(smoke_plan["study_design"], "diagnostic")
+        self.assertEqual(smoke_plan["clock_sweep_coverage"]["requirements_status"], "not_required")
+        self.assertTrue(all(trial["clocks"] == {"graphics_mhz": None, "memory_mhz": None} for trial in smoke_plan["trials"]))
+
+    def test_cli_plan_exposes_unknown_default_and_run_blocks_before_cuda_probe(self):
+        from powermodeling.cli import main
+        supported = self.supported()
+        supported.pop("default_applications_graphics_mhz")
+        supported.pop("default_applications_memory_mhz")
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            config_path, device_path, plan_path = (directory / name for name in ("config.json", "device.json", "plan.json"))
+            config_path.write_text(json.dumps(self.strict_config()))
+            device_path.write_text(json.dumps({"cuda_device": {**self.device(), "compute_capability": "8.0"}, "clocks": supported}))
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                status = main(["plan", "--config", str(config_path), "--device-json", str(device_path), "--output", str(plan_path)])
+            self.assertEqual(status, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertFalse(summary["execution_allowed"])
+            self.assertEqual(summary["requirements_status"], "incomplete")
+            self.assertTrue(summary["requirement_reasons"])
+            with patch("powermodeling.cli.describe_benchmark") as probe, redirect_stderr(io.StringIO()):
+                status = main(["run", "--plan", str(plan_path), "--output", str(directory / "results")])
+            self.assertEqual(status, 2)
+            probe.assert_not_called()
 
     def test_paired_orders_are_balanced_by_repeat_without_splitting_condition(self):
         plan = expand_plan(self.config("tensor"), self.device())

@@ -71,9 +71,11 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 | [configs/dvfs.json](configs/dvfs.json) | memory×SM clock 도메인의 bandwidth plateau와 효율 탐색 |
 | [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
 
-JSON의 `clock_pairs`로 실측 장치가 지원하는 `(graphics_mhz, memory_mhz)`를 명시할 수 있다. **`configs/dvfs.json`은 `graphics_step_mhz: 90`으로 모든 광고된 memory domain에서 약 90 MHz graphics grid를 만든다.** 이전 quantile 선택은 이 간격을 보장하지 않았다. `saturation.json`과 `locality.json`의 quantile은 geometry/latency 탐색 단계이며 90 MHz frequency sweep로 표시하지 않는다. 지원 범위 끝점, exact 1110 MHz(지원 domain), advertised default 고정 pair와 무설정 current-policy reference를 포함하고, 미지원/미조회 사유와 실제 간격은 `plan.clock_sweep_coverage`에 남긴다. 1110 미지원일 때 근사 주파수로 대체하지 않는다. current-policy reference는 이전 applications/locked 정책이 있을 수 있어 factory default라고 확정하지 않는다. `sm_count`, `l2_bytes`, `total_memory_bytes`를 쓰는 숫자 표현식은 장치의 조회값으로 해석된다. `blocks = sm_count × 2`는 작업량 지정이며 정확히 각 SM에 2 blocks를 배치하는 명령이 아니다.
+JSON의 `clock_pairs`로 실측 장치가 지원하는 `(graphics_mhz, memory_mhz)`를 명시할 수 있다. **`saturation.json`·`dvfs.json`·`locality.json`은 모두 `graphics_step_mhz: 90`으로 모든 광고된 memory domain에서 약 90 MHz graphics grid를 만든다.** 이전 quantile 선택이나 일부 설정에만 적용한 격자로는 이 요구를 충족하지 못했다. 지원 범위 끝점, exact 1110 MHz(지원 domain), advertised default 고정 pair와 무설정 current-policy reference를 포함하고, 실제 간격은 `plan.clock_sweep_coverage`에 남긴다. 1110 미지원 exact pair는 적용 불가 사유를 기록하며 근사값으로 대체하지 않는다. current-policy reference는 이전 applications/locked 정책이 있을 수 있어 factory default라고 확정하지 않는다.
 
-DVFS 설정의 geometry는 예제 시작점이다. saturation 결과에서 확인한 block/thread·working set을 `configs/dvfs.json`에 반영한 뒤 주파수 도메인을 검토한다. 전체 격자는 수시간 걸릴 수 있으므로 plan의 trial 수와 예상 시간을 확인한다.
+`study_design: "energy_sweep"`은 graphics 간격·memory domain·1110·advertised default·current-policy reference의 요구사항 coverage를 검사한다. default pair를 조회하거나 지원 근거로 확인하지 못한 계획은 `requirements_status: "incomplete"`, `execution_allowed: false`이며 runner가 clock 변경·커널 실행 전에 차단한다. 계획 파일과 미확정 사유는 검토용으로 남는다. Runner는 기록된 native 지원 clock 목록에서 필수 약 90 MHz grid·끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 clock pair가 모두 있는지 검사한다. 선택된 coverage와 trial 목록에서 같은 조건을 함께 제거해도 native 목록에 근거한 필수 grid 검사로 드러난다. `smoke.json`의 null clock은 `diagnostic` 예외로 허용하고 전체 효율 sweep로 승인하지 않는다. `sm_count`, `l2_bytes`, `total_memory_bytes`를 쓰는 숫자 표현식은 장치의 조회값으로 해석된다. `blocks = sm_count × 2`는 작업량 지정이며 정확히 각 SM에 2 blocks를 배치하는 명령이 아니다.
+
+DVFS 설정은 SM 수의 2·4·8배 blocks × 128·256 threads, GEMM shape를 함께 비교한다. saturation 설정은 Tensor accumulator 수도 바꾼다. seed·working set·stride·주소 offset만 바꾸어 resource geometry 개수를 부풀리지 않는다. 각 frequency pair에서 NCU·품질·정확한 시간 정렬을 통과한 최소 2개의 resource geometry가 실제로 비교되어야 승인된 효율 최적점을 만들 수 있다. geometry 비교 수는 자원 활용에 대한 최소 근거이며 실제 plateau의 증명은 아니다. saturation 결과와 NCU에서 확인한 geometry·working set으로 범위를 늘리거나 정밀하게 탐색한다. 전체 격자는 수시간 걸릴 수 있으므로 plan의 trial 수와 예상 시간을 확인한다.
 
 HBM stride 실험은 stride가 커질 때 전체 할당 크기도 늘리고 순환 접근의 가능한 sector footprint를 검사한다. worker는 한 launch가 유한한 iteration 동안 실제로 방문할 수 있는 footprint와 전체 stride cycle의 footprint를 구분한다. 짧은 launch가 같은 작은 주소 집합을 반복하면 큰 할당이어도 cache 실험이 될 수 있으므로 DRAM counter가 필요하다. write/copy는 thread 간 주소 소유권이 겹치지 않도록 유효 크기를 조정하고 실제 사용 크기를 결과에 기록한다.
 
@@ -97,8 +99,9 @@ Treatment는 측정하려는 대상 작업이다. `paired_reference: true`인 cu
 | `total_pj_per_flop`, `total_pj_per_logical_bit` | 전체 GPU 단가. FMA=2 FLOP, logical bit=요청 byte×8 |
 | `operational_idle_increment_pj_per_flop`, `operational_idle_increment_pj_per_logical_bit` | 전후 idle 대비 증가분 단가; 승인 여부와 함께 읽음 |
 | `paired_active_reference_pj_per_flop`, `paired_active_reference_pj_per_logical_bit` | 같은 process의 짝지은 control 대비 단가; 물리 component isolation이 아님 |
+| `baseline_state_matched`, `baseline_state_issues` | 조회 가능한 pstate/enforced power cap의 일치·불일치 근거 |
 | `baseline_valid`, `baseline_issues`, `operational_idle_increment_eligible` | 전후 idle 품질과 실제 상태 일치에 따라 증가분 최적점 사용을 승인 |
-| `paired_active_reference_eligible`, `paired_active_reference_issues` | arm별 geometry·시간 정렬·actual clock·온도·cap·간섭·protocol 검사 |
+| `paired_active_reference_eligible`, `paired_active_reference_issues` | arm별 geometry·시간 정렬·actual clock·온도·cap·간섭·protocol, 조회 가능한 pstate/enforced cap 검사 |
 | `paired_reference_order_counts` | group의 AB/BA 유효 반복 수. 두 순서의 수가 같아야 paired 최적점 승인 |
 | 기존 `pj_per_op`, `pj_per_logical_byte` | legacy alias; `metric_aliases`와 실제 FLOP/byte 정의를 함께 읽음 |
 | `memory_rail_*` | 지원되는 memory scope의 관측값; 미지원이면 null |
@@ -119,8 +122,11 @@ Treatment는 측정하려는 대상 작업이다. `paired_reference: true`인 cu
 | `within_clock_best_total_energy`, `cross_clock_best_total_energy` | 95% 처리량 조건에서 최소 전체 에너지 단가의 설정 |
 | `pareto_frontiers` | 더 높은 처리량과 더 낮은 전력으로 동시에 개선할 수 없는 관측 설정 |
 | `active_control_associations` | 별도로 실행한 control과의 설명용 연결; same-process paired arm과 다르며 자동 component 차감에 사용하지 않음 |
-| `empirical_gpu_energy_optima` | GPU UUID·작업·access·고정 memory MHz·objective별 실제 단가 최솟값. 각 주파수 전체 geometry peak의 기본 95% 이상 요구 |
-| `empirical_gpu_overall_energy_optima` | measured graphics·memory domain을 함께 비교한 각 GPU의 실제 최솟값 |
+| `empirical_gpu_energy_optima` | GPU UUID·작업·access·고정 memory MHz·objective별 승인 단가 최솟값. 각 frequency pair의 최소 2 검증 resource geometry 비교·관측 peak의 기본 95% 이상 요구 |
+| `empirical_gpu_overall_energy_optima` | 같은 승인 조건에서 measured graphics·memory domain을 함께 비교한 각 GPU의 실제 최솟값 |
+| `exploratory_single_geometry_energy_optima`, `exploratory_single_geometry_overall_energy_optima` | 검증된 geometry 한 종류뿐인 fixed/overall 탐색 결과; 승인된 효율 최적점과 분리 |
+| `own_clock_verified_distinct_geometry_count`, `own_clock_observed_distinct_geometry_count` | 해당 clock pair의 검증된/전체 유효 resource geometry 비교 수. `own_clock_distinct_geometry_count`는 검증 수 alias |
+| `geometry_evidence_status`, `saturation_proven` | 승인 또는 단일 geometry 진단의 근거. 최소 2 비교도 실제 hardware saturation 증명이 아니므로 `saturation_proven: false` |
 | `near_optimum_support_points`, `uncertainty_overlap_support_points` | 기본 최소 단가 5% 이내 / 95% 구간이 겹치는 실측 support points; 미측정 gap이나 연속 최적 구간을 보장하지 않음 |
 | `observed_frequency_pairs_without_eligible_candidate` | 측정은 했으나 검증·활용·baseline 요건으로 최적점 후보를 만들지 못한 frequency pair |
 | `verified_target_*` | NCU 통과·정확한 시간 정렬 조건 중 **전체 유효 고정 클럭 sweep 최고 처리량의 95% 이상**을 달성한 결과의 최저 단가; 없으면 winner 없음 |

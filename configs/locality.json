@@ -1,0 +1,125 @@
+{
+  "description": "Exploratory SM/offset/stride and dependent latency probes. No automatic near/far assignment. All geometries are measured on the same90MHz all-memory energy grid with mandatory default and supported1110MHz anchors.",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "clock_sweep": {
+    "graphics_step_mhz": 90,
+    "all_memory_clocks": true,
+    "required_graphics_mhz": [
+      1110
+    ],
+    "include_default_policy": true,
+    "include_advertised_default": true
+  },
+  "experiments": [
+    {
+      "workload": "l2",
+      "stage": "stride",
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "working_set_bytes": "l2_bytes*0.5"
+      },
+      "grid": {
+        "stride_elements": [
+          1,
+          2,
+          8,
+          32
+        ],
+        "offset_bytes": [
+          0,
+          4096,
+          2097152
+        ]
+      }
+    },
+    {
+      "workload": "l2",
+      "stage": "locality",
+      "parameters": {
+        "blocks": "sm_count*8",
+        "threads": 128,
+        "working_set_bytes": "l2_bytes*0.125"
+      },
+      "grid": {
+        "sm_ids": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "offset_bytes": [
+          0,
+          2097152,
+          4194304
+        ]
+      }
+    },
+    {
+      "workload": "l2_latency",
+      "stage": "latency",
+      "parameters": {
+        "blocks": "sm_count*8",
+        "threads": 32,
+        "working_set_bytes": "l2_bytes*0.125"
+      },
+      "grid": {
+        "sm_ids": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "offset_bytes": [
+          0,
+          2097152,
+          4194304
+        ],
+        "seed": [
+          2026,
+          2027
+        ]
+      }
+    },
+    {
+      "workload": "hbm",
+      "stage": "stride",
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "working_set_bytes": "max(l2_bytes*max(8,stride_elements/2),268435456)"
+      },
+      "grid": {
+        "stride_elements": [
+          1,
+          2,
+          8,
+          32
+        ]
+      }
+    }
+  ],
+  "target_form_factor": "SXM",
+  "paired_reference": true,
+  "study_design": "energy_sweep"
+}

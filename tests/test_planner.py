@@ -217,7 +217,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_strict_study_rejects_clock_policy_exceptions(self):
         policies = [
-            {"graphics_step_mhz": 60}, {"graphics_quantiles": [1]},
+            {"graphics_step_mhz": 0}, {"graphics_quantiles": [1]},
             {"all_memory_clocks": False}, {"memory_quantiles": [1]}, {"memory_mhz": [1000]},
             {"include_advertised_default": False}, {"include_default_policy": False},
         ]

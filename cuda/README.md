@@ -1,6 +1,6 @@
 # CUDA workload contract
 
-Build with CUDA 12.x and CMake 3.23+:
+Build with CUDA 12.x or 13.0 and CMake 3.22+:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -8,9 +8,28 @@ cmake --build build -j
 build/powerbench --describe --device 0
 ```
 
-The default fat binary targets Volta `sm_70`, Ampere `sm_80`, and Hopper
-`sm_90`. CUDA 13 removed offline Volta compilation; use CUDA 12 for V100.
-`ptxas` prints register and local/spill resource usage during compilation.
+With CUDA 12, the default fat binary targets Volta `sm_70`, Ampere `sm_80`, and
+Hopper `sm_90`. With CUDA 13, the default targets `sm_80;sm_90`. CUDA 13 removed
+offline Volta compilation; use CUDA 12 for V100. Explicit
+`CMAKE_CUDA_ARCHITECTURES` and `CUDAARCHS` settings override these defaults.
+
+For A100 with CUDA 13.0, use a separate build directory and a CUDA 13-capable
+Linux driver (R580 or newer):
+
+```sh
+cmake -S . -B build-a100-cuda13 -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+  -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build-a100-cuda13 -j
+build-a100-cuda13/powerbench --describe --device 0
+```
+
+Point `powermodeling --bench` and the GPU test's `POWERBENCH` environment variable
+at that executable. CUDA 13 profiling on A100 needs a compatible Nsight Compute,
+such as 2025.3 or newer. `ptxas` prints register and local/spill resource usage
+during compilation. Device clock metadata uses `cudaDeviceGetAttribute`, since
+CUDA 13 removed the clock fields from `cudaDeviceProp`.
 
 ```sh
 build/powerbench --device 0 --workload hbm --seconds 10 \
@@ -33,6 +52,17 @@ emitted, and such a trial must be rejected.
 | `hbm` | Same `.cg` loop over a larger incompressible footprint | The name is a requested target, not proof that payload reached DRAM. Verify DRAM counters and effective address footprint. |
 | `l2_latency` | One active lane per admitted block traverses a randomized full-cycle linked list through dependent `.cg` loads | Per-SM cycles/access diagnostic; clocks, loop overhead and concurrent blocks matter. Address/SM probes do not establish near/far partition labels. |
 | `control` | Four integer issue operations per inner loop plus result/telemetry stores | Active issue-loop power reference, not transistor static power or a precisely matched memory/Tensor control. |
+| `exp`, `tanh`, `silu` | Complete FP32 elementwise standard CUDA math, input load and output store | Counted output elements; memory and supporting arithmetic included, not isolated SFU energy. |
+| `rmsnorm` | FP32 row sum-of-squares, epsilon 1e-5, column gamma and normalized output | Two input passes, gamma and output; pJ/element and pJ/row; no mean subtraction. |
+| `softmax` | Stable FP32 row max, exp-sum reduction and normalized output | Three input passes and two exp evaluations per element; complete function energy. |
+
+Nonlinear workloads default to one complete input application per launch and
+16 launches per batch. `--iterations` repeats the entire application with fresh
+volatile loads/stores. Input/output slices are disjoint per block; the footprint
+must divide into complete equal slices/rows. `--row-width` defaults to 1024 for
+RMSNorm/Softmax; these workloads support full-grid execution only. Before and
+after measurement, distributed outputs are checked against CPU double references.
+See [the nonlinear experiment protocol](../docs/nonlinear-experiments.ko.md).
 
 `--iterations` defaults to 1024 inner iterations per microkernel, and one cuBLAS
 invocation for GEMM. `--batch-launches` defaults to 16 for microkernels and one

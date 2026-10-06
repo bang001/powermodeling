@@ -119,18 +119,18 @@ memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보
 | SKU별 최고 처리량 | 각 장치의 허용 peak 설정 | 공통 클럭 결과와 다른 표로 비교 |
 | 효율 최적화 | SM×memory clock 격자와 power cap 층 | 서로 다른 cap/온도 결과를 한 기준으로 혼합하지 않음 |
 
-### 지원 범위의 약 90 MHz grid와 필수 기준점
+### 900 MHz 이상의 가변 간격 grid와 필수 기준점
 
-이전 구현의 graphics quantile 선택은 약 90 MHz 간격을 보장하지 않았다. `configs/saturation.json`·`configs/dvfs.json`·`configs/locality.json`은 모두 `graphics_step_mhz: 90`을 사용한다. 장치가 광고한 지원 pair에서 각 선택 memory domain의 최소/최대와 약 90 MHz 목표점을 만든 뒤 가까운 지원 graphics MHz에 매핑한다. 목표·선택값·오차·실제 인접 간격을 `plan.clock_sweep_coverage`에 남긴다. 지원 값 사이의 native gap과 추가 필수점 때문에 실제 간격은 정확히 90 MHz가 아닐 수 있다.
+`configs/saturation.json`·`configs/dvfs.json`·`configs/locality.json`·`configs/nonlinear.json`은 `graphics_min_mhz: 900`, 기본 `graphics_step_mhz: 90`을 사용한다. 60·90·120 MHz 등 양의 정수 간격으로 변경할 수 있다. 각 memory domain에서 하한 이상의 지원 graphics MHz에만 목표점을 매핑하고, 해당 평가 범위의 양 끝과 필수점을 포함한다. 일반 200–300 MHz grid는 실행하지 않는다. 필수 default anchor가 하한보다 낮으면 그 pair만 예외로 유지한다. 매핑 목표·실제 MHz·오차·간격과 제외된 낮은 native 값은 plan에 남긴다. 지원 목록이 이산적이면 간격은 요청값과 다를 수 있다.
 
 | 포함 조건 | 처리 | 미지원·중복 처리 |
 |---|---|---|
 | 정확한 `1110 MHz` | 선택한 각 memory domain에서 exact pair가 지원되면 반드시 포함 | 미지원 exact pair면 `not_applicable`과 범위 밖/이산 지원값 아님 사유; 근사값으로 대체하지 않음 |
 | 장치가 광고한 default 고정 pair | NVML default applications graphics/memory pair가 지원 목록에 있으면 포함 | default 조회 불가·지원 pair 불일치이면 미포함 이유를 기록; 기존 grid와 중복이면 사유를 병합 |
 | 현재-policy reference | `null/null`로 기존 driver policy를 변경하지 않는 비교 조건 포함 | incoming applications 설정과 실제 MHz 기록; 기존 lock 정책이 미확인이므로 factory default라고 확정하지 않음 |
-| 지원 범위 끝점 | 선택한 memory domain의 최소·최대 supported graphics MHz 포함 | 지원 범위 밖 MHz를 생성하지 않음 |
+| 평가 범위 끝점 | 하한 이상의 최소·최대 supported graphics MHz 포함 | 지원 범위 밖 MHz를 생성하지 않음 |
 
-세 energy-sweep 설정 모두 `all_memory_clocks: true`로 모든 광고된 memory domain을 선택하고 geometry 또는 locality 축을 함께 바꾼다. 약 90 MHz는 graphics/core domain 간격이며 HBM memory frequency를 같은 간격으로 강제하는 설정이 아니다. `study_design: "energy_sweep"` 계획은 요구사항 coverage를 검사한다. advertised default pair가 미확정이면 plan의 `execution_allowed: false`와 `requirements_status: "incomplete"`를 남기고 runner가 변경·실행 전에 차단한다. null/null current-policy reference는 advertised-default 확인을 대체하지 못한다. Runner는 기록된 native 지원 clock 목록에서 필수 약 90 MHz grid·끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 조건이 모두 포함되는지 실행 전에 검사한다. selected coverage와 trial 목록을 함께 축소해도 원래 기록된 지원 목록에 따른 필수 grid 검사로 누락을 확인한다.
+네 energy-sweep 설정 모두 `all_memory_clocks: true`로 모든 광고된 memory domain을 선택하고 geometry 또는 locality 축을 함께 바꾼다. 설정한 간격은 graphics/core domain 간격이며 HBM memory frequency를 같은 간격으로 강제하는 설정이 아니다. `study_design: "energy_sweep"` 계획은 요구사항 coverage를 검사한다. advertised default pair가 미확정이면 plan의 `execution_allowed: false`와 `requirements_status: "incomplete"`를 남기고 runner가 변경·실행 전에 차단한다. null/null current-policy reference는 advertised-default 확인을 대체하지 못한다. Runner는 기록된 native 지원 clock 목록에서 선언한 하한·간격의 grid·평가 끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 조건이 모두 포함되는지 실행 전에 검사한다. selected coverage와 trial 목록을 함께 축소해도 원래 기록된 지원 목록에 따른 필수 grid 검사로 누락을 확인한다.
 
 임의 MHz를 직접 넣은 explicit `clock_pairs`나 제한 memory domain은 full-study 요구 coverage가 확인되어야 energy sweep로 승인된다. `smoke.json`은 `study_design: "diagnostic"`으로 무설정 센서·실행 점검을 허용하는 예외이며 full frequency sweep 또는 효율 최적점 검증을 의미하지 않는다. 모든 미확정·적용 불가 조건은 `requirement_checks`와 `requirement_reasons`에서 확인한다.
 
@@ -214,6 +214,10 @@ mixed 예측은 독립 holdout의 오차와 calibration 범위가 통과한 뒤,
 H100 현재 제품 표의 SXM FP16 값 1,979 TFLOPS에는 sparsity가 포함된다. dense 비교에는 약 절반인 989 TFLOPS급 기준을 사용하고 reference가 반올림된 값임을 기록한다. 최대 TDP는 구성 가능한 700 W급이며 A100의 400 W/312 TFLOPS와 같은 기준을 그대로 적용하지 않는다. [S12]
 
 ## 11. 실행 후 결론을 내리는 순서
+
+구현한 coverage·quality·plateau·anchor 개선 판정과 컴포넌트별 시각화는
+[평가 설계](evaluation-design.ko.md)를 따른다. `analyze`는 독립 `evaluation.html`,
+JSON/CSV와 선택적인 PNG/SVG를 생성하며 미확정 후보의 이유를 보존한다.
 
 1. raw sensor·worker 로그에서 구간·UUID·클럭·오류를 확인한다.
 2. 전후 idle 보간·drift와 paired AB/BA arm의 state·geometry·시간 정렬·온도·throttling을 확인한다.

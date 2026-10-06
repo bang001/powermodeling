@@ -6,6 +6,7 @@ Missing/unsupported counters are unknown. Profiler replay is never energy data.
 from dataclasses import asdict, dataclass
 import math
 import statistics
+from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ DURATION = "gpu__time_duration.sum"
 SM_HZ = "sm__cycles_elapsed.avg.per_second"
 TENSOR_INSTRUCTIONS = ("sm__inst_executed_pipe_tensor.sum", "smsp__inst_executed_pipe_tensor.sum")
 TENSOR_ACTIVITY = ("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active")
+SFU_INSTRUCTIONS = ("smsp__inst_executed_pipe_sfu.sum", "sm__inst_executed_pipe_sfu.sum")
 
 
 def _number(value):
@@ -123,6 +125,16 @@ def _kernel_assessment(rows, evidence, policy):
         derived.update(tensor_instructions=inst, tensor_active_pct=activity,
                        tensor_utilization_scope="elapsed" if metrics.get(TENSOR_ACTIVITY[0]) is not None else "active" if activity is not None else "unknown")
         if workload == "gemm": derived["component_scope"] = "GEMM includes memory and auxiliary work; tensor path verified, pure tensor energy not isolated"
+    elif workload in NONLINEAR_WORKLOADS:
+        result = evidence.get("profile_benchmark") or {}
+        inst = next((metrics.get(m) for m in SFU_INSTRUCTIONS if metrics.get(m) is not None), None)
+        _check(checks, "nonlinear_sfu_path", inst, lambda v: v > 0, "positive SFU pipeline instructions; implementation admission, not pure SFU energy")
+        _check(checks, "single_nonlinear_profile_launch", _number(result.get("kernel_launches")), lambda v: v == 1, "exactly one measured nonlinear kernel")
+        name = "row_nonlinear_kernel" if workload in ROW_WORKLOADS else "pointwise_nonlinear_kernel"
+        _check(checks, "nonlinear_kernel_name", rows[0].get("kernel"), lambda v: name in v, "expected complete function implementation kernel")
+        _check(checks, "nonlinear_profile_count_contract", count_issues(result, workload), lambda v: not v, "consistent exact element/row counts and sampled CPU-reference correctness")
+        derived.update(sfu_instructions=inst, elements=result.get("elements"), row_width=result.get("row_width"),
+                       component_scope="whole FP32 nonlinear function includes memory/reduction; SFU instructions do not define its energy denominator")
     elif workload in ("l1", "l2", "l2_latency", "hbm"):
         result = evidence.get("profile_benchmark") or {}
         logical = _number(result.get("logical_bytes"))
@@ -274,12 +286,18 @@ def validate_evidence(record, evidence, policy=None):
             _check(checks, "matching_parameter_" + name, config.get(name), lambda v, e=expected: v == e, "exact requested workload parameter")
     benchmark = evidence.get("profile_benchmark") or {}
     measured_benchmark = record.get("benchmark") or {}
-    for name in ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated"):
+    effective_names = ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated")
+    if record.get("workload") in NONLINEAR_WORKLOADS:
+        effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
+        if record.get("workload") == "rmsnorm": effective_names += ("rms_epsilon", "affine_gamma")
+    for name in effective_names:
         if name in benchmark or name in measured_benchmark:
             _check(checks, "matching_effective_" + name, benchmark.get(name), lambda v, e=measured_benchmark.get(name): e is not None and v == e, "exact effective profile/energy workload parameter")
     clocks = provenance.get("requested_clocks") or {}
     actual_clocks = {}
     required_effective = ("blocks", "threads", "iterations_per_launch", "tensor_accumulators") if record.get("workload") == "tensor" else ("gemm_m", "gemm_n", "gemm_k", "iterations_per_launch") if record.get("workload") == "gemm" else ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "access")
+    if record.get("workload") in NONLINEAR_WORKLOADS:
+        required_effective += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
     for name in required_effective:
         if name not in benchmark or name not in measured_benchmark:
             _check(checks, "missing_effective_" + name, None, bool, "effective profile and energy kernel parameters required")

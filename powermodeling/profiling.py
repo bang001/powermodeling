@@ -16,14 +16,14 @@ from .runner import atomic_json
 from .validation import (DURATION, DRAM_READ, DRAM_WRITE, L1_HITS, L1_MISSES,
                          L1_REQUESTS, L1_SECTORS, L2_READ, L2_READ_HITS, L2_WRITE,
                          LOCAL_LOAD, LOCAL_STORE, SM_HZ, TENSOR_ACTIVITY,
-                         TENSOR_INSTRUCTIONS, assess_profile, validate_evidence)
+                         TENSOR_INSTRUCTIONS, SFU_INSTRUCTIONS, assess_profile, validate_evidence)
 
 # Exact operation-specific counters are preferred. Architecture/release discovery
 # determines support; absent counters are retained as unknown in admission.
 METRICS = list(dict.fromkeys([DRAM_READ, DRAM_WRITE, DURATION, SM_HZ,
     "dram__cycles_elapsed.avg.per_second", L2_READ, L2_READ_HITS, L2_WRITE,
     L1_SECTORS, L1_HITS, L1_MISSES, L1_REQUESTS, LOCAL_LOAD, LOCAL_STORE,
-    *TENSOR_INSTRUCTIONS, *TENSOR_ACTIVITY,
+    *TENSOR_INSTRUCTIONS, *TENSOR_ACTIVITY, *SFU_INSTRUCTIONS,
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
     "lts__throughput.avg.pct_of_peak_sustained_elapsed",
     "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
@@ -73,7 +73,7 @@ def profile_command(ncu, executable, trial, device_index=0, available=None, log_
     if log_file is not None: command += ["--log-file", str(log_file)]
     if report_path is not None: command += ["--export", str(report_path), "--force-overwrite"]
     if trial["workload"] != "gemm":
-        command += ["--kernel-name", "regex:.*(memory_kernel|tensor_kernel|latency_kernel|control_kernel).*", "--launch-count", "1"]
+        command += ["--kernel-name", "regex:.*(memory_kernel|tensor_kernel|latency_kernel|control_kernel|pointwise_nonlinear_kernel|row_nonlinear_kernel).*", "--launch-count", "1"]
     return command + benchmark_command(executable, trial, device_index, profiling=True)
 
 
@@ -314,7 +314,7 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
         raise ValueError("Profiled application CUDA UUID differs from plan")
     # Application replay emits one result per pass. Require exact deterministic
     # counter-relevant metadata/payload, allowing elapsed timing to differ.
-    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated")
+    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated", "row_width", "elements", "row_evaluations", "math_implementation", "input_precision", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution")
     deterministic = bool(benchmarks) and all(all(item.get(k) == benchmarks[0].get(k) for k in determinism_fields) for item in benchmarks)
     context = _profile_context(profile_context, events)
     evidence = {"schema_version": 2, "condition_id": trial["condition_id"], "trial_id": trial_id,

@@ -96,6 +96,7 @@ class RunnerAuditTests(unittest.TestCase):
         pairs = [{"graphics_mhz": g, "memory_mhz": 1000 if g is not None else None}
                  for g in (900, 1110, None)]
         return {"study_design": "energy_sweep", "execution_allowed": True,
+                "clock_sweep_policy": {"graphics_step_mhz": 90, "graphics_min_mhz": 900},
                 "device": DEVICE, "sample_interval_s": .05,
                 "clock_sweep_coverage": {
                     "requirements_status": "complete",
@@ -143,7 +144,7 @@ class RunnerAuditTests(unittest.TestCase):
     def test_complete_label_cannot_hide_wrong_step_or_missing_memory_domain(self):
         plan = self.strict_plan()
         plan["clock_sweep_coverage"]["requested_step_mhz"] = 180
-        with self.assertRaisesRegex(ValueError, "90 MHz"):
+        with self.assertRaisesRegex(ValueError, "declared interval"):
             validate_plan_execution(plan)
         plan = self.strict_plan()
         plan["clock_sweep_coverage"]["supported_memory_mhz"].append(1500)
@@ -162,7 +163,7 @@ class RunnerAuditTests(unittest.TestCase):
         domain["requested_grid_mhz"].remove(990)
         domain["actual_gaps_mhz"] = [b-a for a, b in zip(domain["selected_graphics_mhz"], domain["selected_graphics_mhz"][1:])]
         plan["trials"] = [trial for trial in plan["trials"] if trial["clocks"]["graphics_mhz"] != 990]
-        with self.assertRaisesRegex(ValueError, "90 MHz grid"):
+        with self.assertRaisesRegex(ValueError, "interval grid"):
             validate_plan_execution(plan)
 
     def test_complementary_paired_and_unpaired_clock_subsets_do_not_complete_each_other(self):
@@ -209,7 +210,7 @@ class RunnerAuditTests(unittest.TestCase):
                 if condition["clocks"]["graphics_mhz"] != missing]
             incomplete["trials"] = [trial for trial in incomplete["trials"]
                                     if trial["clocks"]["graphics_mhz"] != missing]
-            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "90 MHz grid"):
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "interval grid"):
                 validate_plan_execution(incomplete)
     def test_unsafe_and_duplicate_trial_ids_fail_before_device_or_output_mutation(self):
         for identifier in (None, "", ".", "..", "../escaped", "folder/trial", "folder\\trial", "bad\nname"):

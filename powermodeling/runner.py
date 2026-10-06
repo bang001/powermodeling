@@ -56,8 +56,14 @@ def validate_plan_execution(plan):
         return
     if coverage.get("requirements_status") != "complete":
         raise ValueError("Study clock requirements must be complete before execution")
-    if coverage.get("strategy") != "nearest_supported_graphics_grid" or coverage.get("requested_step_mhz") != 90:
-        raise ValueError("Energy study requires the supported approximately 90 MHz graphics sweep")
+    step = coverage.get("requested_step_mhz")
+    floor = coverage.get("graphics_min_mhz", 900)
+    if (coverage.get("strategy") != "nearest_supported_graphics_grid"
+            or type(step) is not int or step <= 0 or type(floor) is not int or floor <= 0):
+        raise ValueError("Energy study requires a positive interval and minimum MHz for the supported graphics sweep")
+    declared_policy = plan.get("clock_sweep_policy") or {}
+    if declared_policy != {"graphics_step_mhz": step, "graphics_min_mhz": floor}:
+        raise ValueError("Clock coverage differs from the declared interval/minimum policy; regenerate the plan")
     supported_memory = coverage.get("supported_memory_mhz") or []
     selected_memory = coverage.get("selected_memory_mhz") or []
     domains = coverage.get("memory_domains") or []
@@ -84,7 +90,8 @@ def validate_plan_execution(plan):
     for domain in domains:
         selected_graphics = {graphics for graphics, memory in declared if memory == domain.get("memory_mhz")}
         supported_graphics = domain.get("supported_graphics_mhz") or []
-        if (not supported_graphics or not selected_graphics
+        eligible = [g for g in supported_graphics if g >= floor]
+        if (not supported_graphics or (eligible and not selected_graphics)
                 or not selected_graphics.issubset(set(supported_graphics))):
             raise ValueError("Study clock conditions must use supported pairs in every memory domain")
         if 1110 in domain.get("supported_graphics_mhz", []) and (1110, domain.get("memory_mhz")) not in declared:
@@ -96,7 +103,7 @@ def validate_plan_execution(plan):
     # alone cannot establish that the required sweep remains complete.
     from .planner import resolve_clock_plan
     pairs, rebuilt = resolve_clock_plan({"study_design": "energy_sweep", "clock_sweep": {
-        "graphics_step_mhz": 90, "all_memory_clocks": True,
+        "graphics_step_mhz": step, "graphics_min_mhz": floor, "all_memory_clocks": True,
         "required_graphics_mhz": coverage.get("required_graphics_mhz", [1110]),
         "include_advertised_default": True, "include_default_policy": True}}, {
         "supported_pairs": native_pairs,
@@ -106,7 +113,7 @@ def validate_plan_execution(plan):
         raise ValueError("Required advertised default clock pair is not in the discovered supported clock domains")
     expected = {(pair["graphics_mhz"], pair["memory_mhz"]) for pair in pairs}
     if declared != expected:
-        raise ValueError("Study clock coverage does not retain the required approximately 90 MHz grid and supported endpoints; regenerate the full plan")
+        raise ValueError("Study clock coverage does not retain the required interval grid and evaluation endpoints; regenerate the full plan")
     by_geometry = {}
     for trial in plan.get("trials") or []:
         protocol = trial.get("treatment_protocol") or {}

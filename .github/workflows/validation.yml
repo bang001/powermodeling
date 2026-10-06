@@ -16,10 +16,28 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python -m compileall -q powermodeling
   cuda-build:
+    name: CUDA ${{ matrix.target }}
     runs-on: ubuntu-latest
-    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: '12 V100/A100/H100'
+            image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            architectures: '70;80;90'
+          - target: '13.0 A100'
+            image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+            architectures: '80'
+          - target: '13.0 default A100/H100'
+            image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+            architectures: ''
+    container: ${{ matrix.image }}
     steps:
       - run: apt-get update && apt-get install -y --no-install-recommends git cmake g++
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES='70;80;90'
+      - if: matrix.architectures != ''
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.architectures }}"
+      - if: matrix.architectures == ''
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build -j2
+      - run: build/powerbench --help

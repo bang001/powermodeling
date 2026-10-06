@@ -8,11 +8,12 @@ import math
 import random
 
 from .profiles import declare_sxm
+from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS
 
-WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"}
+WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS
 PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "iterations",
               "tensor_accumulators", "access", "sm_ids", "seed", "offset_bytes",
-              "gemm_m", "gemm_n", "gemm_k", "batch_launches"}
+              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width"}
 
 
 def numeric_expression(value, names):
@@ -87,13 +88,13 @@ def _strict_clock_policy(config):
     if _study_design(config) != "energy_sweep":
         return
     if "clock_pairs" in config:
-        raise ValueError("energy_sweep requires the discovered90MHz clock grid, not explicit clock_pairs")
+        raise ValueError("energy_sweep requires a discovered interval clock grid, not explicit clock_pairs")
     sweep = config.get("clock_sweep", {})
     if not isinstance(sweep, dict):
         raise ValueError("clock_sweep must be an object")
     if ("graphics_quantiles" in sweep or type(sweep.get("graphics_step_mhz", 90)) is not int
-            or sweep.get("graphics_step_mhz", 90) != 90):
-        raise ValueError("energy_sweep requires graphics_step_mhz=90; graphics quantile exceptions are not allowed")
+            or sweep.get("graphics_step_mhz", 90) <= 0):
+        raise ValueError("energy_sweep requires a positive graphics_step_mhz; graphics quantile exceptions are not allowed")
     if sweep.get("all_memory_clocks") is not True or "memory_mhz" in sweep or "memory_quantiles" in sweep:
         raise ValueError("energy_sweep requires all_memory_clocks=true without a memory-domain subset")
     if sweep.get("include_advertised_default", True) is not True:
@@ -108,9 +109,11 @@ def _requirements_coverage(coverage, strict):
         return {"requirements_status": "not_required", "execution_allowed": True,
                 "requirement_checks": [], "requirement_reasons": []}
     checks = [
-        {"requirement": "graphics_step_90_mhz", "status": "satisfied", "reason": "requested90MHz grid maps to advertised graphics clocks"},
+        {"requirement": "graphics_interval_grid", "status": "satisfied", "reason": "requested interval grid maps to advertised graphics clocks within the evaluation range",
+         "step_mhz": coverage["requested_step_mhz"], "minimum_mhz": coverage["graphics_min_mhz"]},
         {"requirement": "all_memory_domains", "status": "satisfied", "reason": "every advertised memory-clock domain is selected",
-         "memory_mhz": coverage["selected_memory_mhz"]},
+         "memory_mhz": coverage["selected_memory_mhz"],
+         "no_supported_graphics_in_evaluation_range_memory_mhz": [d["memory_mhz"] for d in coverage["memory_domains"] if d["evaluation_range_status"] == "not_applicable"]},
     ]
     default = coverage["advertised_default"]
     if default["status"] == "included":
@@ -205,6 +208,9 @@ def resolve_clock_plan(config, supported):
     step = sweep.get("graphics_step_mhz", 90) if grid else None
     if grid and (type(step) is not int or step <= 0):
         raise ValueError("graphics_step_mhz must be a positive integer")
+    floor = sweep.get("graphics_min_mhz", 900)
+    if type(floor) is not int or floor <= 0:
+        raise ValueError("graphics_min_mhz must be a positive integer")
     required = sweep.get("required_graphics_mhz", [1110])
     if not isinstance(required, list) or any(type(g) is not int or g <= 0 for g in required) or len(set(required)) != len(required):
         raise ValueError("required_graphics_mhz must contain unique positive integer exact anchors")
@@ -215,7 +221,7 @@ def resolve_clock_plan(config, supported):
         if key in sweep and type(sweep[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
     coverage = {"strategy": "nearest_supported_graphics_grid" if grid else "geometry_graphics_quantiles",
-                "requested_step_mhz": step, "memory_selection_policy": memory_policy,
+                "requested_step_mhz": step, "graphics_min_mhz": floor, "memory_selection_policy": memory_policy,
                 "supported_memory_mhz": sorted(by_mem), "selected_memory_mhz": memories,
                 "required_graphics_mhz": required, "memory_domains": [], "clock_conditions": [],
                 "note": "Only advertised pairs are fixed. Grid anchors use nearest supported clocks; required points are exact. An observed optimum is GPU-specific and restricted to measured configurations."}
@@ -232,21 +238,23 @@ def resolve_clock_plan(config, supported):
     for memory in memories:
         graphics = by_mem[memory]
         low, high = graphics[0], graphics[-1]
-        if grid and (high - low) // step + 1 > 100000:
+        eligible = [g for g in graphics if g >= floor]
+        grid_start = max(floor, low)
+        if grid and (high - grid_start) // step + 1 > 100000:
             raise ValueError("Requested graphics grid exceeds100000 points; check discovery or increase step")
-        targets = list(range(low, high + 1, step)) if grid else []
+        targets = list(range(grid_start, high + 1, step)) if grid and eligible else []
         mapping = []
         if grid:
             for target in targets:
-                nearest = min(graphics, key=lambda g: (abs(g - target), g))
+                nearest = min(eligible, key=lambda g: (abs(g - target), g))
                 mapping.append({"requested_mhz": target, "selected_mhz": nearest, "error_mhz": nearest - target})
                 add(nearest, memory, "graphics_grid")
         else:
-            for g in _quantiles(graphics, sweep["graphics_quantiles"]):
+            for g in (_quantiles(eligible, sweep["graphics_quantiles"]) if eligible else []):
                 add(g, memory, "geometry_graphics_quantile")
         # Operating endpoints of each *selected* memory domain are explicit.
-        for g in (low, high):
-            add(g, memory, "supported_range_endpoint")
+        for g in ([eligible[0], high] if eligible else []):
+            add(g, memory, "evaluation_range_endpoint")
         points = []
         for anchor in required:
             status = "included" if anchor in graphics else "not_applicable" if strict else "unavailable"
@@ -259,6 +267,11 @@ def resolve_clock_plan(config, supported):
         selected = sorted(g for g, m in conditions if m == memory)
         coverage["memory_domains"].append({"memory_mhz": memory, "supported_graphics_mhz": graphics,
             "min_graphics_mhz": low, "max_graphics_mhz": high, "requested_grid_mhz": targets,
+            "evaluation_min_graphics_mhz": eligible[0] if eligible else None,
+            "evaluation_max_graphics_mhz": high if eligible else None,
+            "evaluation_range_status": "included" if eligible else "not_applicable",
+            "excluded_below_floor_graphics_mhz": [g for g in graphics if g < floor],
+            "below_floor_scope": "excluded from the routine grid; mandatory default/exact anchors can still be included",
             "grid_mapping": mapping, "selected_graphics_mhz": selected,
             "actual_gaps_mhz": [b - a for a, b in zip(selected, selected[1:])],
             "required_points": points,
@@ -333,10 +346,10 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
         if stage and spec.get("stage", "saturation") != stage: continue
         workload = spec["workload"]
         if workload not in WORKLOADS: raise ValueError(f"Unknown workload {workload}")
-        paired = spec.get("paired_reference", paired_default if workload in {"tensor", "l1", "l2", "hbm"} else False)
+        paired = spec.get("paired_reference", paired_default if workload in {"tensor", "l1", "l2", "hbm"} | NONLINEAR_WORKLOADS else False)
         if type(paired) is not bool:
             raise ValueError("Experiment paired_reference must be boolean")
-        if paired and workload not in {"tensor", "l1", "l2", "hbm", "gemm"}:
+        if paired and workload not in {"tensor", "l1", "l2", "hbm", "gemm"} | NONLINEAR_WORKLOADS:
             raise ValueError("Paired issue-loop reference is available only for treatment workloads; latency/control remain diagnostic")
         grid = spec.get("grid", {})
         if set(grid) - PARAMETERS: raise ValueError(f"Unknown parameters: {set(grid)-PARAMETERS}")
@@ -376,20 +389,36 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 ids = resolved["sm_ids"]
                 if not isinstance(ids, list) or not ids or any(type(i) is not int or not 0 <= i < 4096 for i in ids) or len(set(ids)) != len(ids):
                     raise ValueError("sm_ids must be a nonempty unique list of integers within0..4095")
-                if workload == "gemm":
-                    raise ValueError("cuBLAS GEMM cannot honor sm_ids")
+                if workload == "gemm" or workload in NONLINEAR_WORKLOADS:
+                    raise ValueError("GEMM/nonlinear full-output workloads cannot honor sm_ids")
                 # SM IDs are sparse hardware identifiers on some SKUs. They
                 # cannot be inferred merely from the enabled SM count.
                 known_ids = device.get("discovered_sm_ids")
                 if known_ids is not None and any(i not in known_ids for i in ids):
                     raise ValueError("sm_ids includes an ID absent from the discovered hardware map")
-            if workload == "l1": default_ws = blocks * 16 * 1024
+            if "row_width" in resolved and workload not in ROW_WORKLOADS:
+                raise ValueError("row_width applies only to RMSNorm and Softmax")
+            width = resolved.get("row_width", 1024) if workload in ROW_WORKLOADS else 0
+            if workload in ROW_WORKLOADS and not 1 <= width <= 65536:
+                raise ValueError("row_width must be within 1..65536")
+            if workload in NONLINEAR_WORKLOADS: default_ws = blocks * (width or threads * 128) * 4
+            elif workload == "l1": default_ws = blocks * 16 * 1024
             elif workload in ("l2", "l2_latency"): default_ws = max(4, names["l2_bytes"] // 8 * 4)
             else: default_ws = max(512 * 1024 * 1024, names["l2_bytes"] * 8)
             ws = resolved.get("working_set_bytes", default_ws)
             offset = resolved.get("offset_bytes", 0)
             if ws < 4 or ws % 4 or offset % 4:
                 raise ValueError("working_set_bytes and offset_bytes must be word-aligned (4bytes), with a nonempty working set")
+            if workload in NONLINEAR_WORKLOADS:
+                if access != "read" or offset != 0 or resolved.get("stride_elements", 1) != 1:
+                    raise ValueError("Nonlinear kernels require access=read, offset_bytes=0 and stride_elements=1; input and output are distinct")
+                if ws % (blocks * (width or 1) * 4):
+                    raise ValueError("Nonlinear working_set_bytes must contain equal complete block slices/rows")
+                allocation = ws * 2 + width * 4 + blocks * threads * 8 + 256 * 1024
+                if allocation > names["total_memory_bytes"] * 0.7:
+                    raise ValueError("Nonlinear input/output/gamma and reference allocations exceed70% of device memory")
+                resolved.update(working_set_bytes=ws, iterations=resolved.get("iterations", 1))
+                if width: resolved["row_width"] = width
             if workload == "l1" and ws < blocks * 4:
                 raise ValueError("L1 working set must include at least one 4byte word per block")
             if workload == "l2_latency" and ws // 4 > 2**32 - 1:
@@ -460,6 +489,8 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
     return {"schema_version":1, "device":device, "trials":trials,
             "study_design": _study_design(config), "execution_allowed": clock_coverage["execution_allowed"],
             "clock_sweep_coverage": clock_coverage,
+            "clock_sweep_policy": {"graphics_step_mhz": clock_coverage.get("requested_step_mhz"),
+                                   "graphics_min_mhz": clock_coverage.get("graphics_min_mhz", 900)},
             "sweep_dimensions": {"geometry_conditions": sum(len(keys) for keys in geometry_keys.values()),
                 "clock_conditions_per_geometry": len(clocks), "clock_geometry_conditions": len(conditions),
                 "repeats": repeats, "trials": len(trials), "by_workload": by_workload,

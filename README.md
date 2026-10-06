@@ -4,7 +4,7 @@
 
 SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter로 검증하기 전에는 목표 계층과 물리 회로 에너지를 동일시하지 않는다.
 
-[실험 설계 HTML](docs/experiment-design.html)은 treatment/reference 도식, 약 90 MHz clock coverage, 실제 plan·summary JSON의 로컬 뷰어를 제공한다. 서버 업로드 없이 사용할 수 있으며 문서 도식에는 실측 전력곡선이 없다.
+[실험 설계 HTML](docs/experiment-design.html)은 treatment/reference 도식, clock coverage, 실제 plan·summary JSON의 로컬 뷰어를 제공한다. 서버 업로드 없이 사용할 수 있으며 문서 도식에는 실측 전력곡선이 없다.
 
 ## 제공 기능
 
@@ -15,7 +15,7 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
 | 전력 측정 | capability 기반 NVML 평균/현재/누적에너지, 지원되는 memory scope, raw timestamps·오류 |
 | 시간·기준 | 같은 context·버퍼·clock policy의 전후 idle 및 AB/BA paired active reference, arm별 warmup·완료 epoch의 정렬 적분 |
-| 클럭·DVFS | 지원 pair 안의 약 90 MHz graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
+| 클럭·DVFS | 900 MHz 이상 지원 pair의 60/90/120 등 가변 간격 graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
 | 분석 | GPU UUID별 전체·idle 증가분·paired-reference 단가 최소와 이산 근접 측정점·bootstrap 구간; 주파수별 활용 조건과 전체 최고 성능 제약을 분리 |
 | 모델 | 명시적 활동률 특징, rank/condition 검사, 다른 GPU·클럭 층 분리, mixed holdout 검증 |
 | 검증 | Nsight Compute counter를 자동 판정하고 분석에 반영; `pass`/`fail`/`inconclusive` 및 근거 보존 |
@@ -24,7 +24,7 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 
 ## 설치와 빌드
 
-Linux, Python 3.10 이상, CMake 3.22 이상, NVIDIA driver와 CUDA Toolkit이 필요하다. 세 세대를 같은 코드로 비교하려면 **CUDA 12.x**를 사용한다. CUDA 13.0은 V100/Volta의 offline compilation과 library support를 제거했다.
+Linux, Python 3.10 이상, CMake 3.22 이상, NVIDIA driver와 CUDA Toolkit이 필요하다. **A100은 CUDA 13.0의 `sm_80` 빌드를 지원한다.** V100·A100·H100을 같은 Toolkit으로 비교하려면 CUDA 12.x를 사용한다. CUDA 13.0은 V100/Volta의 offline compilation과 library support를 제거했다.
 
 NCU도 세대 지원을 맞춰야 한다. **V100·A100·H100 공통 profiling에는 Nsight Compute 2025.2.x처럼 GV100을 지원하는 버전을 사용한다.** Nsight Compute 2025.3부터 Volta 지원이 제거되어 최신 NCU만 설치하면 V100 검증이 실행되지 않는다. `profile`/`validate-run --ncu /설치경로/ncu`로 실제 사용할 executable을 지정하고 driver 요구사항을 확인한다. [공식 버전 지원 자료](docs/sources.md)
 
@@ -35,9 +35,27 @@ cmake --build build -j
 python -m powermodeling --help
 ```
 
-CUDA compiler를 별도 경로로 지정해야 하면 CMake에 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc`를 추가한다. Python 분석만 사용할 때는 CUDA 빌드가 필요하지 않다. GPU 측정에는 `build/powerbench`가 필요하다.
+**A100 + CUDA 13.0**은 CUDA 13.0을 지원하는 Linux R580 이상 driver와 별도 빌드 디렉터리를 사용한다. Toolkit 설치 경로가 다르면 두 경로를 함께 바꾼다.
+
+```bash
+cmake -S . -B build-a100-cuda13 -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+  -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build-a100-cuda13 -j
+python -m powermodeling discover --device 0 --bench build-a100-cuda13/powerbench
+```
+
+아키텍처를 생략한 새 빌드의 기본값은 CUDA 12에서 `70;80;90`, CUDA 13에서 `80;90`이다. `-DCMAKE_CUDA_ARCHITECTURES`와 `CUDAARCHS` 환경변수의 지정값을 우선한다. A100 + CUDA 13의 NCU 검증에는 CUDA 13을 지원하는 Nsight Compute 2025.3 이상을 사용한다. 아래 실행 예시의 `--bench build/powerbench`도 선택한 실행 파일 경로로 바꾼다. 비선형 함수 지침에는 두 빌드 경로를 모두 제공한다. CUDA/cuBLAS 버전이 다른 측정은 별도 분석 층으로 기록한다.
+
+CUDA 12 compiler를 별도 경로로 지정하려면 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc`를 추가한다. Python 분석만 사용할 때는 CUDA 빌드가 필요하지 않다.
 
 ## 첫 실험
+
+EXP·TANH·SiLU·RMSNorm·Softmax의 FP32 **pJ/element** 실험도 지원한다.
+RMSNorm/Softmax는 reduction과 메모리 접근을 포함한 완전한 행 연산이며
+**pJ/row**도 보고한다. `configs/nonlinear-smoke.json`, `configs/nonlinear.json`과
+[비선형 함수 실험 설계·실행 지침](docs/nonlinear-experiments.ko.md)을 사용한다.
 
 먼저 장치를 조회하고 기본 DVFS 상태의 smoke sweep으로 실행·센서·결과 형식을 확인한다. smoke도 평균 센서 때문에 수초씩 실행하며, 포화 조건을 전수 탐색하는 용도는 아니다.
 
@@ -70,10 +88,12 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 | [configs/saturation.json](configs/saturation.json) | warp/block·working set·accumulator·GEMM 크기와 고정 클럭 탐색 |
 | [configs/dvfs.json](configs/dvfs.json) | memory×SM clock 도메인의 bandwidth plateau와 효율 탐색 |
 | [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
+| [configs/nonlinear-smoke.json](configs/nonlinear-smoke.json) | FP32 비선형 함수 5종의 실행·수치·센서 점검 |
+| [configs/nonlinear.json](configs/nonlinear.json) | 비선형 함수의 footprint·geometry·행 너비·clock별 pJ/element sweep |
 
-JSON의 `clock_pairs`로 실측 장치가 지원하는 `(graphics_mhz, memory_mhz)`를 명시할 수 있다. **`saturation.json`·`dvfs.json`·`locality.json`은 모두 `graphics_step_mhz: 90`으로 모든 광고된 memory domain에서 약 90 MHz graphics grid를 만든다.** 이전 quantile 선택이나 일부 설정에만 적용한 격자로는 이 요구를 충족하지 못했다. 지원 범위 끝점, exact 1110 MHz(지원 domain), advertised default 고정 pair와 무설정 current-policy reference를 포함하고, 실제 간격은 `plan.clock_sweep_coverage`에 남긴다. 1110 미지원 exact pair는 적용 불가 사유를 기록하며 근사값으로 대체하지 않는다. current-policy reference는 이전 applications/locked 정책이 있을 수 있어 factory default라고 확정하지 않는다.
+JSON의 `clock_pairs`로 검증된 특정 pair를 진단할 수 있다. **`saturation.json`·`dvfs.json`·`locality.json`·`nonlinear.json`의 energy sweep은 기본 `graphics_min_mhz: 900`, `graphics_step_mhz: 90`을 사용한다.** 간격은 60·90·120 MHz 등 양의 정수로 변경할 수 있다. 각 memory domain에서 900 MHz 이상의 지원 값에만 grid를 매핑하고 해당 평가 범위의 끝점, exact 1110 MHz(지원 domain), advertised factory-default 고정 pair와 incoming-policy reference를 포함한다. 일반 200–300 MHz sweep는 생성하지 않는다. 필수 default pair가 하한 아래이면 그 anchor만 예외로 포함한다. 1110 미지원은 사유를 기록하며 근사값으로 대체하지 않는다. incoming policy를 factory-default DVFS라고 단정하지 않는다. 지원/평가 범위·제외된 낮은 native 값·실제 간격은 `plan.clock_sweep_coverage`에 남긴다.
 
-`study_design: "energy_sweep"`은 graphics 간격·memory domain·1110·advertised default·current-policy reference의 요구사항 coverage를 검사한다. default pair를 조회하거나 지원 근거로 확인하지 못한 계획은 `requirements_status: "incomplete"`, `execution_allowed: false`이며 runner가 clock 변경·커널 실행 전에 차단한다. 계획 파일과 미확정 사유는 검토용으로 남는다. Runner는 기록된 native 지원 clock 목록에서 필수 약 90 MHz grid·끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 clock pair가 모두 있는지 검사한다. 선택된 coverage와 trial 목록에서 같은 조건을 함께 제거해도 native 목록에 근거한 필수 grid 검사로 드러난다. `smoke.json`의 null clock은 `diagnostic` 예외로 허용하고 전체 효율 sweep로 승인하지 않는다. `sm_count`, `l2_bytes`, `total_memory_bytes`를 쓰는 숫자 표현식은 장치의 조회값으로 해석된다. `blocks = sm_count × 2`는 작업량 지정이며 정확히 각 SM에 2 blocks를 배치하는 명령이 아니다.
+`study_design: "energy_sweep"`은 graphics 간격·memory domain·1110·advertised default·current-policy reference의 요구사항 coverage를 검사한다. default pair를 조회하거나 지원 근거로 확인하지 못한 계획은 `requirements_status: "incomplete"`, `execution_allowed: false`이며 runner가 clock 변경·커널 실행 전에 차단한다. 계획 파일과 미확정 사유는 검토용으로 남는다. Runner는 기록된 native 지원 clock 목록에서 선언한 하한·간격의 grid·평가 끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 clock pair가 모두 있는지 검사한다. 선택된 coverage와 trial 목록에서 같은 조건을 함께 제거해도 native 목록에 근거한 필수 grid 검사로 드러난다. `smoke.json`의 null clock은 `diagnostic` 예외로 허용하고 전체 효율 sweep로 승인하지 않는다. `sm_count`, `l2_bytes`, `total_memory_bytes`를 쓰는 숫자 표현식은 장치의 조회값으로 해석된다. `blocks = sm_count × 2`는 작업량 지정이며 정확히 각 SM에 2 blocks를 배치하는 명령이 아니다.
 
 DVFS 설정은 SM 수의 2·4·8배 blocks × 128·256 threads, GEMM shape를 함께 비교한다. saturation 설정은 Tensor accumulator 수도 바꾼다. seed·working set·stride·주소 offset만 바꾸어 resource geometry 개수를 부풀리지 않는다. 각 frequency pair에서 NCU·품질·정확한 시간 정렬을 통과한 최소 2개의 resource geometry가 실제로 비교되어야 승인된 효율 최적점을 만들 수 있다. geometry 비교 수는 자원 활용에 대한 최소 근거이며 실제 plateau의 증명은 아니다. saturation 결과와 NCU에서 확인한 geometry·working set으로 범위를 늘리거나 정밀하게 탐색한다. 전체 격자는 수시간 걸릴 수 있으므로 plan의 trial 수와 예상 시간을 확인한다.
 
@@ -88,6 +108,13 @@ Treatment는 측정하려는 대상 작업이다. `paired_reference: true`인 cu
 전후 idle는 active 시점에 보간하고 drift·actual clock·온도를 검사한다. baseline가 실패해도 treatment 전체 에너지의 품질 판정은 보존한다. 미승인 차감값과 음의 대비는 진단값으로 남기지만 승인된 최적점 후보로 사용하지 않는다. 전체 에너지, 승인된 idle 증가분, 승인된 paired 대비를 서로 대체하지 않으며 순수 static/dynamic·회로 에너지로 이름 붙이지 않는다. 이전 plan/결과와 새 paired protocol을 같은 repeat로 합치지 않는다.
 
 ## 결과 읽기
+
+`analyze`는 [컴포넌트별 평가·시각화 설계](docs/evaluation-design.ko.md)에 따라 계획 대비 coverage, 측정 품질, NCU/수치 근거, resource plateau, 처리량을 유지하는 에너지 후보와 default·1110 대비 개선을 함께 평가한다. `evaluation.html`은 GPU·함수·입력·objective·memory·clock 필터와 CI/anchor/품질/근거 표를 제공하고 SVG를 저장할 수 있다. `evaluation.json`·`evaluation.csv`도 생성하며 `--plots`는 조건을 분리한 PNG와 SVG를 낸다. 원본 run의 `plan.json`은 자동 사용하고, NCU 검증 후 디렉터리에는 원 energy plan을 `--plan`으로 지정한다. plan이 없거나 누락·plateau 부족이 있으면 후보는 잠정으로 남긴다.
+
+```bash
+python -m powermodeling analyze --input results/validated \
+  --plan saturation-plan.json --output results/validated-report --plots
+```
 
 각 trial의 raw JSON과 실행 plan이 결과 폴더에 저장된다. 분석 폴더의 `trials.csv`와 `summary.json`에서 측정값과 탈락 이유를 확인한다.
 

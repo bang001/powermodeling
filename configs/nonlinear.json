@@ -1,0 +1,139 @@
+{
+  "target_form_factor": "SXM",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "paired_reference": true,
+  "randomization_seed": 2026,
+  "description": "Complete FP32 nonlinear pJ/element sweep; compare each function, row width and footprint separately. Inspect plan runtime before execution.",
+  "study_design": "energy_sweep",
+  "experiments": [
+    {
+      "workload": "exp",
+      "stage": "pointwise",
+      "parameters": {
+        "iterations": 1
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "sm_count*4*4096*4",
+          "sm_count*4*4096*4*32"
+        ]
+      }
+    },
+    {
+      "workload": "tanh",
+      "stage": "pointwise",
+      "parameters": {
+        "iterations": 1
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "sm_count*4*4096*4",
+          "sm_count*4*4096*4*32"
+        ]
+      }
+    },
+    {
+      "workload": "silu",
+      "stage": "pointwise",
+      "parameters": {
+        "iterations": 1
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "sm_count*4*4096*4",
+          "sm_count*4*4096*4*32"
+        ]
+      }
+    },
+    {
+      "workload": "rmsnorm",
+      "stage": "rowwise",
+      "parameters": {
+        "iterations": 1
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "sm_count*4*4096*4",
+          "sm_count*4*4096*4*32"
+        ],
+        "row_width": [
+          128,
+          1024,
+          4096
+        ]
+      }
+    },
+    {
+      "workload": "softmax",
+      "stage": "rowwise",
+      "parameters": {
+        "iterations": 1
+      },
+      "grid": {
+        "blocks": [
+          "sm_count*2",
+          "sm_count*4"
+        ],
+        "threads": [
+          128,
+          256
+        ],
+        "working_set_bytes": [
+          "sm_count*4*4096*4",
+          "sm_count*4*4096*4*32"
+        ],
+        "row_width": [
+          128,
+          1024,
+          4096
+        ]
+      }
+    }
+  ],
+  "clock_sweep": {
+    "graphics_step_mhz": 90,
+    "all_memory_clocks": true,
+    "required_graphics_mhz": [
+      1110
+    ],
+    "include_default_policy": true,
+    "include_advertised_default": true,
+    "graphics_min_mhz": 900
+  }
+}

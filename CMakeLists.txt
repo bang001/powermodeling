@@ -1,14 +1,28 @@
 cmake_minimum_required(VERSION 3.22)
-# CUDA 12 supports all three requested generations. CUDA 13 removed offline
-# compilation for Volta; configure with CUDA 12 when building one portable binary.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 70 80 90)
+# Let compiler identification use nvcc's supported default before choosing our
+# targets. In particular, CUDA 13 cannot identify a compiler with sm_70 enabled.
+# Preserve explicit CMake and CUDAARCHS environment overrides.
+set(_powermodeling_default_architectures OFF)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+  set(_powermodeling_default_architectures ON)
 endif()
 project(powermodeling LANGUAGES CXX CUDA)
 find_package(CUDAToolkit 12 REQUIRED)
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13 AND "70" IN_LIST CMAKE_CUDA_ARCHITECTURES)
-  message(FATAL_ERROR "CUDA 13 cannot build sm_70. Use CUDA 12 for the V100/A100/H100 binary, or set CMAKE_CUDA_ARCHITECTURES=80;90.")
+if(_powermodeling_default_architectures)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13)
+    set(CMAKE_CUDA_ARCHITECTURES "70;80;90" CACHE STRING "CUDA architectures" FORCE)
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES "80;90" CACHE STRING "CUDA architectures" FORCE)
+  endif()
 endif()
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+  foreach(_architecture IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(_architecture MATCHES "^([0-9]+)(-real|-virtual)?$" AND CMAKE_MATCH_1 LESS 75)
+      message(FATAL_ERROR "CUDA 13 cannot build ${_architecture}. Use CUDA 12 for V100, or set CMAKE_CUDA_ARCHITECTURES=80 for A100 (80;90 for A100/H100).")
+    endif()
+  endforeach()
+endif()
+message(STATUS "powerbench CUDA ${CMAKE_CUDA_COMPILER_VERSION} architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 add_executable(powerbench cuda/gpu_bench.cu)
 target_compile_features(powerbench PRIVATE cxx_std_17 cuda_std_17)

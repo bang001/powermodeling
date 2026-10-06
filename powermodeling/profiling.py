@@ -16,14 +16,14 @@ from .runner import atomic_json
 from .validation import (DURATION, DRAM_READ, DRAM_WRITE, L1_HITS, L1_MISSES,
                          L1_REQUESTS, L1_SECTORS, L2_READ, L2_READ_HITS, L2_WRITE,
                          LOCAL_LOAD, LOCAL_STORE, SM_HZ, TENSOR_ACTIVITY,
-                         TENSOR_INSTRUCTIONS, SFU_INSTRUCTIONS, assess_profile, validate_evidence)
+                         TENSOR_INSTRUCTIONS, SFU_INSTRUCTIONS, SFU_ACTIVITY, assess_profile, validate_evidence)
 
 # Exact operation-specific counters are preferred. Architecture/release discovery
 # determines support; absent counters are retained as unknown in admission.
 METRICS = list(dict.fromkeys([DRAM_READ, DRAM_WRITE, DURATION, SM_HZ,
     "dram__cycles_elapsed.avg.per_second", L2_READ, L2_READ_HITS, L2_WRITE,
     L1_SECTORS, L1_HITS, L1_MISSES, L1_REQUESTS, LOCAL_LOAD, LOCAL_STORE,
-    *TENSOR_INSTRUCTIONS, *TENSOR_ACTIVITY, *SFU_INSTRUCTIONS,
+    *TENSOR_INSTRUCTIONS, *TENSOR_ACTIVITY, *SFU_INSTRUCTIONS, *SFU_ACTIVITY,
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
     "lts__throughput.avg.pct_of_peak_sustained_elapsed",
     "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
@@ -314,7 +314,7 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
         raise ValueError("Profiled application CUDA UUID differs from plan")
     # Application replay emits one result per pass. Require exact deterministic
     # counter-relevant metadata/payload, allowing elapsed timing to differ.
-    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated", "row_width", "elements", "row_evaluations", "math_implementation", "input_precision", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution", "kernel_implementation_version", "memory_accesses_per_thread_iteration")
+    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated", "row_width", "elements", "row_evaluations", "math_implementation", "input_precision", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution", "kernel_implementation_version", "memory_accesses_per_thread_iteration", "grid_mode", "input_elements", "block_completion_count_source")
     deterministic = bool(benchmarks) and all(all(item.get(k) == benchmarks[0].get(k) for k in determinism_fields) for item in benchmarks)
     context = _profile_context(profile_context, events)
     evidence = {"schema_version": 2, "condition_id": trial["condition_id"], "trial_id": trial_id,

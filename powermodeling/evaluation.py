@@ -45,7 +45,9 @@ def experiment_contract(workload, benchmark, config):
                 **({"offset_bytes": get("offset_bytes", 0), "sm_ids": config.get("sm_ids", [])} if workload != "l2_latency" else {})}
     if workload in NONLINEAR_WORKLOADS:
         return {key: get(key) for key in ("working_set_bytes", "row_width", "input_precision", "math_implementation",
-                                          "rms_epsilon", "affine_gamma", "nonlinear_input_distribution")}
+                                          "rms_epsilon", "affine_gamma", "nonlinear_input_distribution",
+                                          "input_elements", "grid_mode", "kernel_implementation_version",
+                                          "block_completion_count_source")}
     return {"definition": "dense FP16 input / FP32 accumulation", "implementation": workload} if workload in TENSOR else {"definition": "active integer issue control"}
 
 
@@ -147,6 +149,90 @@ def _plateau(groups, rate, fraction, minimum_repeats, policy):
             "resource_axis": "GEMM m × n × k; problem-size evidence, vendor algorithms can change" if gemm else "blocks × threads × accumulators (Tensor); blocks × threads otherwise",
             "resource_levels": top, "group_ids": [g["group_id"] for g in selected], "throughputs": rates,
             "observed_peak": peak, "hardware_saturation_proven": False}
+
+
+def _nonlinear_launch(group):
+    contract = group.get("nonlinear_contract") or {}
+    geometry = group.get("resource_geometry") or {}
+    return {"input_elements": contract.get("input_elements"),
+            "grid_mode": contract.get("grid_mode"),
+            "blocks": geometry.get("blocks"), "threads": geometry.get("threads"),
+            "block_completion_count_source": contract.get("block_completion_count_source")}
+
+
+def _input_curve_signature(group):
+    """Compare Q only; never use this signature for energy aggregation."""
+    contract = group.get("nonlinear_contract") or {}
+    if (group.get("workload") not in NONLINEAR_WORKLOADS or contract.get("grid_mode") != "auto"
+            or contract.get("math_implementation") != "cuda_fp32_q_grid_v2"
+            or not group.get("clock_comparison_controlled")):
+        return None
+    q = number(contract.get("input_elements"))
+    if q is None or q <= 0 or q != int(q):
+        return None
+    variable = {"input_elements", "working_set_bytes", "blocks"}
+    stratum = component_stratum(group)
+    stratum["experiment_contract"] = {k: v for k, v in (group.get("experiment_contract") or {}).items() if k not in variable}
+    return canonical({**stratum,
+        "nonlinear_contract": {k: v for k, v in contract.items() if k not in variable},
+        "config": {k: v for k, v in group.get("config", {}).items() if k not in variable | {
+            "clock_selection_policy", "clock_selection_reasons"}},
+        "resource_geometry": {k: v for k, v in (group.get("resource_geometry") or {}).items() if k != "blocks"}})
+
+
+def _input_size_plateau(candidate, peers, objective, metric, rate, fraction, minimum_repeats, policy):
+    """A winner's Q curve can show stable throughput, not physical saturation.
+
+    Keep unverified or imprecise valid rates in the observed peak and Q levels,
+    so dropping a failed high-Q point cannot fabricate a lower stable plateau.
+    """
+    observed = [g for g in peers if g.get("valid_repeats", 0) >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
+    peak = max((g[rate] for g in observed), default=None)
+    top = sorted({g["nonlinear_contract"]["input_elements"] for g in observed})[-policy.minimum_resource_levels:]
+    selected = []
+    for q in top:
+        accepted = [g for g in observed if g["nonlinear_contract"]["input_elements"] == q
+                    and _qualified(g, metric, rate, minimum_repeats, policy)
+                    and not _eligibility_reasons(g, objective, metric, rate, minimum_repeats, policy)]
+        if accepted:
+            selected.append(max(accepted, key=lambda g: (g[rate], g["group_id"])))
+    rates = [g[rate] for g in selected]
+    selected_q = (candidate.get("nonlinear_contract") or {}).get("input_elements")
+    spread = (max(rates) - min(rates)) / max(rates) if rates else None
+    stable = (len(top) >= policy.minimum_resource_levels and len(selected) == len(top) and selected_q in top
+              and peak is not None and min(rates) >= fraction * peak and spread <= policy.plateau_tolerance_fraction)
+    return {"status": "observed_input_size_plateau" if stable else "inconclusive",
+            "curve_id": hashlib.sha256(_input_curve_signature(candidate).encode()).hexdigest()[:12],
+            "reason": "The selected Q lies in the largest tested Q levels with precise, verified near-peak throughput" if stable else
+                      f"The selected Q must belong to the {policy.minimum_resource_levels} largest observed Q levels, each qualified and stable near the complete matching-curve peak",
+            "resource_axis": "input elements Q at fixed threads, clocks, iterations and function definition",
+            "input_elements_levels": top, "selected_input_elements": selected_q,
+            "group_ids": [g["group_id"] for g in selected], "throughputs": rates,
+            "observed_peak": peak, "relative_throughput_spread": spread,
+            "hardware_saturation_proven": False,
+            "scope": "Observed input-size stability only; Q-dependent energy values remain separate and SFU or GPU saturation is not established"}
+
+
+def _input_scaling_rows(groups, curves, rate, suffix, minimum_repeats, policy):
+    signatures = sorted({key for group in groups if (key := _input_curve_signature(group)) is not None})
+    result = []
+    for signature in signatures:
+        rows = []
+        for group in sorted(curves[signature], key=lambda g: (g["nonlinear_contract"]["input_elements"], g["group_id"])):
+            reasons = {o: _eligibility_reasons(group, o, o + "_" + suffix, rate, minimum_repeats, policy) for o in OBJECTIVES}
+            rows.append({"group_id": group["group_id"], **_nonlinear_launch(group),
+                "requested_graphics_mhz": group["config"].get("graphics_clock_mhz"),
+                "requested_memory_mhz": group["config"].get("memory_clock_mhz"),
+                "rate": group.get(rate), "rate_ci95": group.get("ci95", {}).get(rate),
+                "energies": {o: group.get(o + "_" + suffix) for o in OBJECTIVES},
+                "energy_ci95": {o: group.get("ci95", {}).get(o + "_" + suffix) for o in OBJECTIVES},
+                "valid_repeats": group.get("valid_repeats", 0), "ncu_status": group.get("ncu_status"),
+                "eligible": {o: not reasons[o] and _qualified(group, o + "_" + suffix, rate, minimum_repeats, policy) for o in OBJECTIVES},
+                "eligibility_reasons": reasons})
+        result.append({"curve_id": hashlib.sha256(signature.encode()).hexdigest()[:12],
+                       "signature": json.loads(signature), "rows": rows})
+    return {"curves": result,
+            "scope": "Each curve holds GPU, binary, measurement/input definition, requested fixed clocks, threads and iterations constant; only Q changes. Energies and recommendations remain separate per Q. Stable throughput is not proof of hardware saturation."}
 
 
 def _plan_coverage(summary, plan):
@@ -254,9 +340,11 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
     selection = summary["selection_policy"]
     minimum_repeats, minimum_geometries, fraction = (selection[k] for k in ("min_repeats", "min_geometries", "throughput_fraction"))
     coverage = _plan_coverage(summary, plan)
-    buckets = defaultdict(list)
+    buckets, input_curves = defaultdict(list), defaultdict(list)
     for group in summary.get("groups", []):
         buckets[canonical(component_stratum(group))].append(group)
+        if (signature := _input_curve_signature(group)) is not None:
+            input_curves[signature].append(group)
     analyzed = {t["trial_id"]: t for t in summary["trials"]}
     raw = {r.get("trial_id"): r for r in raw_records}
     components = []
@@ -290,6 +378,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "eligibility_reasons": {o: _eligibility_reasons(group, o, o + "_" + u["energy_suffix"], rate, minimum_repeats, policy) for o in OBJECTIVES},
                 "tensor_dense_peak_fraction": group.get("tensor_utilization_vs_dense_clock_peak"),
                 "measurement_diagnostics": group.get("measurement_diagnostics"),
+                "nonlinear_launch": _nonlinear_launch(group) if workload in NONLINEAR_WORKLOADS else None,
                 "row_width": (group.get("nonlinear_contract") or {}).get("row_width"),
                 "pj_per_row": {o: group.get(o + "_pj_per_row") for o in OBJECTIVES},
                 "config": cfg})
@@ -325,9 +414,12 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 winner = min(eligible, key=lambda g: (g[metric], -g[rate], g["group_id"])) if eligible else None
                 best[objective] = winner["group_id"] if winner else None
                 candidates[objective].extend(eligible)
+            q_grid = all(_input_curve_signature(g) is not None for g in rows)
+            plateau = {"status": "not_applicable_q_grid", "reason": "Q determines the grid; selected-candidate evidence uses a matched input-size curve",
+                       "hardware_saturation_proven": False} if q_grid else _plateau(rows, rate, fraction, minimum_repeats, policy)
             clocks.append({"graphics_mhz": gfx, "memory_mhz": mem, "observed_peak": peak,
                 "verified_peak": max((g[rate] for g in verified), default=None), "verified_geometry_count": count,
-                "minimum_energy_group_ids": best, "plateau": _plateau(rows, rate, fraction, minimum_repeats, policy)})
+                "minimum_energy_group_ids": best, "plateau": plateau})
         observed_peak = max((c["observed_peak"] for c in clocks if c["observed_peak"] is not None), default=None)
         for point in point_rows:
             clock = next((c for c in clocks if (c["graphics_mhz"], c["memory_mhz"]) == (point["requested_graphics_mhz"], point["requested_memory_mhz"])), None)
@@ -350,9 +442,14 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             if coverage["status"] != "complete" or wc.get("status") not in ("complete", "complete_with_rejections"):
                 reasons.append("planned coverage is incomplete or unknown")
             if coverage.get("study_design") != "energy_sweep": reasons.append("a complete energy-sweep plan is required")
-            if clock["plateau"]["status"] not in ("observed_plateau", "observed_problem_size_plateau"): reasons.append("resource plateau is inconclusive")
+            curve = _input_curve_signature(winner)
+            plateau = (_input_size_plateau(winner, input_curves[curve], objective, metric, rate, fraction, minimum_repeats, policy)
+                       if curve is not None else clock["plateau"])
+            if plateau["status"] not in ("observed_plateau", "observed_problem_size_plateau", "observed_input_size_plateau"):
+                reasons.append("input-size plateau is inconclusive" if curve is not None else "resource plateau is inconclusive")
             recommendations.append({"objective": objective, "group_id": winner["group_id"],
                 "status": "provisional_candidate" if reasons else "qualified_observed_candidate", "qualification_limits": reasons,
+                "saturation_evidence": plateau,
                 "energy": winner[metric], "energy_ci95": winner["ci95"].get(metric), "throughput_fraction_of_observed_peak": winner[rate] / observed_peak,
                 "near_optimum_group_ids": [g["group_id"] for g in eligible if g[metric] <= winner[metric] * (1 + selection.get("near_optimum_fraction", 0.05))],
                 "factory_default_comparison": _comparison(winner, tagged, objective, rate, metric, minimum_repeats, policy, "factory_default"),
@@ -376,6 +473,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             "trial_counts": dict(Counter("valid" if analyzed[i].get("valid") else "invalid" for g in groups for i in g["trial_ids"] if i in analyzed)),
             "points": point_rows, "clocks": clocks, "observed_peak": observed_peak, "recommendations": recommendations,
             "energy_selection_diagnostics": selection_diagnostics,
+            "input_scaling": _input_scaling_rows(groups, input_curves, rate, u["energy_suffix"], minimum_repeats, policy),
             "profiler_evidence": evidence, "latency_points": latency,
             "correctness_scope": "distributed CPU-double output samples before/after measurement; not exhaustive" if workload in NONLINEAR_WORKLOADS else
                                  "finite output samples and issued-operation accounting; full mathematical reference not established" if workload in TENSOR else
@@ -392,4 +490,5 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                        "Profiler counter rates use replay busy time and are never energy-run sustained throughput.",
                        "Compare the same energy objective and denominator. Total/idle ratios and replay traffic amplification diagnose differences; they do not rescale the measured energy.",
                        "A resource plateau is empirical evidence; it does not prove hardware saturation or pure component energy.",
+                       "Nonlinear auto-grid candidates use matching Q-scaling evidence; input-size stability does not prove SFU or GPU saturation, and energy is never pooled across Q.",
                        "Factory default means the advertised fixed clock pair; incoming driver policy is a separate reference."]}

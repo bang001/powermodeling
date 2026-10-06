@@ -80,8 +80,10 @@ struct Options {
   uint64_t fixed_batches = 0, warmup_batches = 0;
   uint64_t offset_bytes = 0, seed = 1;
   std::string workload = "tensor", access = "read", reference_order = "AB";
+  std::string grid_mode = "auto";
   std::vector<unsigned> sm_ids;
   bool describe = false, profile_region = false, paired_reference = false;
+  bool blocks_explicit = false, grid_mode_explicit = false;
 };
 
 uint64_t parse_u64(const std::string& value, const char* flag) {
@@ -115,6 +117,7 @@ void usage() {
     "  --access read|write|copy --sm-ids 0,1,... --seed N\n"
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
     "  --row-width 1024 (RMSNorm/Softmax, FP32 full row operations)\n"
+    "  --grid-mode auto|fixed (nonlinear; default auto, Q=working-set-bytes/4)\n"
     "Memory stride is in 32-bit words; footprint is total input bytes.\n"
     "L1/L2/HBM read issues one scalar load per thread/iteration with one sum32; default iterations=4096.\n"
     "Write/copy keeps four accesses per thread/iteration; default iterations=1024.\n"
@@ -134,7 +137,8 @@ Options parse_options(int argc, char** argv) {
     if (i + 1 >= argc) throw std::runtime_error("missing value for " + flag);
     std::string value = argv[++i];
     if (flag == "--device") o.device = parse_int(value, flag.c_str());
-    else if (flag == "--blocks") o.blocks = parse_int(value, flag.c_str());
+    else if (flag == "--blocks") { o.blocks = parse_int(value, flag.c_str()); o.blocks_explicit = true; }
+    else if (flag == "--grid-mode") { o.grid_mode = value; o.grid_mode_explicit = true; }
     else if (flag == "--threads") o.threads = parse_int(value, flag.c_str());
     else if (flag == "--row-width") {
       o.row_width = parse_int(value, flag.c_str());
@@ -194,6 +198,10 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error("--row-width 1..65536 applies only to RMSNorm/Softmax");
   if (nonlinear_workload(o.workload) && (!o.sm_ids.empty() || o.offset_bytes || o.stride_elements != 1 || o.access != "read"))
     throw std::runtime_error("nonlinear workloads require a full grid, offset=0, stride=1 and access=read");
+  if (o.grid_mode != "auto" && o.grid_mode != "fixed") throw std::runtime_error("--grid-mode must be auto or fixed");
+  if (o.grid_mode_explicit && !nonlinear_workload(o.workload)) throw std::runtime_error("--grid-mode applies only to nonlinear workloads");
+  if (nonlinear_workload(o.workload) && o.grid_mode == "fixed" && (!o.blocks_explicit || o.blocks <= 0))
+    throw std::runtime_error("fixed nonlinear grid requires explicit positive --blocks");
   return o;
 }
 
@@ -341,6 +349,18 @@ __global__ void memory_kernel(const uint32_t* input, uint32_t* output, uint32_t*
 __global__ void control_kernel(uint32_t* sink, uint64_t iterations,
     const unsigned char* mask, bool filtered, unsigned long long* blocks_per_sm) {
   if (!admit(mask, filtered, blocks_per_sm)) return;
+  uint64_t tid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint32_t a = random_word(tid), b = a + 1U, c = a + 2U, d = a + 3U;
+  for (uint64_t i = 0; i < iterations; ++i) {
+    asm volatile("add.u32 %0, %0, %4;\n\txor.b32 %1, %1, %0;\n\tadd.u32 %2, %2, %1;\n\txor.b32 %3, %3, %2;"
+      : "+r"(a), "+r"(b), "+r"(c), "+r"(d) : "r"(uint32_t(i)));
+  }
+  sink[tid] = a ^ b ^ c ^ d;
+}
+
+// The nonlinear paired reference matches Q-derived launch geometry without
+// per-CTA SM-ID atomics. Ordinary control/tensor/memory admission is unchanged.
+__global__ void nonlinear_control_kernel(uint32_t* sink, uint64_t iterations) {
   uint64_t tid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   uint32_t a = random_word(tid), b = a + 1U, c = a + 2U, d = a + 3U;
   for (uint64_t i = 0; i < iterations; ++i) {
@@ -512,10 +532,26 @@ size_t checked_size(uint64_t n, uint64_t unit, const char* name) {
 }
 
 void experiment(Options o, const cudaDeviceProp& p) {
-  if (!o.blocks) o.blocks = 2 * p.multiProcessorCount;
-  if (o.blocks > 1000000) throw std::runtime_error("--blocks exceeds practical safety limit");
   if (o.threads > p.maxThreadsPerBlock) throw std::runtime_error("thread count exceeds this device limit");
   if (p.major < 7) throw std::runtime_error("benchmark requires compute capability >= 7.0");
+  const bool nonlinear = nonlinear_workload(o.workload);
+  const bool rowwise = o.workload == "rmsnorm" || o.workload == "softmax";
+  if (nonlinear) {
+    if (!o.working_set_bytes) o.working_set_bytes = uint64_t(1048576) * 4;
+    const uint64_t input_elements = o.working_set_bytes / 4;
+    if (!input_elements || (rowwise && input_elements % o.row_width))
+      throw std::runtime_error("nonlinear Q must be positive; rowwise Q must contain complete rows");
+    if (o.grid_mode == "auto") {
+      const uint64_t derived_blocks = rowwise ? input_elements / o.row_width : (input_elements + o.threads - 1) / o.threads;
+      if (derived_blocks > 1000000 || derived_blocks > uint64_t(p.maxGridSize[0]))
+        throw std::runtime_error("nonlinear auto grid exceeds practical/hardware block limit; use explicit fixed grid for grid-stride traversal");
+      if (o.blocks_explicit && uint64_t(o.blocks) != derived_blocks)
+        throw std::runtime_error("explicit --blocks must equal the Q-derived auto grid; use --grid-mode fixed for a block sweep");
+      o.blocks = int(derived_blocks);
+    }
+  } else if (!o.blocks) o.blocks = 2 * p.multiProcessorCount;
+  if (o.blocks <= 0 || o.blocks > 1000000 || o.blocks > p.maxGridSize[0])
+    throw std::runtime_error("--blocks must be positive within practical/hardware limit");
   const bool latency = o.workload == "l2_latency";
   const bool memory = o.workload == "l1" || o.workload == "l2" || latency || o.workload == "hbm";
   const bool simple_memory_read = memory && !latency && o.access == "read";
@@ -523,16 +559,13 @@ void experiment(Options o, const cudaDeviceProp& p) {
   const char* implementation_version = simple_memory_read ? "scalar_single_stream_read_v2" :
     memory && !latency ? "scalar_four_stream_write_copy_v1" : latency ? "dependent_pointer_chain_v1" :
     o.workload == "tensor" ? "wmma_register_reuse_v1" : o.workload == "gemm" ? "cublas_dense_gemm_v1" :
-    o.workload == "control" ? "integer_issue_loop_v1" : "fp32_complete_nonlinear_v1";
-  const bool nonlinear = nonlinear_workload(o.workload);
-  const bool rowwise = o.workload == "rmsnorm" || o.workload == "softmax";
+    o.workload == "control" ? "integer_issue_loop_v1" : "fp32_complete_nonlinear_q_grid_v2";
   // One scalar read replaces four loads per iteration. Keep the implicit read
   // payload/finite footprint comparable; explicit --iterations is literal.
   if (!o.iterations) o.iterations = o.workload == "gemm" || nonlinear ? 1 : simple_memory_read ? 4096 : 1024;
   if (!o.batch_launches) o.batch_launches = o.workload == "gemm" ? 1 : 16;
   if (!o.working_set_bytes) {
-    if (nonlinear) o.working_set_bytes = uint64_t(o.blocks) * (rowwise ? o.row_width : o.threads * 128) * 4;
-    else if (o.workload == "l1") o.working_set_bytes = uint64_t(o.blocks) * 16 * 1024;
+    if (o.workload == "l1") o.working_set_bytes = uint64_t(o.blocks) * 16 * 1024;
     else if (o.workload == "l2" || latency) o.working_set_bytes = std::max(uint64_t(4), uint64_t(p.l2CacheSize) / 2 / 4 * 4);
     else o.working_set_bytes = std::max(uint64_t(512) * 1024 * 1024, uint64_t(p.l2CacheSize) * 8);
   }
@@ -541,9 +574,9 @@ void experiment(Options o, const cudaDeviceProp& p) {
   const bool paired_context = o.paired_reference && o.workload != "control";
   const bool paired_reference = paired_context && !o.profile_region;
   uint64_t words = memory || nonlinear ? o.working_set_bytes / 4 : 1;
-  if (nonlinear && (!words || words % (uint64_t(o.blocks) * (rowwise ? o.row_width : 1))))
-    throw std::runtime_error("nonlinear footprint must contain equal complete block slices/rows");
-  if (nonlinear && ((long double)words * 8 + uint64_t(o.row_width) * 4 + lanes * 8 + 262144 > (long double)p.totalGlobalMem * 0.7))
+  const uint64_t sink_words = nonlinear ? 1 : lanes;
+  const uint64_t nonlinear_gamma_words = o.workload == "rmsnorm" ? uint64_t(o.row_width) : 1;
+  if (nonlinear && ((long double)words * 8 + nonlinear_gamma_words * 4 + sink_words * 4 + (paired_context ? lanes : 1) * 4 + 262144 > (long double)p.totalGlobalMem * 0.7))
     throw std::runtime_error("nonlinear input/output/gamma and reference allocations exceed 70% of device memory");
   if (memory && o.access != "read") {
     // x=(tid+k*lanes)*stride modulo words. A whole lanes*stride tile
@@ -572,7 +605,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
   Buffer<uint32_t> output(checked_size((memory && o.access != "read") || nonlinear ? words + offset_words : 1, sizeof(uint32_t), "output"));
   const uint64_t gamma_count = o.workload == "rmsnorm" ? o.row_width : 1;
   Buffer<uint32_t> gamma(checked_size(gamma_count, sizeof(uint32_t), "gamma"));
-  Buffer<uint32_t> sink(checked_size(lanes, sizeof(uint32_t), "sink"));
+  Buffer<uint32_t> sink(checked_size(sink_words, sizeof(uint32_t), "sink"));
   Buffer<__half> a(checked_size(gemm_a_count, sizeof(__half), "GEMM A"));
   Buffer<__half> b(checked_size(gemm_b_count, sizeof(__half), "GEMM B"));
   Buffer<float> c(checked_size(gemm_c_count, sizeof(float), "GEMM C"));
@@ -588,7 +621,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
   std::vector<unsigned char> mask_host(kSmSlots, o.sm_ids.empty() ? 1 : 0);
   for (unsigned id : o.sm_ids) mask_host[id] = 1;
   CUDA_CHECK(cudaMemcpy(mask.ptr, mask_host.data(), kSmSlots, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(sink.ptr, 0, size_t(lanes) * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMemset(sink.ptr, 0, size_t(sink_words) * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemset(c.ptr, 0, size_t(gemm_c_count) * sizeof(float)));
   CUDA_CHECK(cudaMemset(sm_blocks.ptr, 0, kSmSlots * sizeof(unsigned long long)));
   CUDA_CHECK(cudaMemset(sm_cycles.ptr, 0, kSmSlots * sizeof(unsigned long long)));
@@ -667,12 +700,11 @@ void experiment(Options o, const cudaDeviceProp& p) {
       latency_kernel<<<o.blocks, o.threads>>>(input.ptr + offset_words, sink.ptr, words, o.iterations, launch_nonce,
         mask.ptr, filtered, sm_blocks.ptr, sm_cycles.ptr, sm_loads.ptr);
     } else if (nonlinear) {
-      const uint64_t block_words = words / o.blocks;
-      if (o.workload == "exp") pointwise_nonlinear_kernel<0><<<o.blocks, o.threads>>>(input.ptr, output.ptr, block_words, o.iterations, mask.ptr, sm_blocks.ptr);
-      else if (o.workload == "tanh") pointwise_nonlinear_kernel<1><<<o.blocks, o.threads>>>(input.ptr, output.ptr, block_words, o.iterations, mask.ptr, sm_blocks.ptr);
-      else if (o.workload == "silu") pointwise_nonlinear_kernel<2><<<o.blocks, o.threads>>>(input.ptr, output.ptr, block_words, o.iterations, mask.ptr, sm_blocks.ptr);
-      else if (o.workload == "softmax") row_nonlinear_kernel<true><<<o.blocks, o.threads, o.threads * sizeof(float)>>>(input.ptr, gamma.ptr, output.ptr, block_words / o.row_width, o.row_width, o.iterations, mask.ptr, sm_blocks.ptr);
-      else row_nonlinear_kernel<false><<<o.blocks, o.threads, o.threads * sizeof(float)>>>(input.ptr, gamma.ptr, output.ptr, block_words / o.row_width, o.row_width, o.iterations, mask.ptr, sm_blocks.ptr);
+      if (o.workload == "exp") pointwise_nonlinear_kernel<0><<<o.blocks, o.threads>>>(input.ptr, output.ptr, words, o.iterations);
+      else if (o.workload == "tanh") pointwise_nonlinear_kernel<1><<<o.blocks, o.threads>>>(input.ptr, output.ptr, words, o.iterations);
+      else if (o.workload == "silu") pointwise_nonlinear_kernel<2><<<o.blocks, o.threads>>>(input.ptr, output.ptr, words, o.iterations);
+      else if (o.workload == "softmax") row_nonlinear_kernel<true><<<o.blocks, o.threads, o.threads * sizeof(float)>>>(input.ptr, gamma.ptr, output.ptr, words / o.row_width, o.row_width, o.iterations);
+      else row_nonlinear_kernel<false><<<o.blocks, o.threads, o.threads * sizeof(float)>>>(input.ptr, gamma.ptr, output.ptr, words / o.row_width, o.row_width, o.iterations);
     } else {
       const uint32_t* in = input.ptr + offset_words; uint32_t* out = output.ptr + (o.access == "read" ? 0 : offset_words);
       if (o.workload == "l1") simple_memory_kernel<true><<<o.blocks, o.threads>>>(in, sink.ptr, words, slice, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
@@ -709,11 +741,12 @@ void experiment(Options o, const cudaDeviceProp& p) {
   idle_phase("idle_pre", o.idle_seconds);
   std::vector<unsigned long long> epoch_observed(kSmSlots), reference_observed(kSmSlots);
   auto snapshot_admissions = [&]() -> uint64_t {
-    if (o.workload == "gemm") return 0;
+    if (o.workload == "gemm" || nonlinear) return 0;
     CUDA_CHECK(cudaMemcpy(epoch_observed.data(), sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     return std::accumulate(epoch_observed.begin(), epoch_observed.end(), uint64_t(0));
   };
   auto snapshot_reference_admissions = [&]() -> uint64_t {
+    if (nonlinear) return 0;
     CUDA_CHECK(cudaMemcpy(reference_observed.data(), reference_sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     return std::accumulate(reference_observed.begin(), reference_observed.end(), uint64_t(0));
   };
@@ -728,28 +761,45 @@ void experiment(Options o, const cudaDeviceProp& p) {
     // A timed warmup must not shift the first measured pointer-chain nonce.
     launch_nonce = o.seed;
     timing = run_phase("measure", o.seconds, o.fixed_batches, launch, snapshot_admissions, o.profile_region);
+    if (nonlinear) for (WorkEpoch& epoch : timing.epochs) {
+      epoch.admitted_blocks = epoch.batches * o.batch_launches * o.blocks;
+      // The no-op snapshot preserves host epoch boundaries; no CUDA counter
+      // transfer occurs. Its small host bookkeeping cost stays in the window.
+      epoch.counter_readback_ns = 0;
+    }
   };
   auto reference_launch = [&]() {
-    for (int i = 0; i < o.batch_launches; ++i)
-      control_kernel<<<o.blocks, o.threads>>>(reference_sink.ptr, o.iterations, mask.ptr, filtered, reference_sm_blocks.ptr);
+    for (int i = 0; i < o.batch_launches; ++i) {
+      if (nonlinear) nonlinear_control_kernel<<<o.blocks, o.threads>>>(reference_sink.ptr, o.iterations);
+      else control_kernel<<<o.blocks, o.threads>>>(reference_sink.ptr, o.iterations, mask.ptr, filtered, reference_sm_blocks.ptr);
+    }
   };
   auto reference_arm = [&]() {
     run_phase("warmup_reference", o.warmup_seconds, o.warmup_batches, reference_launch);
     CUDA_CHECK(cudaMemset(reference_sm_blocks.ptr, 0, kSmSlots * sizeof(unsigned long long)));
     reference_timing = run_phase("active_reference", o.seconds, o.fixed_batches, reference_launch, snapshot_reference_admissions);
+    if (nonlinear) for (WorkEpoch& epoch : reference_timing.epochs) {
+      epoch.admitted_blocks = epoch.batches * o.batch_launches * o.blocks;
+      epoch.counter_readback_ns = 0;
+    }
   };
   if (paired_reference && o.reference_order == "AB") reference_arm();
   treatment_arm();
   if (paired_reference && o.reference_order == "BA") reference_arm();
   idle_phase("idle_post", o.idle_seconds);
   if (paired_reference) {
-    CUDA_CHECK(cudaMemcpy(reference_observed.data(), reference_sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    uint64_t reference_admitted = std::accumulate(reference_observed.begin(), reference_observed.end(), uint64_t(0));
+    if (!nonlinear) CUDA_CHECK(cudaMemcpy(reference_observed.data(), reference_sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    uint64_t reference_admitted = nonlinear ? reference_timing.batches * o.batch_launches * o.blocks :
+      std::accumulate(reference_observed.begin(), reference_observed.end(), uint64_t(0));
     if (!reference_admitted) throw std::runtime_error("no active-reference blocks were admitted by the SM filter");
     std::vector<unsigned> missing_reference;
     for (unsigned id : o.sm_ids) if (!reference_observed[id]) missing_reference.push_back(id);
     std::cout << std::setprecision(17)
       << "{\"type\":\"active_reference_result\",\"workload\":\"control\",\"reference_kind\":\"issue_loop\""
+      << ",\"kernel_implementation_version\":" << quote(nonlinear ? "integer_issue_loop_no_admission_v2" : "integer_issue_loop_v1")
+      << ",\"block_completion_count_source\":" << quote(nonlinear ? "synchronized_completed_launches" : "per_sm_admission_atomics")
+      << ",\"active_sm_distribution_status\":" << quote(nonlinear ? "not_measured_nonlinear" : "admission_counter_observed")
+      << ",\"sm_distribution_scope\":" << quote(nonlinear ? "no per-CTA SMID/admission telemetry; synchronized launch completion does not measure physical SM coverage" : "completed CTA admissions observed by physical SM counter")
       << ",\"duration_s\":" << reference_timing.device_s << ",\"host_duration_s\":" << reference_timing.host_s
       << ",\"batches\":" << reference_timing.batches << ",\"batch_launches\":" << o.batch_launches
       << ",\"iterations_per_launch\":" << o.iterations << ",\"blocks\":" << o.blocks << ",\"threads\":" << o.threads
@@ -769,8 +819,9 @@ void experiment(Options o, const cudaDeviceProp& p) {
     if (!missing_reference.empty()) throw std::runtime_error("requested active-reference SM coverage incomplete; reject this trial");
   }
   std::vector<unsigned long long> observed(kSmSlots);
-  CUDA_CHECK(cudaMemcpy(observed.data(), sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-  unsigned long long admitted_blocks = 0; std::vector<unsigned> active;
+  if (!nonlinear) CUDA_CHECK(cudaMemcpy(observed.data(), sm_blocks.ptr, kSmSlots * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+  unsigned long long admitted_blocks = nonlinear ? timing.batches * o.batch_launches * o.blocks : 0;
+  std::vector<unsigned> active;
   for (unsigned id = 0; id < kSmSlots; ++id) if (observed[id]) { active.push_back(id); admitted_blocks += observed[id]; }
   if (o.workload != "gemm" && !admitted_blocks) throw std::runtime_error("no blocks were admitted by the SM filter");
   std::vector<unsigned> missing;
@@ -784,7 +835,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     logical_bytes = operations * 4 * (o.access == "copy" ? 2 : 1);
   }
   else if (nonlinear) {
-    operations = (long double)admitted_blocks * (words / o.blocks) * o.iterations;
+    operations = (long double)timing.batches * o.batch_launches * words * o.iterations;
     logical_bytes = operations * (rowwise ? 16 : 8);
   }
   uint64_t checksum = 0; bool finite = true;
@@ -850,7 +901,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     // This verifies a defined sink transfer, not full memory correctness or
     // cache residency. Write/copy still use the existing four-stream checksum.
   }
-  uint64_t allocated_bytes = (words + offset_words + ((memory && o.access != "read") || nonlinear ? words + offset_words : 1) + lanes + gamma_count) * 4
+  uint64_t allocated_bytes = (words + offset_words + ((memory && o.access != "read") || nonlinear ? words + offset_words : 1) + sink_words + gamma_count) * 4
     + (gemm_a_count + gemm_b_count) * 2 + gemm_c_count * 4 + kSmSlots * 25
     + (paired_context ? lanes * 4 + kSmSlots * sizeof(unsigned long long) : 12);
   uint64_t reachable_words = memory ? (latency ? words : (o.workload == "l1" ? slice / std::gcd(slice, o.stride_elements) * o.blocks : words / std::gcd(words, o.stride_elements))) : 0;
@@ -895,6 +946,13 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"mean_batch_duration_s\":" << timing.device_s / timing.batches
     << ",\"duration_scope\":\"CUDA event elapsed experiment window including gaps; not summed kernel busy time\""
     << ",\"kernel_implementation_version\":" << quote(implementation_version)
+    << ",\"grid_mode\":" << (nonlinear ? quote(o.grid_mode) : "null")
+    << ",\"input_elements\":" << (nonlinear ? std::to_string(words) : "null")
+    << ",\"elements_per_launch\":";
+  if (nonlinear) std::cout << (long double)words * o.iterations;
+  else std::cout << "null";
+  std::cout
+    << ",\"block_completion_count_source\":" << quote(nonlinear ? "synchronized_completed_launches" : o.workload == "gemm" ? "not_applicable" : "per_sm_admission_atomics")
     << ",\"memory_accesses_per_thread_iteration\":" << (memory && !latency ? std::to_string(memory_accesses_per_iteration) : "null")
     << ",\"memory_read_checksum_scope\":" << (simple_memory_read ? "\"sum32_of_all_reads_per_thread\"" : "null")
     << ",\"memory_read_validation\":";
@@ -944,14 +1002,14 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"row_width\":" << (rowwise ? o.row_width : 0)
     << ",\"elements\":" << (nonlinear ? operations : 0)
     << ",\"row_evaluations\":" << (rowwise ? operations / o.row_width : 0)
-    << ",\"math_implementation\":" << (nonlinear ? "\"cuda_fp32_standard_streaming_v1\"" : "null")
+    << ",\"math_implementation\":" << (nonlinear ? "\"cuda_fp32_q_grid_v2\"" : "null")
     << ",\"rms_epsilon\":" << (o.workload == "rmsnorm" ? "0.00001" : "null")
     << ",\"affine_gamma\":" << (o.workload == "rmsnorm" ? "true" : "false")
     << ",\"nonlinear_input_distribution\":" << (nonlinear ? quote(o.workload == "softmax" ? "deterministic uniform FP32 [96,104); stable max subtraction" : "deterministic uniform FP32 [-4,4)") : "null")
     << ",\"nonlinear_scope\":" << (nonlinear ? "\"complete FP32 function including global input/output and row reductions; repeated applications reload fixed input; no pure SFU or FLOP attribution\"" : "null")
     << ",\"numerical_validation\":{\"checked_values\":" << numerical.checked_values
     << ",\"max_absolute_error\":" << numerical.max_absolute_error << ",\"max_relative_error\":" << numerical.max_relative_error
-    << ",\"absolute_tolerance\":0.000002,\"relative_tolerance\":0.0002,\"scope\":\"CPU double reference on distributed block slices/complete rows before warmup and after measurement; Softmax row sums also checked; not exhaustive\"}"
+    << ",\"absolute_tolerance\":0.000002,\"relative_tolerance\":0.0002,\"scope\":\"CPU double reference on global first/middle/last and distributed elements or complete rows before warmup and after measurement; includes pointwise tail; Softmax row sums also checked; not exhaustive\"}"
     << ",\"sanity\":{\"finite_output_sample\":" << (finite ? "true" : "false")
     << ",\"memory_read_sample_matches_reference\":" << (simple_memory_read && read_checked_values ? (read_mismatched_values ? "false" : "true") : "null")
     << ",\"numerical_validation_passed\":" << (nonlinear ? (numerical.passed ? "true" : "false") : "null")
@@ -966,7 +1024,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     else if (o.workload == "gemm") epoch_operations = (long double)epoch.batches * o.batch_launches * o.iterations * 2 * o.gemm_m * o.gemm_n * o.gemm_k;
     else if (latency) { epoch_operations = (long double)epoch.admitted_blocks * o.iterations; epoch_bytes = epoch_operations * 4; }
     else if (memory) { epoch_operations = (long double)epoch.admitted_blocks * o.threads * o.iterations * memory_accesses_per_iteration; epoch_bytes = epoch_operations * 4 * (o.access == "copy" ? 2 : 1); }
-    else if (nonlinear) { epoch_operations = (long double)epoch.admitted_blocks * (words / o.blocks) * o.iterations; epoch_bytes = epoch_operations * (rowwise ? 16 : 8); }
+    else if (nonlinear) { epoch_operations = (long double)epoch.batches * o.batch_launches * words * o.iterations; epoch_bytes = epoch_operations * (rowwise ? 16 : 8); }
     std::cout << (i ? "," : "") << "{\"host_monotonic_start_ns\":" << epoch.start_ns
       << ",\"host_monotonic_end_ns\":" << epoch.end_ns
       << ",\"start_s\":" << double(epoch.start_ns) * 1e-9 << ",\"end_s\":" << double(epoch.end_ns) * 1e-9
@@ -983,14 +1041,16 @@ void experiment(Options o, const cudaDeviceProp& p) {
     nonlinear ? 0 : latency ? (long double)admitted_blocks * 4 : (long double)admitted_blocks * o.threads * 4;
   std::cout << "],\"auxiliary_work\":{\"logical_result_output_bytes\":" << output_payload_bytes
     << ",\"logical_tensor_operand_load_bytes\":" << (o.workload == "tensor" ? (long double)admitted_blocks * (o.threads / 32) * 1024 : 0)
-    << ",\"sm_admission_atomic_updates\":" << admitted_blocks
+    << ",\"sm_admission_atomic_updates\":" << (nonlinear ? 0 : admitted_blocks)
     << ",\"latency_telemetry_atomic_updates\":" << (latency ? (long double)admitted_blocks * 2 : 0)
-    << ",\"host_counter_readback_bytes\":" << (o.workload == "gemm" ? 0 : timing.epochs.size() * kSmSlots * sizeof(unsigned long long))
+    << ",\"host_counter_readback_bytes\":" << (o.workload == "gemm" || nonlinear ? 0 : timing.epochs.size() * kSmSlots * sizeof(unsigned long long))
     << ",\"scope\":\"issued auxiliary payload, not physical cache or DRAM bytes; excludes possible compiler spills; GEMM output payload is algorithmic minimum, internal kernels may differ\"}"
-    << ",\"epoch_scope\":\"approximately one second, exact completed batch counts; host windows include measured admission-counter readback overhead; no interpolated partial-batch counts\""
+    << ",\"epoch_scope\":" << quote(nonlinear ? "approximately one second, exact synchronized completed batch counts; nonlinear work/completed CTAs derived from Q and launch geometry without per-CTA telemetry or counter readback; no interpolated partial-batch counts" : "approximately one second, exact completed batch counts; host windows include measured admission-counter readback overhead; no interpolated partial-batch counts")
     << ",\"active_sm_ids\":[";
   for (size_t i = 0; i < active.size(); ++i) std::cout << (i ? "," : "") << active[i];
-  std::cout << "],\"missing_requested_sm_ids\":[";
+  std::cout << "],\"active_sm_distribution_status\":" << quote(nonlinear ? "not_measured_nonlinear" : o.workload == "gemm" ? "not_measured_gemm" : "admission_counter_observed")
+    << ",\"sm_distribution_scope\":" << quote(nonlinear ? "no per-CTA SMID/admission telemetry for nonlinear treatment or paired control; synchronized launch completion proves grid completion, not physical SM coverage" : "admission counter observes completed CTAs by physical SM; not concurrent residency or full-device utilization")
+    << ",\"missing_requested_sm_ids\":[";
   for (size_t i = 0; i < missing.size(); ++i) std::cout << (i ? "," : "") << missing[i];
   std::cout << "],\"allocated_sm_working_set\":{\"meaning\":\"per-block L1 slice times mean dispatched blocks per measured kernel launch; not concurrent residency\",\"bytes_per_sm\":{";
   if (o.workload == "l1")

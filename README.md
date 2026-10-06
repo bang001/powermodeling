@@ -90,6 +90,8 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 
 `element`는 **완료한 출력 원소 1개**다. 행 너비가 N이면 `pJ/row = N × pJ/element`이며 RMSNorm·Softmax의 reduction 비용도 포함한다. 이 workload의 `operations`와 `*_pj_per_op` 별칭도 출력 원소를 세며 FLOP나 SFU instruction 수를 뜻하지 않는다. 입력을 반복 처리한 횟수도 분모에 포함한다. `working_set_bytes`는 입력 버퍼 크기이고, 같은 크기의 출력 버퍼와 RMSNorm의 gamma 벡터는 별도다. 측정값에는 메모리 접근·reduction·launch 비용이 포함되므로 함수만의 물리 회로 에너지로 해석하지 않는다.
 
+기본 `grid_mode: "auto"`는 **Q = working_set_bytes / 4**를 기준으로 EXP·TANH·SiLU에 `ceil(Q/threads)`개 블록, RMSNorm·Softmax에 `Q/row_width`개 블록(한 행/CTA)을 실행한다. 기존 2/4×SM 고정 grid는 Q를 늘려도 동시 실행 후보 블록 수가 늘지 않는 제한이 있었다. 새 방식은 이 제한을 제거하며, 처리량 포화 여부는 Q sweep과 profiler로 따로 평가한다. `grid_mode: "fixed"`와 명시적 `blocks`는 제한된 grid를 비교하는 진단용이다. 이전 설정 파일에 `blocks`가 있으면 제거하거나 `fixed`를 지정해야 한다.
+
 ### 실행·수치·센서 점검
 
 설치와 빌드를 마친 뒤 사용할 실행 파일을 선택한다. A100 + CUDA 13.0이면 첫 줄을 `export POWERBENCH=build-a100-cuda13/powerbench`로 바꾼다. 아래 `--plots`에는 matplotlib가 필요하므로 plots 의존성을 설치한다.
@@ -111,7 +113,9 @@ Smoke는 5개 함수 × 4회 반복 = **20 trials, 최소 약 15분**이다. 준
 
 ### 고정 클럭 sweep과 NCU 검증
 
-전체 설정은 blocks 2/4×SM, threads 128/256, 작은/큰 입력 footprint를 비교한다. RMSNorm·Softmax는 행 너비 128/1024/4096도 비교한다. 기본 graphics 범위는 **900 MHz 이상·90 MHz 간격**이며 지원되는 exact 1110 MHz와 advertised factory-default 고정 pair, 현재 정책 reference를 포함한다. 간격은 설정 파일의 `clock_sweep.graphics_step_mhz`를 60·120 MHz 등으로 바꿀 수 있다. `plan`이 보여 주는 trial 수·최소 예상 시간을 확인한 뒤 전용 GPU에서 실행한다.
+전체 설정은 **Q = 2²⁴/2²⁵/2²⁶ 원소(입력 64/128/256 MiB), threads 128/256/512**를 비교한다. RMSNorm·Softmax는 행 너비 128/1024/4096도 비교한다. 기본 graphics 범위는 **900 MHz 이상·90 MHz 간격**이며 지원되는 exact 1110 MHz와 advertised factory-default 고정 pair, 현재 정책 reference를 포함한다. 간격은 설정 파일의 `clock_sweep.graphics_step_mhz`를 60·120 MHz 등으로 바꿀 수 있다. `plan`이 보여 주는 trial 수·최소 예상 시간을 확인한 뒤 전용 GPU에서 실행한다.
+
+현재 전체 설정은 clock 조건 하나당 81개 조건 × 4회 반복으로 **최소 4.05시간**이다(pointwise 1.35시간, rowwise 2.70시간). GPU별 지원 clock 수를 곱하고 준비·overrun·별도 NCU 시간을 추가해야 한다. GPU 모델명만으로 전체 시간을 확정할 수 없다.
 
 ```bash
 python -m powermodeling plan --config configs/nonlinear.json \
@@ -140,6 +144,8 @@ python -m powermodeling analyze --input results/nonlinear-validated \
 | `throughput_elements_s`, `throughput_rows_s` | 같은 에너지 적분 구간에서 완료한 원소/초, 행/초 |
 
 `results/nonlinear-report/evaluation.html`을 열어 GPU·함수·입력 footprint·행 너비·에너지 기준을 선택한다. 클럭별 Gelement/s와 pJ/element, 처리량 대비 에너지, 실행 geometry 응답, 반복 신뢰구간, factory-default·1110 MHz 대비를 확인할 수 있다. 같은 폴더에 `evaluation.json`·`evaluation.csv`·`summary.json`·`trials.csv`와 `--plots`로 생성한 PNG/SVG가 저장된다. GPU·CUDA 버전·함수·footprint·행 너비가 다른 결과는 별도 조건으로 비교한다.
+
+Q scaling 그림·표는 같은 clock·함수·행 너비·threads에서 Q에 따른 처리량과 단가를 비교한다. 최소 3개 Q의 큰 입력 구간에서 처리량이 안정되는지 확인하며, Q별 에너지 후보와 반복 통계는 따로 유지한다. Q 변화에는 cache와 launch 비용의 영향도 있으므로 `observed_input_size_plateau`를 SFU 하드웨어 포화로 해석하지 않는다.
 
 전체·idle 증가분·paired 대비는 각각 평가한다. 후보는 측정 품질·정확한 카운트·NCU·반복 정밀도·실행 geometry 조건을 통과하고 관측 최고 처리량의 기본 95% 이상을 유지해야 한다. 계획 누락이나 plateau 근거 부족이 있으면 잠정 후보로 표시하며, 음의 차감값은 효율 최적점으로 선택하지 않는다. 실제 pJ 값은 GPU에서 실행해야 얻을 수 있다.
 

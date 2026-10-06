@@ -58,14 +58,15 @@ def nonlinear_evidence(record):
     record["provenance"] = {"benchmark_sha256": "a" * 64}
     evidence["workload"] = workload
     profile = copy.deepcopy(record["benchmark"])
-    per_launch = profile["working_set_bytes"] // 4
-    profile.update(kernel_launches=1, admitted_blocks=profile["blocks"],
+    per_launch = profile["working_set_bytes"] // 4 * profile["iterations_per_launch"]
+    profile.update(kernel_launches=1, admitted_blocks=profile["blocks"], batches=1, batch_launches=1,
                    elements=per_launch, operations=per_launch,
                    logical_bytes=per_launch * logical_bytes_per_element(workload),
                    row_evaluations=per_launch / profile["row_width"] if profile["row_width"] else 0,
                    profile_region=True)
     profile["measure_epochs"] = [{"start_s": 0, "end_s": .1, "counts_exact": True,
-                                   **{key: profile[key] for key in ("elements", "operations", "logical_bytes", "row_evaluations")}}]
+                                   **{key: profile[key] for key in ("elements", "operations", "logical_bytes", "row_evaluations",
+                                                                   "kernel_launches", "admitted_blocks", "batches")}}]
     evidence["profile_benchmark"] = profile
     parameters = {k: v for k, v in record["config"].items()
                   if k not in ("gpu_uuid", "graphics_clock_mhz", "memory_clock_mhz", "repeat", "stride_bytes")}
@@ -257,7 +258,7 @@ class NonlinearGpuTests(unittest.TestCase):
             for width in ((1, 129, 1024) if workload in ROW_WORKLOADS else (131,)):
                 with self.subTest(workload=workload, width=width):
                     command = [os.environ.get("POWERBENCH", "build/powerbench"), "--workload", workload,
-                               "--blocks", "2", "--threads", "96", "--iterations", "2",
+                               "--grid-mode", "fixed", "--blocks", "2", "--threads", "96", "--iterations", "2",
                                "--working-set-bytes", str(2 * width * 3 * 4),
                                "--seconds", "0.1", "--warmup-seconds", "0", "--idle-seconds", "0",
                                "--batch-launches", "1", "--fixed-batches", "1"]

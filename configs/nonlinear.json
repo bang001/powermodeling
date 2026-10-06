@@ -7,27 +7,26 @@
   "sample_interval_s": 0.05,
   "paired_reference": true,
   "randomization_seed": 2026,
-  "description": "Complete FP32 nonlinear pJ/element sweep; compare each function, row width and footprint separately. Inspect plan runtime before execution.",
+  "description": "Q-driven complete FP32 nonlinear sweep: pointwise ceil(Q/threads), rowwise one CTA per row. Compare Q=16M/32M/64M elements and block sizes independently. Q scaling is empirical throughput evidence, not proof of SFU saturation; keep each Q and row width as a separate energy stratum.",
   "study_design": "energy_sweep",
   "experiments": [
     {
       "workload": "exp",
       "stage": "pointwise",
       "parameters": {
-        "iterations": 1
+        "iterations": 1,
+        "grid_mode": "auto"
       },
       "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4"
-        ],
         "threads": [
           128,
-          256
+          256,
+          512
         ],
         "working_set_bytes": [
-          "sm_count*4*4096*4",
-          "sm_count*4*4096*4*32"
+          67108864,
+          134217728,
+          268435456
         ]
       }
     },
@@ -35,20 +34,19 @@
       "workload": "tanh",
       "stage": "pointwise",
       "parameters": {
-        "iterations": 1
+        "iterations": 1,
+        "grid_mode": "auto"
       },
       "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4"
-        ],
         "threads": [
           128,
-          256
+          256,
+          512
         ],
         "working_set_bytes": [
-          "sm_count*4*4096*4",
-          "sm_count*4*4096*4*32"
+          67108864,
+          134217728,
+          268435456
         ]
       }
     },
@@ -56,20 +54,19 @@
       "workload": "silu",
       "stage": "pointwise",
       "parameters": {
-        "iterations": 1
+        "iterations": 1,
+        "grid_mode": "auto"
       },
       "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4"
-        ],
         "threads": [
           128,
-          256
+          256,
+          512
         ],
         "working_set_bytes": [
-          "sm_count*4*4096*4",
-          "sm_count*4*4096*4*32"
+          67108864,
+          134217728,
+          268435456
         ]
       }
     },
@@ -77,20 +74,19 @@
       "workload": "rmsnorm",
       "stage": "rowwise",
       "parameters": {
-        "iterations": 1
+        "iterations": 1,
+        "grid_mode": "auto"
       },
       "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4"
-        ],
         "threads": [
           128,
-          256
+          256,
+          512
         ],
         "working_set_bytes": [
-          "sm_count*4*4096*4",
-          "sm_count*4*4096*4*32"
+          67108864,
+          134217728,
+          268435456
         ],
         "row_width": [
           128,
@@ -103,20 +99,19 @@
       "workload": "softmax",
       "stage": "rowwise",
       "parameters": {
-        "iterations": 1
+        "iterations": 1,
+        "grid_mode": "auto"
       },
       "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4"
-        ],
         "threads": [
           128,
-          256
+          256,
+          512
         ],
         "working_set_bytes": [
-          "sm_count*4*4096*4",
-          "sm_count*4*4096*4*32"
+          67108864,
+          134217728,
+          268435456
         ],
         "row_width": [
           128,

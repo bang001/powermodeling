@@ -16,7 +16,7 @@ def write_plots(summary, output_dir):
     import matplotlib.pyplot as plt
     import numpy as np
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
-    files = {}
+    files, exported_input_curves = {}, set()
     components = (summary.get("evaluation") or {}).get("components", [])
     counts = {c["stratum"]["workload"]: sum(x["stratum"]["workload"] == c["stratum"]["workload"] for x in components) for c in components}
     for c in components:
@@ -26,6 +26,13 @@ def write_plots(summary, output_dir):
         if workload in ("control", "l2_latency"):
             _diagnostic(c, name, output, files, plt, np)
             continue
+        for curve in (c.get("input_scaling") or {}).get("curves", []):
+            if curve["curve_id"] in exported_input_curves:
+                continue
+            exported_input_curves.add(curve["curve_id"])
+            for objective in OBJECTIVES:
+                if any(p["energies"][objective] is not None for p in curve["rows"]):
+                    _input_size_figure(c, curve, objective, summary["selection_policy"]["min_repeats"], output, files, plt)
         for objective in OBJECTIVES:
             points = [p for p in c["points"] if p["valid_repeats"] >= summary["selection_policy"]["min_repeats"]
                       and p["rate"] is not None and p["energies"][objective] is not None and p["objective_eligible"][objective]]
@@ -66,6 +73,50 @@ def _scatter(ax, points, x, y, ci=None):
     ax.grid(alpha=.2)
 
 
+def _input_size_figure(component, curve, objective, minimum_repeats, output, files, plt):
+    """Export one matched Q curve, without pooling energies across input sizes."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.2), layout="constrained")
+    units = component["units"]
+    points = [{**p, "anchor_tags": []} for p in curve["rows"]]
+    x = lambda p: p["input_elements"] / 1e6
+    rate = lambda p: p["rate"] / units["rate_scale"] if p["rate"] is not None else None
+    energy = lambda p: p["energies"][objective]
+    rci = lambda p: [v / units["rate_scale"] for v in p["rate_ci95"]] if p["rate_ci95"] else None
+    eci = lambda p: p["energy_ci95"][objective]
+    _scatter(axes[0], points, x, rate, rci)
+    _scatter(axes[1], points, x, energy, eci)
+    observed = [p["rate"] for p in points if p["valid_repeats"] >= minimum_repeats and p["rate"] is not None and p["rate"] > 0]
+    if observed:
+        axes[0].axhline(max(observed) / units["rate_scale"], linestyle=":", linewidth=1,
+                       color="#68758c", label="all-valid curve peak")
+    for ax, y, ylabel, title in ((axes[0], rate, units["rate_unit"], "Observed input-size throughput"),
+                                (axes[1], energy, units["energy_unit"], "Energy remains separate at each Q")):
+        rejected = [p for p in points if not p["eligible"][objective] and y(p) is not None]
+        if rejected:
+            ax.scatter([x(p) for p in rejected], [y(p) for p in rejected], s=110,
+                       facecolors="none", edgecolors="#17263c", label="evidence ineligible")
+        if len(points) <= 12:
+            q_min, q_max = min(p["input_elements"] for p in points), max(p["input_elements"] for p in points)
+            for point in points:
+                if y(point) is not None:
+                    ax.annotate(point["group_id"][:8] + f" / B={point['blocks']}", (x(point), y(point)),
+                                xytext=(0, 8), textcoords="offset points", fontsize=7,
+                                ha="left" if point["input_elements"] == q_min else "right" if point["input_elements"] == q_max else "center")
+        ax.set(xlabel="Input Q (million elements)", ylabel=ylabel, title=title)
+        if ax.collections:
+            ax.legend(fontsize=7)
+    first = points[0]
+    signature = curve["signature"]
+    width = signature["nonlinear_contract"].get("row_width")
+    iterations = signature["config"].get("iterations")
+    fig.suptitle(f"{component['stratum']['workload']} Q curve {curve['curve_id']}: {objective.replace('_', ' ')}\n"
+                 f"{component.get('gpu_name')} / {component['stratum']['gpu_uuid']}; "
+                 f"SM/memory={first['requested_graphics_mhz']}/{first['requested_memory_mhz']} MHz\n"
+                 f"threads={first['threads']}; iterations={iterations}; row_width={width}" + (" (pointwise)" if width == 0 else "") + "; grid=auto\n"
+                 "Repeat medians / bootstrap 95% intervals; matched definition and iterations. Size stability does not prove hardware saturation.", fontsize=9)
+    _save(fig, component["stratum"]["workload"] + "-q-curve-" + curve["curve_id"] + "-" + objective + "-input-scaling", output, files, plt)
+
+
 def _energy_figure(c, points, objective, name, output, files, plt, np):
     fig, axes = plt.subplots(2, 3, figsize=(17, 9), layout="constrained")
     u = c["units"]; rate = lambda p: p["rate"] / u["rate_scale"]
@@ -96,7 +147,9 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
         (axes[0, 0], "Requested SM / graphics MHz", u["rate_unit"], "Sustained throughput; every geometry"),
         (axes[0, 1], "Requested SM / graphics MHz", u["energy_unit"], "Energy and repeat uncertainty"),
         (axes[0, 2], u["rate_unit"], u["energy_unit"], "Measured energy / throughput tradeoff"),
-        (axes[1, 0], "GEMM m × n × k" if c["stratum"]["workload"] == "gemm" else "blocks × threads (× accumulators for Tensor)", u["rate_unit"], "Per-clock resource / size response; colour = SM MHz")):
+        (axes[1, 0], "GEMM m × n × k" if c["stratum"]["workload"] == "gemm" else
+         "Launched grid threads; not simultaneous residency" if c["stratum"]["experiment_contract"].get("grid_mode") == "auto" else
+         "blocks × threads (× accumulators for Tensor)", u["rate_unit"], "Per-clock resource / size response; colour = SM MHz")):
         ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
         if ax.collections: ax.legend(fontsize=7, ncol=2 if ax is axes[1, 0] else 1)
     graphics = sorted({k["graphics_mhz"] for k in c["clocks"]})

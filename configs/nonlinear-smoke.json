@@ -7,7 +7,7 @@
   "sample_interval_s": 0.05,
   "paired_reference": true,
   "randomization_seed": 2026,
-  "description": "FP32 nonlinear functional/telemetry smoke; no fixed-clock optimum claim.",
+  "description": "Q-driven FP32 nonlinear functional/telemetry smoke with Q=1048576 input elements; no fixed-clock optimum or saturation claim.",
   "study_design": "diagnostic",
   "clock_pairs": [
     {
@@ -20,52 +20,52 @@
       "workload": "exp",
       "stage": "nonlinear-smoke",
       "parameters": {
-        "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "sm_count*4*4096*4",
-        "iterations": 1
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "grid_mode": "auto"
       }
     },
     {
       "workload": "tanh",
       "stage": "nonlinear-smoke",
       "parameters": {
-        "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "sm_count*4*4096*4",
-        "iterations": 1
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "grid_mode": "auto"
       }
     },
     {
       "workload": "silu",
       "stage": "nonlinear-smoke",
       "parameters": {
-        "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "sm_count*4*4096*4",
-        "iterations": 1
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "grid_mode": "auto"
       }
     },
     {
       "workload": "rmsnorm",
       "stage": "nonlinear-smoke",
       "parameters": {
-        "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "sm_count*4*4096*4",
+        "working_set_bytes": 4194304,
         "iterations": 1,
-        "row_width": 1024
+        "row_width": 1024,
+        "grid_mode": "auto"
       }
     },
     {
       "workload": "softmax",
       "stage": "nonlinear-smoke",
       "parameters": {
-        "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "sm_count*4*4096*4",
+        "working_set_bytes": 4194304,
         "iterations": 1,
-        "row_width": 1024
+        "row_width": 1024,
+        "grid_mode": "auto"
       }
     }
   ]

@@ -1,7 +1,7 @@
 # 비선형 함수의 에너지 실험
 
 EXP, TANH, SiLU, RMSNorm, Softmax를 `powerbench`의 독립 workload로 측정한다.
-첫 구현은 **FP32 입력·출력, CUDA 표준 math, 실제 global load/store를 포함한
+현재 구현은 **FP32 입력·출력, CUDA 표준 math, 실제 global load/store를 포함한
 완전한 함수 적용**이다. `--use_fast_math`는 사용하지 않는다. FP16/BF16,
 근사 math, register-only SFU 반복, framework/vendor fused kernel의 비용은
 다른 실험이며 이 결과로 대신하지 않는다.
@@ -31,12 +31,31 @@ default/1110 개선 판정을 적용하며 `evaluation.html`에서 함수/footpr
 
 ## 커널·정확성·카운트
 
-각 CTA에 동일한 크기의 겹치지 않는 입력·출력 slice를 할당한다. Pointwise
-함수는 coalesced thread loop로 slice 전체를 처리하고, rowwise 함수는 CTA
-하나가 맡은 행들을 순서대로 처리한다. 행 너비는 1..65536이고 thread 수보다
+`Q = working_set_bytes / 4`를 입력 원소 수로 정의한다. 기본 `grid_mode: "auto"`는
+pointwise EXP·TANH·SiLU에 `ceil(Q/threads)`개 CTA를 실행한다. 각 thread가
+전역 인덱스의 원소를 처리하고 마지막 CTA의 Q 밖 thread는 쓰지 않는다.
+RMSNorm·Softmax는 `Q/row_width`개 CTA를 실행하며 CTA 하나가 행 하나의
+reduction과 출력을 담당한다. Q는 행 너비의 배수여야 한다. 행 너비는 1..65536이고 thread 수보다
 크거나 warp 크기의 배수가 아니어도 된다. reduction은 96 같은 non-power-of-two
-thread 수를 지원한다. 전체 출력의 수치 검증을 위해 nonlinear workload에는
+thread 수를 지원한다. 전체 Q의 처리와 출력 표본 검증을 위해 nonlinear workload에는
 SM admission filter, stride 변경, 주소 offset을 허용하지 않는다.
+
+Q를 생략하면 GPU SM 수·threads와 무관하게 1,048,576 원소(입력 4 MiB)다.
+자동 grid와 다른 `blocks`를 함께 지정하면 오류다. 계산된 grid가 1,000,000개
+CTA 또는 장치 grid 한도를 넘으면 오류를 내며 몰래 잘라내지 않는다.
+`grid_mode: "fixed"`는 명시적 양의 `blocks`를 요구하고 pointwise grid-stride,
+rowwise row-stride로 Q 전체를 처리한다. Q가 blocks의 배수일 필요는 없다.
+
+이전 v1의 2/4×SM grid도 Q 전체를 처리했지만, Q가 커질수록 CTA 내부의 순차
+반복만 길어졌다. 제한된 grid로는 큰 Q에서의 병렬성 확대를 평가할 수 없었다.
+다만 4 blocks/SM은 실제 residency 지정이 아니며 일부 SM만 사용했다는 뜻도
+아니다. Q 기반 grid 역시 자동 포화를 보장하지 않아 별도 성능 검증이 필요하다.
+
+예를 들어 132 SM 장치의 `4×SM`은 528 CTA다. Q=2²⁴, threads=256인
+pointwise auto grid는 65,536 CTA를 준비한다. 실제 동시 residency는 registers,
+threads, 장치 한도에 따라 결정되지만, scheduler가 처리할 CTA 수가 Q와 함께
+늘어난다는 차이가 있다. 작은 고정 grid가 낮은 처리량과 높은 pJ/element의 원인이
+될 수는 있어도, 실측 전력·완료 처리량 없이 에너지 차이의 크기나 원인을 확정할 수 없다.
 
 `working_set_bytes`는 **입력 전체 크기**이고 출력은 같은 크기의 별도 버퍼다.
 RMSNorm은 너비 N의 FP32 gamma 벡터도 할당한다. 입력은 seed로 정해진 FP32
@@ -44,22 +63,33 @@ RMSNorm은 너비 N의 FP32 gamma 벡터도 할당한다. 입력은 seed로 정�
 max 차감 없이 exp를 적용하면 overflow하는 경우도 검증한다. 안정화 후 exp의
 입력 범위는 [-8,0]이다. 실제 분포와 math 구현은 result에 기록한다.
 
-`iterations`마다 같은 입력에 **함수 전체를 다시 적용**한다. volatile inline
-global load/store로 compiler가 반복을 없애거나 입력을 loop 밖으로 이동하지
-못하게 한다. 원소를 반복 처리한 횟수도 분모에 포함되며, 고유 원소 수와는
+`iterations`마다 같은 입력에 **함수 전체를 다시 적용**한다. inline PTX global
+load/store와 출력의 데이터 의존성을 사용하며, 컴파일된 코드에서도 반복과
+load/store가 유지되는지 확인해야 한다. 원소를 반복 처리한 횟수도 분모에 포함되며, 고유 원소 수와는
 다르다. 작은 footprint는 cache에 머물 수 있다. payload는 실제 DRAM traffic과
 다르므로 메모리 계층이나 함수만의 물리 에너지로 단정하지 않는다.
 
-완료 admission 수 × slice 원소 수 × iterations로 각 work epoch의 `elements`
-와 `operations`를 계산한다. power 적분과 **같은 완전한 epoch**의 원소 수만
+V2는 **동기화로 완료를 확인한 kernel launches × Q × iterations**로 각 work
+epoch의 `elements`와 `operations`를 계산한다. 마지막 CTA의 padding을
+원소 수에 더하지 않는다. 완료 CTA 수는 launches × blocks로 계산하고
+`block_completion_count_source: "synchronized_completed_launches"`로 기록한다.
+Nonlinear treatment와 paired control의 CTA별 SM admission atomic을 제거하여
+대규모 grid에서 계측용 atomic 경합이 새 병목이 되는 것을 피한다. 실제 SM별
+분포는 측정하지 않았으므로 unknown이며, 균등 분포로 만들어 기록하지 않는다.
+Power 적분과 **같은 완전한 epoch**의 원소 수만
 에너지 분모로 사용한다. 잘못된 element/row/byte count, 부분 행, 수치 검증
 실패, 부정확한 epoch는 분석에서 invalid 처리하고 pJ/element를 내지 않는다.
 
-실행 전과 측정 후, 최대 8개 CTA에 분산한 입력/출력을 CPU double 기준값과
-비교한다. Pointwise는 slice의 처음·중간·끝, rowwise는 처음·마지막 행 전체를
+실행 전과 측정 후, 입력/출력을 CPU double 기준값과
+비교한다. Pointwise는 Q의 처음·중간·끝과 경계 표본, rowwise는 분산한 행 전체를
 검사한다. 허용 오차는 `2e-6 + 2e-4 * abs(reference)`이고 Softmax의 행 합계도
 1과 비교한다. 검사 횟수·오차·pass 여부를 기록하며 실패한 worker는 nonzero로
 종료한다. 이는 대표 표본 검증이며 전체 출력이나 모든 입력 범위의 증명이 아니다.
+
+V2는 `math_implementation: "cuda_fp32_q_grid_v2"`,
+`kernel_implementation_version: "fp32_complete_nonlinear_q_grid_v2"`다.
+기존 v1 기록은 원래 admission × slice 계약으로 읽고 V2와 합치지 않는다.
+`fixed`는 새 커널의 제한 grid 진단이며 v1의 배치·계측을 그대로 재현하지 않는다.
 
 ## 에너지와 비교 설계
 
@@ -80,21 +110,43 @@ Signed contrast는 보존하지만 음수 대비를 효율 최적점으로 선�
 AB/BA를 2회씩 실행한다. 최소 시간은 15분이며 준비·overrun·프로파일링은 제외한다.
 무설정 clock smoke는 기능 점검이고 고정 clock 최적점을 확정하지 않는다.
 
-`configs/nonlinear.json`은 pointwise와 rowwise stage, blocks 2/4×SM, threads
-128/256, 작은/큰 입력 footprint, 행 너비 128/1024/4096을 제공한다. 해당 장치의
+`configs/nonlinear.json`은 pointwise와 rowwise stage, auto grid, threads
+128/256/512, Q=2²⁴/2²⁵/2²⁶(입력 64/128/256 MiB), 행 너비
+128/1024/4096을 제공한다. 해당 장치의
 모든 지원 memory domain의 900 MHz 이상 graphics grid(기본 90 MHz, 60/120 등 선택), advertised default와 지원되는
-exact 1110 MHz 및 incoming-policy reference를 교차한다. 작은 footprint와 큰
-footprint의 의미는 실제 L2 크기·traffic을 확인해 판단한다. 기본 값은 출발점이다.
-큰 footprint의 CTA별 slice가 길면 batch overrun이 생길 수 있으므로 batch duration,
+exact 1110 MHz 및 incoming-policy reference를 교차한다. 입력 크기의 의미는
+실제 L2 크기·traffic을 확인해 판단한다. 기본 값은 출발점이다.
+큰 Q에서 batch overrun이 생길 수 있으므로 batch duration,
 epoch 길이와 power sample alignment를 확인한다.
 
+Clock 조건 하나당 81개 조건 × 4 repeats × 45초 = 최소 **4.05시간**이다.
+Pointwise만 1.35시간, rowwise만 2.70시간이다. GPU별 실제 지원 clock 조건 수와
+준비·overrun·별도 NCU 시간을 반영해야 하므로 plan의 예상 시간을 확인한다.
+
 비교 층은 GPU UUID·binary·clock·정밀도·math 구현·입력 분포·footprint·행 너비·
-RMSNorm 정의를 분리한다. 반복 median과 bootstrap CI, 고정 clock별 실제 최고
+RMSNorm 정의·grid mode·구현 버전을 분리한다. 반복 median과 bootstrap CI, 고정 clock별 실제 최고
 처리량과 비교한 조건, 주변 측정점은 기존 summary 형식을 따른다. 검증된 두 개
 이상의 실행 geometry 없이 포화/최적점을 확정하지 않는다. seed/크기만 바꾼
 조건은 독립적인 실행 resource geometry로 세지 않는다.
-그래프도 nonlinear 정의·행 너비·입력 footprint별로 나누고 pJ/element와
-Gelement/s 축을 사용한다. 서로 다른 크기를 같은 곡선으로 해석하지 않는다.
+주 에너지 그래프와 후보는 정의·행 너비·Q별로 나누고 pJ/element와 Gelement/s를
+사용한다. 별도 Q-scaling 진단에서는 같은 threads·clock·구현·함수·행 너비의
+Q만 바꿔 비교한다. 가장 큰 유효 Q 3개 모두 경로·count·반복·CI·objective 요건을
+통과하고, 전체 유효 Q 곡선의 관측 peak 95% 이상이며 처리량 폭이 5% 이내일 때
+`observed_input_size_plateau`로 표시한다. 선택 후보의 Q도 이 구간에 있어야 한다.
+미검증인 빠른 조건을 peak 분모에서 빼거나 큰 Q의 실패를 숨겨 plateau를 만들지 않는다.
+이 근거는 같은 Q 안의 최소 2개 geometry·클럭별/전체 95% 기준을 대체하지 않는다.
+
+Auto pointwise에서는 blocks×threads가 거의 Q이므로 threads를 바꿔도 자원 축이
+증가하지 않는다. 따라서 예전 resource plateau를 그대로 적용하지 않고 후보별
+Q-scaling 근거를 사용한다. 큰 Q는 cache 사용과 launch 비용 비중도 바꾸므로
+처리량 안정이 곧 SFU 하드웨어 포화라는 뜻은 아니다. NCU의 active warps,
+DRAM throughput과 지원되는 SFU activity counter를 함께 확인한다. Counter가
+없으면 unknown으로 남긴다. `fixed`와 v1은 기존 resource plateau 판정을 유지한다.
+
+`evaluation.html`의 Q scaling 그림·표와 `evaluation.json`의 `input_scaling`에서
+Q, blocks, threads, 완료 count 출처, 처리량/에너지 CI와 제외 이유를 확인한다.
+`--plots`는 같은 곡선을 중복 없이
+`<workload>-q-curve-<curve_id>-<objective>-input-scaling.png/.svg`로 저장한다.
 
 ## 실행
 
@@ -130,6 +182,7 @@ export POWERBENCH=build-a100-cuda13/powerbench
 ```bash
 # 짧은 실제 CUDA 수치·카운트 검증; 에너지를 측정하는 테스트는 아님
 POWERBENCH_GPU_TESTS=1 python -m unittest discover -s tests -p test_nonlinear.py -v
+POWERBENCH_GPU_TESTS=1 python -m unittest discover -s tests -p test_nonlinear_q_grid.py -v
 
 # 기존 runner의 NVML 센서·독점 사용·clock 복원 검사를 그대로 사용
 python -m powermodeling discover --device 0 --bench "$POWERBENCH" --output results/nonlinear-discovery.json
@@ -163,18 +216,22 @@ count·수치 검증·profile/energy parameter binding을 확인한다. 필요�
 CPU 테스트는 pJ/element·pJ/row 단위, epoch/count 오류 차단, 계획/CLI/그래프,
 NCU 근거의 수치 판정과 행 너비 binding을 검증한다. GPU opt-in 테스트는 실제
 worker에서 모든 함수와 너비 1·129·1024, 96 threads, 반복 2회를 검사한다.
-GPU가 없는 개발 환경에서는 이 테스트를 명시적으로 skip한다.
+Q-grid 테스트는 Q=1, threads−1, threads, threads+1 등의 tail, fixed grid의
+남는 행, launch/epoch count, padding 분모 거부도 검사한다.
+GPU가 없는 개발 환경에서는 실제 GPU 테스트를 명시적으로 skip한다.
 
 현재 Cloud에서 CMake 3.31.10으로 다음 전체 컴파일·링크를 통과했다.
 
 - CUDA 12.9.86: V100/A100/H100 `sm_70;sm_80;sm_90`.
-- CUDA 13.0.48: A100 전용 `sm_80`, 기본 A100/H100 `sm_80;sm_90`.
+- CUDA 13.0.48: A100 전용 `sm_80`.
 
 모든 빌드에서 5개 비선형 커널의 ptxas 보고서에 spill load/store가 없었다.
+SASS에서도 입력 load·함수 계산·출력 store가 traversal/repeat loop에 남고,
+nonlinear treatment와 전용 control에 admission atomic·SMID 명령이 없는 것을
+확인했다. Tensor·메모리·latency·기존 control의 SASS는 변경 전과 같았다.
 CUDA 13 실행 파일에 실제 `sm_80` cubin/PTX가 포함되고 CUDA runtime/cuBLAS 13
 라이브러리로 연결되는 것도 확인했다. 기본 아키텍처·명시적 override·환경변수
 우선순위·CUDA 13의 Volta 거부를 실제 CMake configure로 확인했다.
-CPU 테스트는 215개 중 214개 통과, 실제 GPU 테스트 1개 skip이다.
 이 결과는 컴파일·CPU 검증이며 runtime NCU 검증을 대신하지 않는다.
 각 실행 파일의 `--help`도 동작한다. `--describe`는 NVIDIA driver가 없는
 머신에서 CUDA driver/runtime 오류로 실패했다.

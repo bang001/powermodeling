@@ -6,7 +6,7 @@ Missing/unsupported counters are unknown. Profiler replay is never energy data.
 from dataclasses import asdict, dataclass
 import math
 import statistics
-from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
+from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, Q_GRID_MATH_IMPLEMENTATION, Q_GRID_IMPLEMENTATION_VERSION, count_issues
 from .memory import VERSIONS as MEMORY_IMPLEMENTATION_VERSIONS, count_issues as memory_count_issues
 
 
@@ -53,6 +53,10 @@ SM_HZ = "sm__cycles_elapsed.avg.per_second"
 TENSOR_INSTRUCTIONS = ("sm__inst_executed_pipe_tensor.sum", "smsp__inst_executed_pipe_tensor.sum")
 TENSOR_ACTIVITY = ("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active")
 SFU_INSTRUCTIONS = ("smsp__inst_executed_pipe_sfu.sum", "sm__inst_executed_pipe_sfu.sum")
+SFU_ACTIVITY = ("sm__pipe_sfu_cycles_active.avg.pct_of_peak_sustained_elapsed",
+                "smsp__pipe_sfu_cycles_active.avg.pct_of_peak_sustained_elapsed",
+                "sm__pipe_sfu_cycles_active.avg.pct_of_peak_sustained_active",
+                "smsp__pipe_sfu_cycles_active.avg.pct_of_peak_sustained_active")
 
 
 def _number(value):
@@ -156,7 +160,12 @@ def _kernel_assessment(rows, evidence, policy):
         name = "row_nonlinear_kernel" if workload in ROW_WORKLOADS else "pointwise_nonlinear_kernel"
         _check(checks, "nonlinear_kernel_name", rows[0].get("kernel"), lambda v: name in v, "expected complete function implementation kernel")
         _check(checks, "nonlinear_profile_count_contract", count_issues(result, workload), lambda v: not v, "consistent exact element/row counts and sampled CPU-reference correctness")
-        derived.update(sfu_instructions=inst, elements=result.get("elements"), row_width=result.get("row_width"),
+        activity_counter = next((name for name in SFU_ACTIVITY if metrics.get(name) is not None), None)
+        derived.update(sfu_instructions=inst,
+                       sfu_active_pct=metrics.get(activity_counter), sfu_activity_counter=activity_counter,
+                       sfu_activity_scope="elapsed" if activity_counter and activity_counter.endswith("_elapsed") else "active" if activity_counter else "unknown",
+                       sfu_activity_interpretation="optional advertised profiler pipeline activity; separate replay run, not a pure-function energy denominator or proof of hardware saturation",
+                       elements=result.get("elements"), row_width=result.get("row_width"),
                        component_scope="whole FP32 nonlinear function includes memory/reduction; SFU instructions do not define its energy denominator")
     elif workload in ("l1", "l2", "l2_latency", "hbm"):
         result = evidence.get("profile_benchmark") or {}
@@ -245,17 +254,18 @@ def assess_profile(evidence, policy=None):
         if isinstance(row, dict): groups.setdefault((row.get("id"), row.get("kernel")), []).append(row)
     kernels = [_kernel_assessment(rows, evidence, policy) for rows in groups.values()]
     checks = [check for kernel in kernels for check in kernel["checks"]]
-    if evidence.get("workload") in ("l1", "l2", "l2_latency", "hbm"):
+    if evidence.get("workload") in {"l1", "l2", "l2_latency", "hbm"} | NONLINEAR_WORKLOADS:
         # Raw launch IDs bind the one profiled custom launch to its payload.
         # An extra otherwise-valid kernel must not silently reuse that payload.
         ids = [int(str(kernel["id"])) for kernel in kernels if str(kernel.get("id")).isdecimal()]
         ids_known = bool(kernels) and len(ids) == len(kernels)
-        _check(checks, "memory_profile_launch_id_unique_mapping",
+        prefix = "nonlinear" if evidence.get("workload") in NONLINEAR_WORKLOADS else "memory"
+        _check(checks, prefix + "_profile_launch_id_unique_mapping",
                len(ids) == len(set(ids)) if ids_known else None, bool,
                "each numeric profile launch ID maps to exactly one kernel name")
         reported = _number((evidence.get("profile_benchmark") or {}).get("kernel_launches"))
         reported = reported if reported is not None and reported > 0 and reported.is_integer() else None
-        _check(checks, "memory_profile_observed_launch_count",
+        _check(checks, prefix + "_profile_observed_launch_count",
                len(set(ids)) if ids_known and reported is not None else None,
                lambda value: value == reported,
                "number of distinct observed kernel launch IDs matches reported positive integer kernel_launches")
@@ -270,6 +280,9 @@ def assess_profile(evidence, policy=None):
         values = [k["metrics"].get(metric) for k in kernels]
         rate_summary[key] = sum(values) * scale / duration if values and all(v is not None for v in values) and duration > 0 else None
     rate_summary["tensor_activity_by_kernel"] = [{"id": k["id"], "kernel": k["kernel"], "active_pct": k["derived"].get("tensor_active_pct"), "scope": k["derived"].get("tensor_utilization_scope"), "instructions": k["derived"].get("tensor_instructions")} for k in kernels]
+    rate_summary["sfu_activity_by_kernel"] = [{"id": k["id"], "kernel": k["kernel"],
+        "active_pct": k["derived"].get("sfu_active_pct"), "counter": k["derived"].get("sfu_activity_counter"),
+        "scope": k["derived"].get("sfu_activity_scope", "unknown"), "instructions": k["derived"].get("sfu_instructions")} for k in kernels if "sfu_instructions" in k["derived"]]
     traffic_kernels = [kernel for kernel in kernels if "traffic_amplification" in kernel["derived"]]
     # The application payload is attributable only to one observed microkernel.
     # Multiple observed kernels with one reported launch cannot reuse that total.
@@ -346,7 +359,8 @@ def validate_evidence(record, evidence, policy=None):
     measured_benchmark = record.get("benchmark") or {}
     effective_names = ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated", "kernel_implementation_version", "memory_accesses_per_thread_iteration")
     if record.get("workload") in NONLINEAR_WORKLOADS:
-        effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
+        effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution",
+                            "grid_mode", "input_elements", "block_completion_count_source")
         if record.get("workload") == "rmsnorm": effective_names += ("rms_epsilon", "affine_gamma")
     for name in effective_names:
         if name in ("kernel_implementation_version", "memory_accesses_per_thread_iteration") and benchmark.get(name) is None and measured_benchmark.get(name) is None:
@@ -358,6 +372,9 @@ def validate_evidence(record, evidence, policy=None):
     required_effective = ("blocks", "threads", "iterations_per_launch", "tensor_accumulators") if record.get("workload") == "tensor" else ("gemm_m", "gemm_n", "gemm_k", "iterations_per_launch") if record.get("workload") == "gemm" else ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "access")
     if record.get("workload") in NONLINEAR_WORKLOADS:
         required_effective += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
+        if (measured_benchmark.get("math_implementation") == Q_GRID_MATH_IMPLEMENTATION
+                or measured_benchmark.get("kernel_implementation_version") == Q_GRID_IMPLEMENTATION_VERSION):
+            required_effective += ("grid_mode", "input_elements", "kernel_implementation_version", "block_completion_count_source")
     for name in required_effective:
         if name not in benchmark or name not in measured_benchmark:
             _check(checks, "missing_effective_" + name, None, bool, "effective profile and energy kernel parameters required")

@@ -13,7 +13,7 @@ from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS
 WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS
 PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "iterations",
               "tensor_accumulators", "access", "sm_ids", "seed", "offset_bytes",
-              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width"}
+              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode"}
 
 
 def numeric_expression(value, names):
@@ -368,13 +368,18 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             resolved, env = {}, dict(names)
             for key in sorted(params, key=lambda k: (k not in ("blocks", "threads"), k)):
                 value = params[key]
-                resolved[key] = value if key in ("access", "sm_ids") else numeric_expression(value, env)
+                resolved[key] = value if key in ("access", "sm_ids", "grid_mode") else numeric_expression(value, env)
                 env[key] = resolved[key]
             blocks, threads = resolved.get("blocks", names["sm_count"]*2), resolved.get("threads", 256)
             if blocks < 1 or threads < 32 or threads > 1024 or threads % 32:
                 raise ValueError("blocks>=1 and threads must be a multiple of warp size32 within32..1024")
             if blocks > 1000000 or blocks > 2**31-1:
                 raise ValueError("blocks exceeds the benchmark practical limit of1000000")
+            if "grid_mode" in resolved and workload not in NONLINEAR_WORKLOADS:
+                raise ValueError("grid_mode applies only to nonlinear workloads")
+            grid_mode = resolved.get("grid_mode", "auto")
+            if workload in NONLINEAR_WORKLOADS and grid_mode not in ("auto", "fixed"):
+                raise ValueError("nonlinear grid_mode must be auto or fixed")
             access = resolved.get("access", "read")
             if access not in ("read", "write", "copy"):
                 raise ValueError("access must be read, write or copy")
@@ -406,7 +411,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             width = resolved.get("row_width", 1024) if workload in ROW_WORKLOADS else 0
             if workload in ROW_WORKLOADS and not 1 <= width <= 65536:
                 raise ValueError("row_width must be within 1..65536")
-            if workload in NONLINEAR_WORKLOADS: default_ws = blocks * (width or threads * 128) * 4
+            if workload in NONLINEAR_WORKLOADS: default_ws = 1048576 * 4
             elif workload == "l1": default_ws = blocks * 16 * 1024
             elif workload in ("l2", "l2_latency"): default_ws = max(4, names["l2_bytes"] // 8 * 4)
             else: default_ws = max(512 * 1024 * 1024, names["l2_bytes"] * 8)
@@ -417,12 +422,25 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             if workload in NONLINEAR_WORKLOADS:
                 if access != "read" or offset != 0 or resolved.get("stride_elements", 1) != 1:
                     raise ValueError("Nonlinear kernels require access=read, offset_bytes=0 and stride_elements=1; input and output are distinct")
-                if ws % (blocks * (width or 1) * 4):
-                    raise ValueError("Nonlinear working_set_bytes must contain equal complete block slices/rows")
-                allocation = ws * 2 + width * 4 + blocks * threads * 8 + 256 * 1024
+                elements = ws // 4
+                if width and elements % width:
+                    raise ValueError("Nonlinear working_set_bytes must contain complete rows")
+                if grid_mode == "auto":
+                    derived_blocks = elements // width if width else (elements + threads - 1) // threads
+                    if "blocks" in resolved and blocks != derived_blocks:
+                        raise ValueError("Nonlinear auto grid blocks must equal the Q-derived grid; use grid_mode=fixed for an explicit grid")
+                    blocks = derived_blocks
+                elif "blocks" not in resolved:
+                    raise ValueError("Nonlinear fixed grid requires explicit blocks")
+                if not 1 <= blocks <= 1000000:
+                    raise ValueError("Q-derived or fixed blocks exceeds the benchmark practical limit of1000000")
+                # Nonlinear treatment has one unused sink word. Only the paired
+                # integer control needs a sink word for every launched thread.
+                allocation = ws * 2 + (width if workload == "rmsnorm" else 1) * 4 + 4 + (blocks * threads if paired else 1) * 4 + 256 * 1024
                 if allocation > names["total_memory_bytes"] * 0.7:
                     raise ValueError("Nonlinear input/output/gamma and reference allocations exceed70% of device memory")
-                resolved.update(working_set_bytes=ws, iterations=resolved.get("iterations", 1))
+                resolved.update(blocks=blocks, threads=threads, grid_mode=grid_mode,
+                                working_set_bytes=ws, iterations=resolved.get("iterations", 1))
                 if width: resolved["row_width"] = width
             if workload == "l1" and ws < blocks * 4:
                 raise ValueError("L1 working set must include at least one 4byte word per block")

@@ -62,7 +62,7 @@ ECC/MIG, treatment protocol, 함수 정의를 분리한다. GPU 간 결과를 �
 메모리는 access·stride·주소 offset·SM filter·유효 footprint를 분리한다.
 L1은 전체 할당 대신 **CTA당 slice 크기**를 사용해 blocks를 늘리는 geometry
 실험을 같은 조건으로 비교할 수 있게 한다. nonlinear은 FP32/math 구현,
-입력 분포, footprint, 행 너비, epsilon/gamma를 분리한다. locality는
+입력 분포, footprint(Q), 행 너비, epsilon/gamma, grid mode와 구현 버전을 분리한다. locality는
 blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 지도 축으로
 남긴다. 같은 pJ 단위여도 이 정의가 다르면 평균하거나 같은 곡선으로 연결하지 않는다.
 
@@ -74,7 +74,7 @@ blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 �
 | L2 | pJ/logical bit, logical GB/s | L2 hit·DRAM 유입·L1 bypass·finite 주소 footprint·spill | footprint/stride/access별 성능; write/copy의 현재 residency 판정 한계 | footprint/stride/access 분리 그림; 누락/미확정 cell 표시 |
 | HBM | pJ/logical bit, logical GB/s | read/write 방향의 DRAM/logical ratio·L2 hit·sector inflation·finite footprint | memory별 SM clock 공급능력 plateau, replay DRAM rate는 별도 진단 | memory×SM energy matrix, bandwidth/energy, 조건·품질 표 |
 | L2 locality | dependent cycles/access | admitted SM·offset·loads/cycles, L2/fabric counter는 별도 근거 필요 | concurrent blocks·loop overhead·온도/clock; energy optimum으로 선택하지 않음 | clock/geometry별 SM×offset 지도; near/far label 없음 |
-| EXP/TANH/SiLU | pJ/element, Gelement/s | 전후 분산 CPU double sample, complete output element/epoch, 표준 math·SFU activity·spill | footprint별 geometry/clock plateau, memory/reduction 비용 포함 | 함수·footprint별 독립 그림, 수치 검증 표 |
+| EXP/TANH/SiLU | pJ/element, Gelement/s | 전후 분산 CPU double sample, complete output element/epoch, 표준 math·SFU activity·spill | auto grid의 Q scaling과 Q별 geometry/clock 비교, 메모리 비용 포함 | 함수·Q별 독립 그림, Q-scaling 그림·표, 수치 검증 표 |
 | RMSNorm/Softmax | pJ/element와 pJ/row | 위 조건 + row count/width, RMS epsilon/gamma, stable max/sum 및 Softmax 행 합 | 행 너비별 성능·에너지; `pJ/row = width × pJ/element` | 행 너비별 독립 그림과 row 단가 표 |
 | Control / paired arm | active reference 전력과 signed contrast | 같은 process/context·geometry·clock·온도·cap, AB/BA 균형·완료 epoch | matching 실패 시 contrast 선택 제외 | 전력/온도 trace와 order/quality; component 단가로 선택하지 않음 |
 
@@ -102,6 +102,15 @@ write/copy residency 판정이 미확정이면 해당 에너지는 보존하지�
    seed/offset만 다른 조건은 새 자원 level이 아니다. 다른 clock의 geometry를
    합쳐 plateau를 만들지 않는다. 결과는 관측 근거이며 hardware saturation
    증명은 계속 false다.
+   **Nonlinear V2 auto grid 예외:** blocks×threads가 Q에 묶이므로 기존 자원
+   plateau를 적용하지 않는다. 함수·행 너비·threads·iterations·grid mode·binary·
+   환경·고정 clock을 맞춘 별도 Q 곡선에서 가장 큰 유효 Q 3개를 선택한다.
+   각 Q에 경로·정확한 count·반복·CI·해당 에너지 objective 요건을 통과한 근거가
+   있고, 모두 전체 유효 Q 곡선 peak의 95% 이상이며 처리량 폭이 5% 이내여야 한다.
+   추천 후보의 Q도 이 구간에 있어야 `observed_input_size_plateau`가 된다.
+   미검증인 큰 Q를 건너뛰어 낮은 구간을 확정하지 않는다. Q별 에너지 통계·후보는
+   분리하며 이 진단 곡선에서 합산하지 않는다. Q 변화는 cache와 launch 비용도
+   바꾸므로 SFU 포화 증명이 아니다. fixed/v1 nonlinear은 기존 판정을 유지한다.
 5. **에너지 후보:** 같은 clock에서 최소 2개의 검증 geometry와 exact count,
    반복/CI 요건을 통과한 조건 중 처리량 기준을 만족하는 에너지 최소를 고른다.
    own-clock 최소와 **전체 관측 peak의 95% 성능을 유지하는 전체 clock 후보**를

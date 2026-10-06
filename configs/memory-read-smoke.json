@@ -1,0 +1,30 @@
+{
+  "description": "Single-stream scalar read diagnostics for L1/L2/HBM. One 32-bit load per thread and iteration with a single uint32 sum to retain every load; no four-stream XOR recurrence. One geometry is a measurement/path check, not a saturation or energy-optimum claim. Use a supported fixed clock pair matching the original experiment for controlled comparisons.",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "randomization_seed": 2026,
+  "clock_pairs": [{"graphics_mhz": null, "memory_mhz": null}],
+  "target_form_factor": "SXM",
+  "paired_reference": true,
+  "study_design": "diagnostic",
+  "experiments": [
+    {
+      "workload": "l1",
+      "stage": "l1_read",
+      "parameters": {"access": "read", "blocks": "sm_count*4", "threads": 256, "iterations": 4096, "batch_launches": 16, "working_set_bytes": "blocks*8192", "stride_elements": 1, "offset_bytes": 0}
+    },
+    {
+      "workload": "l2",
+      "stage": "l2_read",
+      "parameters": {"access": "read", "blocks": "sm_count*4", "threads": 256, "iterations": 4096, "batch_launches": 16, "working_set_bytes": "l2_bytes*0.5", "stride_elements": 1, "offset_bytes": 0}
+    },
+    {
+      "workload": "hbm",
+      "stage": "hbm_read",
+      "parameters": {"access": "read", "blocks": "sm_count*4", "threads": 256, "iterations": 4096, "batch_launches": 16, "working_set_bytes": "max(l2_bytes*8,268435456)", "stride_elements": 1, "offset_bytes": 0, "seed": 2026}
+    }
+  ]
+}

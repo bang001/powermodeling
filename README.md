@@ -229,6 +229,12 @@ python -m powermodeling analyze --input results/validated \
 
 `valid=true`는 기록의 품질 기준을 통과했다는 뜻이며, `target_verified=true`나 물리 블록 isolation의 증명이 아니다. worker는 약 1초 간격의 완료 batch 수와 실제 SM admission 수를 기록하고, 분석은 양 끝을 제외한 완료 구간에서 work count와 에너지를 함께 계산한다. 이 기록이 없는 과거 결과는 지속 처리량이 일정하다는 가정의 추정치로 남기고 검증된 최적값에는 사용하지 않는다. idle와 active의 실제 클럭이나 온도가 다르면 증가분에는 activation·주파수 상태·누설 변화가 섞일 수 있으며 경고가 남는다. 3–4회처럼 적은 반복의 bootstrap 범위는 거칠다. 수치 차이가 작으면 반복과 최소점 주변 지원 주파수 측정을 늘리고 온도·센서·counter evidence를 확인한다. V100·A100·H100의 최적 pJ/bit·pJ/FLOP 주파수는 각 UUID의 결과에서 독립적으로 선택하며 1110 MHz를 최적점으로 미리 지정하지 않는다. physical pJ/bit는 동일 energy-window의 계층 traffic provenance가 없어 현재 withheld이고 NCU replay bytes만으로 단가를 계산하지 않는다.
 
+## 단순 메모리 read 커널
+
+L1·L2·HBM의 `access=read`는 **단일 stream의 32-bit load + uint32 덧셈 누산**을 사용한다. 이전 네 stream의 XOR 누산과 여러 주소 관리를 줄였으며 L1 `.ca`, L2/HBM `.cg`를 유지한다. 읽은 값을 전혀 사용하지 않으면 컴파일러가 중간 load를 제거하므로 덧셈 하나는 남긴다. 기본 iterations는 4096으로, 이전 read의 1024 × 4 loads와 같은 요청량이다. 직접 지정한 iterations는 변환하지 않는다.
+
+[변경 내용·count·재실험 절차](docs/memory-read-v2.ko.md)를 참고한다. [메모리 read 전용 점검 설정](configs/memory-read-smoke.json)은 L1/L2/HBM 합계 12 trials·최소 9분이며, `--stage hbm_read`로 HBM만 실행하면 4 trials·최소 3분이다. NCU·준비 시간은 별도다. 새 binary로 plan과 profile을 다시 만들고, 이전 결과와는 implementation version·binary hash로 구분한다. 실제 에너지 개선은 GPU 재측정으로 확인해야 한다.
+
 ## 기존 실험보다 에너지 단가가 높을 때
 
 먼저 같은 컴포넌트·단위·에너지 기준·실제 클럭을 비교한다. 전체 GPU 단가와 idle 증가분은 서로 다르고, 메모리의 legacy `pj_per_logical_byte`는 pJ/bit의 8배다. 같은 기준이라면 높은 단가는 전력 증가 또는 낮은 지속 처리량에서 생길 수 있다. 경로 검증 `pass`만으로 bandwidth 포화를 확인하지 않는다.

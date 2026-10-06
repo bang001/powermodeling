@@ -35,6 +35,8 @@ def experiment_contract(workload, benchmark, config):
             blocks = get("blocks")
             size = get("l1_bytes_per_block", size / blocks if number(size) is not None and number(blocks) and blocks > 0 else None)
         return {"access": get("access", "read"),
+                "kernel_implementation_version": get("kernel_implementation_version"),
+                "memory_accesses_per_thread_iteration": get("memory_accesses_per_thread_iteration"),
                 "l1_bytes_per_block" if workload == "l1" else "working_set_bytes": size,
                 "stride_elements": get("stride_elements", 1),
                 **({"blocks": get("blocks"), "threads": get("threads"),

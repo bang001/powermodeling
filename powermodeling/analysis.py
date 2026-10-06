@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
+from .memory import count_issues as memory_count_issues
 from .evaluation import experiment_contract, evaluate
 
 _TENSOR_WORKLOADS = {"tensor", "fp16_tensor", "tensor_fp16", "gemm"}
@@ -496,6 +497,9 @@ def _measurement_diagnostics(result, benchmark, epochs):
         "execution": {"kernel_resources": benchmark.get("kernel_resources"),
                       "execution_diagnostics": benchmark.get("execution_diagnostics"),
                       "implementation_version": benchmark.get("kernel_implementation_version"),
+                      "memory_accesses_per_thread_iteration": benchmark.get("memory_accesses_per_thread_iteration"),
+                      "memory_read_checksum_scope": benchmark.get("memory_read_checksum_scope"),
+                      "memory_read_validation": benchmark.get("memory_read_validation"),
                       "saturation_status": "CUDA occupancy bounds and grid size do not establish achieved utilization or hardware saturation"},
         "timing": {"host_duration_s": _finite(benchmark.get("host_duration_s")),
                    "event_duration_s": _finite(benchmark.get("duration_s")),
@@ -649,6 +653,14 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         issues.append("mps_environment")
     if record.get("status") != "complete" or benchmark.get("error"):
         issues.append("benchmark_failed")
+    sanity = benchmark.get("sanity") or {}
+    if isinstance(sanity, Mapping) and sanity.get("finite_output_sample") is False:
+        issues.append("benchmark_output_sanity_failed")
+    read_validation = benchmark.get("memory_read_validation") or {}
+    if ((isinstance(sanity, Mapping) and sanity.get("memory_read_sample_matches_reference") is False)
+            or (isinstance(read_validation, Mapping) and
+                (read_validation.get("status") == "fail" or (_finite(read_validation.get("mismatched_values")) or 0) > 0))):
+        issues.append("memory_read_reference_mismatch")
     idle_power = _idle_at(pre, post, measure, "power_w")
     idle_memory_power = _idle_at(pre, post, measure, "memory_power_w")
     pre_power, post_power = _finite(pre.get("power_w")), _finite(post.get("power_w"))
@@ -691,6 +703,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         issues.append("missing_logical_byte_count")
     nonlinear_issues = count_issues(benchmark, record.get("workload"))
     issues.extend(nonlinear_issues)
+    issues.extend(memory_count_issues(benchmark, record.get("workload")))
     if record.get("workload") in NONLINEAR_WORKLOADS and not count_alignment_exact:
         issues.append("nonlinear_requires_matching_work_energy_epochs")
     incremental_power = incremental / duration if incremental is not None and duration else None
@@ -797,10 +810,12 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
                                 "runtime_versions": {key: (record.get("cuda_device") or {}).get(key) for key in ("cuda_runtime_version", "cuda_driver_version", "cuda_compile_version", "cublas_version")},
                                 "power_limit_w": power_limit, "power_scope": (record.get("telemetry") or {}).get("power_scope", device.get("power_scope_note")),
                                 "power_usage_semantics": device.get("power_usage_semantics"),
-                                "kernel_implementation_version": benchmark.get("kernel_implementation_version")},
+                                "kernel_implementation_version": benchmark.get("kernel_implementation_version"),
+                                "memory_accesses_per_thread_iteration": benchmark.get("memory_accesses_per_thread_iteration")},
         "kernel_resources": benchmark.get("kernel_resources"),
         "execution_diagnostics": benchmark.get("execution_diagnostics"),
         "kernel_implementation_version": benchmark.get("kernel_implementation_version"),
+        "memory_accesses_per_thread_iteration": benchmark.get("memory_accesses_per_thread_iteration"),
         "validation": validation, "duration_s": duration, "benchmark_duration_s": measured_duration,
         "profile_rates_summary": assessment.get("rates_summary"),
         "validation_binding": {"condition_id": record.get("condition_id"), "workload": record.get("workload"),
@@ -1255,6 +1270,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
                  "kernel_resources": repeats[0].get("kernel_resources"),
                  "execution_diagnostics": repeats[0].get("execution_diagnostics"),
                  "kernel_implementation_version": repeats[0].get("kernel_implementation_version"),
+                 "memory_accesses_per_thread_iteration": repeats[0].get("memory_accesses_per_thread_iteration"),
                  "treatment_design_stratum": repeats[0]["treatment_design_stratum"],
                  "resource_geometry": repeats[0]["resource_geometry"],
                  "repeats": len(repeats), "valid_repeats": len(valid), "trial_ids": [t["trial_id"] for t in repeats],

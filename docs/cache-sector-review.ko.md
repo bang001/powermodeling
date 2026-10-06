@@ -3,6 +3,11 @@
 검토일: 2026-10-06 UTC. 대상은 V100/A100/H100에서 현재 worker가 실행하는
 scalar global read이다. 아래 주소 예시는 실측 에너지 결과가 아니다.
 
+후속 변경으로 현재 read는 [single-stream v2](memory-read-v2.ko.md)를 사용한다.
+한 thread/iteration당 4 B 한 번을 읽고 uint32 합계에 더하며, 기본 iterations는
+4096이다. Sector 표는 scalar load 하나 기준이므로 그대로 유효하다. 아래의
+four-stream 관련 내용은 `8892f8c`까지의 이전 구현을 검토한 기록이다.
+
 ## 128 B를 모든 연산의 고정 전송량으로 해석하지 않는다
 
 NVIDIA Nsight Compute 2025.2.1의 Metrics Reference는 **L1과 L2 모두
@@ -38,9 +43,9 @@ sector 수를 구할 수 있다. Offset 32 B는 두 128 B 주소 구간에 걸�
 적용하지 않는다. 이 수는 요청 주소가 덮는 sectors이며, 실제 L2/DRAM
 traffic이나 에너지가 같은 배율로 증가한다는 뜻이 아니다.
 
-## 현재 구현에서 확인한 것과 부족했던 점
+## 이전 four-stream 구현에서 확인한 것과 부족했던 점
 
-- [CUDA 커널](../cuda/gpu_bench.cu)은 thread당 iteration마다 서로 분리된
+- 이전 [CUDA 커널](https://github.com/bang001/powermodeling/blob/8892f8cf38b394af5ec894df78f6839e01ff9f88/cuda/gpu_bench.cu)은 thread당 iteration마다 서로 분리된
   `ld.global.ca.u32` 4개(L1) 또는 `ld.global.cg.u32` 4개(L2/HBM)를 실행한다.
   따라서 full warp의 iteration당 logical payload는 **512 B**다.
   이상적인 stride 1 조건에서는 네 명령에 걸쳐 16 sector 요청을 기대한다.
@@ -65,9 +70,10 @@ Threads 256, blocks=4×SM, iterations 2048, batch launches 16, repeats 4를
 고정한다. L1은 CTA당 8 KiB, L2는 조회 용량의 절반으로 시작한다.
 작은 L1 slice에서 stride 32가 warp 안의 중복 주소를 만들지 않도록 했다.
 stride에 따라 실제 방문 footprint는 달라지므로 hit와 finite footprint도 확인한다.
-특히 이 8 KiB slice·256 threads 설정에서 stride 8/32는 wrap 때문에 thread의
-네 stream이 같은 주소를 읽는다. Warp 내부 주소는 서로 달라도 warp/stream 사이
-재사용은 달라진다. 이 설정은 현재 커널의 sector 요청과 wrap 효과를 진단하며,
+이 8 KiB slice·256 threads 설정의 이전 구현은 stride 8/32에서 네 stream이
+같은 주소를 읽었다. 새 single-stream 구현도 stride 8/32이면 주소 advance가 0이므로
+각 thread가 같은 원소를 반복 읽는다. Warp 내부 주소는 서로 달라도 재사용은 달라진다.
+이 설정은 커널의 sector 요청과 wrap 효과를 진단하며,
 관측된 pJ 변화 전부를 sector overfetch에 귀속하는 통제 실험은 아니다.
 
 ```bash
@@ -142,7 +148,7 @@ L1 표 역시 최소 접근 크기를 one sector로 명시한다. V100/A100/H100
 3. **Throughput 커널의 작업량과 명령 폭을 맞춘다.** Hopper 연구는 L1에 1024-thread
    block 하나를 쓰고 L2에는 많은 blocks를 공급한다. Global-memory latency는
    4 threads × 8 B로 32 B 접근을 구성하고, throughput은 thread당 `float4`로
-   5회 read와 1회 write를 수행한다. 현재의 4개 scalar read와 명령 수·read/write
+   5회 read와 1회 write를 수행한다. 이전 네 stream 및 현재 단일 stream의 scalar read와 명령 수·read/write
    구성·공급 병렬도가 다르다. Vectorized throughput reference는 추가 비교 후보이며,
    현재 커널을 곧바로 peak 구현이라고 판단하지 않는다.
 4. **Hopper 연구를 H100 SXM 실측으로 부르지 않는다.** 논문의 실제 장비는

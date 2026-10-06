@@ -116,6 +116,8 @@ void usage() {
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
     "  --row-width 1024 (RMSNorm/Softmax, FP32 full row operations)\n"
     "Memory stride is in 32-bit words; footprint is total input bytes.\n"
+    "L1/L2/HBM read issues one scalar load per thread/iteration with one sum32; default iterations=4096.\n"
+    "Write/copy keeps four accesses per thread/iteration; default iterations=1024.\n"
     "L1 splits that footprint into disjoint per-block slices and supports read only.\n"
     "SM filters admit dispatched blocks, and do not disable SMs or select GPCs.\n"
     "cuBLAS GEMM does not support SM filters or requested launch geometry.\n"
@@ -216,7 +218,7 @@ struct Blas {
 __device__ __forceinline__ unsigned sm_id() {
   unsigned value; asm volatile("mov.u32 %0, %%smid;" : "=r"(value)); return value;
 }
-__device__ __forceinline__ uint32_t random_word(uint64_t x) {
+__host__ __device__ __forceinline__ uint32_t random_word(uint64_t x) {
   x += 0x9e3779b97f4a7c15ULL;
   x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
   x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
@@ -253,6 +255,38 @@ __device__ __forceinline__ uint64_t wrap(uint64_t x, uint64_t n, bool pow2) { re
 // loop even when a 20/25 MiB L2 footprint is not a power of two.
 __device__ __forceinline__ uint64_t add_wrap(uint64_t a, uint64_t b, uint64_t n) {
   uint64_t sum = a + b; return sum >= n ? sum - n : sum;
+}
+
+// One coalesced scalar read per lane and iteration. Addresses depend only on
+// the requested grid/stride and loop index, never on the loaded value. One
+// uint32 sum makes every loaded value observable; asm volatile alone would let
+// ptxas discard intermediate loads when only the last value is consumed.
+template<bool L1>
+__global__ void simple_memory_kernel(const uint32_t* input, uint32_t* sink,
+    uint64_t total_words, uint64_t slice_words, uint64_t stride, uint64_t iterations,
+    const unsigned char* mask, bool filtered, unsigned long long* blocks_per_sm) {
+  if (!admit(mask, filtered, blocks_per_sm)) return;
+  const uint64_t n = L1 ? slice_words : total_words;
+  const uint64_t start = L1 ? uint64_t(blockIdx.x) * slice_words : 0;
+  const uint64_t lanes = L1 ? blockDim.x : uint64_t(gridDim.x) * blockDim.x;
+  const uint64_t tid = L1 ? threadIdx.x : uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const bool pow2 = (n & (n - 1)) == 0;
+  uint64_t position = wrap(tid * stride, n, pow2);
+  const uint64_t advance = wrap(lanes * stride, n, pow2);
+  const uint32_t* region_input = input;
+  if constexpr (L1) {
+    // Materialize the fixed CTA base once. An opaque PTX add prevents the
+    // frontend from folding blockIdx*slice_words into every loop load address.
+    uint64_t base_address;
+    asm volatile("add.u64 %0, %1, %2;" : "=l"(base_address) : "l"(uint64_t(input)), "l"(start * sizeof(uint32_t)));
+    region_input = reinterpret_cast<const uint32_t*>(base_address);
+  }
+  uint32_t sum = 0;
+  for (uint64_t i = 0; i < iterations; ++i) {
+    sum += L1 ? load_ca(region_input + position) : load_cg(region_input + position);
+    position = add_wrap(position, advance, n);
+  }
+  sink[uint64_t(blockIdx.x) * blockDim.x + threadIdx.x] = sum;
 }
 
 template<bool L1, int Access> // 0 = read, 1 = write, 2 = copy
@@ -484,9 +518,17 @@ void experiment(Options o, const cudaDeviceProp& p) {
   if (p.major < 7) throw std::runtime_error("benchmark requires compute capability >= 7.0");
   const bool latency = o.workload == "l2_latency";
   const bool memory = o.workload == "l1" || o.workload == "l2" || latency || o.workload == "hbm";
+  const bool simple_memory_read = memory && !latency && o.access == "read";
+  const uint64_t memory_accesses_per_iteration = simple_memory_read ? 1 : 4;
+  const char* implementation_version = simple_memory_read ? "scalar_single_stream_read_v2" :
+    memory && !latency ? "scalar_four_stream_write_copy_v1" : latency ? "dependent_pointer_chain_v1" :
+    o.workload == "tensor" ? "wmma_register_reuse_v1" : o.workload == "gemm" ? "cublas_dense_gemm_v1" :
+    o.workload == "control" ? "integer_issue_loop_v1" : "fp32_complete_nonlinear_v1";
   const bool nonlinear = nonlinear_workload(o.workload);
   const bool rowwise = o.workload == "rmsnorm" || o.workload == "softmax";
-  if (!o.iterations) o.iterations = o.workload == "gemm" || nonlinear ? 1 : 1024;
+  // One scalar read replaces four loads per iteration. Keep the implicit read
+  // payload/finite footprint comparable; explicit --iterations is literal.
+  if (!o.iterations) o.iterations = o.workload == "gemm" || nonlinear ? 1 : simple_memory_read ? 4096 : 1024;
   if (!o.batch_launches) o.batch_launches = o.workload == "gemm" ? 1 : 16;
   if (!o.working_set_bytes) {
     if (nonlinear) o.working_set_bytes = uint64_t(o.blocks) * (rowwise ? o.row_width : o.threads * 128) * 4;
@@ -577,7 +619,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
   // Set a stable carveout preference for L1; actual shared/L1 partition and hit
   // rate still require counters. No shared memory is consumed by this kernel.
   if (o.workload == "l1")
-    CUDA_CHECK(cudaFuncSetAttribute(memory_kernel<true, 0>, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
+    CUDA_CHECK(cudaFuncSetAttribute(simple_memory_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
   KernelResources resources;
   if (o.workload == "tensor") {
     #define TENSOR_RESOURCE_CASE(N) case N: resources = query_kernel_resources(tensor_kernel<N>, o.threads); break
@@ -586,9 +628,9 @@ void experiment(Options o, const cudaDeviceProp& p) {
       TENSOR_RESOURCE_CASE(5); TENSOR_RESOURCE_CASE(6); TENSOR_RESOURCE_CASE(7); TENSOR_RESOURCE_CASE(8);
     }
     #undef TENSOR_RESOURCE_CASE
-  } else if (o.workload == "l1") resources = query_kernel_resources(memory_kernel<true, 0>, o.threads);
+  } else if (o.workload == "l1") resources = query_kernel_resources(simple_memory_kernel<true>, o.threads);
   else if (o.workload == "l2" || o.workload == "hbm") {
-    if (o.access == "read") resources = query_kernel_resources(memory_kernel<false, 0>, o.threads);
+    if (o.access == "read") resources = query_kernel_resources(simple_memory_kernel<false>, o.threads);
     else if (o.access == "write") resources = query_kernel_resources(memory_kernel<false, 1>, o.threads);
     else resources = query_kernel_resources(memory_kernel<false, 2>, o.threads);
   } else if (latency) resources = query_kernel_resources(latency_kernel, o.threads);
@@ -633,8 +675,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
       else row_nonlinear_kernel<false><<<o.blocks, o.threads, o.threads * sizeof(float)>>>(input.ptr, gamma.ptr, output.ptr, block_words / o.row_width, o.row_width, o.iterations, mask.ptr, sm_blocks.ptr);
     } else {
       const uint32_t* in = input.ptr + offset_words; uint32_t* out = output.ptr + (o.access == "read" ? 0 : offset_words);
-      if (o.workload == "l1") memory_kernel<true, 0><<<o.blocks, o.threads>>>(in, out, sink.ptr, words, slice, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
-      else if (o.access == "read") memory_kernel<false, 0><<<o.blocks, o.threads>>>(in, out, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
+      if (o.workload == "l1") simple_memory_kernel<true><<<o.blocks, o.threads>>>(in, sink.ptr, words, slice, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
+      else if (o.access == "read") simple_memory_kernel<false><<<o.blocks, o.threads>>>(in, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
       else if (o.access == "write") memory_kernel<false, 1><<<o.blocks, o.threads>>>(in, out, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
       else memory_kernel<false, 2><<<o.blocks, o.threads>>>(in, out, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
     }
@@ -738,7 +780,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
   else if (o.workload == "gemm") operations = (long double)timing.batches * o.batch_launches * o.iterations * 2 * o.gemm_m * o.gemm_n * o.gemm_k;
   else if (latency) { operations = (long double)admitted_blocks * o.iterations; logical_bytes = operations * 4; }
   else if (memory) {
-    operations = (long double)admitted_blocks * o.threads * o.iterations * 4;
+    operations = (long double)admitted_blocks * o.threads * o.iterations * memory_accesses_per_iteration;
     logical_bytes = operations * 4 * (o.access == "copy" ? 2 : 1);
   }
   else if (nonlinear) {
@@ -746,6 +788,45 @@ void experiment(Options o, const cudaDeviceProp& p) {
     logical_bytes = operations * (rowwise ? 16 : 8);
   }
   uint64_t checksum = 0; bool finite = true;
+  uint64_t read_checked_values = 0, read_mismatched_values = 0;
+  const char* read_validation_status = filtered ? "not_checked_sm_filtered" : "not_checked_iteration_budget";
+  if (simple_memory_read && !filtered) {
+    // Distributed CPU oracle checks are outside measured phases. The input is
+    // immutable deterministic init_words data. Complete sums are sampled for
+    // selected threads, not every issued access. Filtered CTA identity is unknown.
+    const uint64_t region_words = o.workload == "l1" ? slice : words;
+    const uint64_t region_lanes = o.workload == "l1" ? uint64_t(o.threads) : lanes;
+    const uint64_t advance = (region_lanes * o.stride_elements) % region_words;
+    const uint64_t period = region_words / std::gcd(region_words, advance);
+    const uint64_t reference_steps = std::min(o.iterations, period);
+    // Fold repeated address cycles and bound the remaining CPU work to keep
+    // explicitly enormous iteration/period requests from stalling postprocessing.
+    if (reference_steps <= 65536) {
+      const unsigned sample_blocks = std::min(unsigned(o.blocks), 8U);
+      for (unsigned sample_block = 0; sample_block < sample_blocks; ++sample_block) {
+        const uint64_t block = sample_blocks == 1 ? 0 : uint64_t(sample_block) * (o.blocks - 1) / (sample_blocks - 1);
+        for (int thread : {0, o.threads / 2, o.threads - 1}) {
+          const uint64_t tid = o.workload == "l1" ? uint64_t(thread) : block * o.threads + thread;
+          uint64_t position = (tid * o.stride_elements) % region_words;
+          uint32_t cycle_sum = 0, prefix_sum = 0;
+          for (uint64_t step = 0; step < reference_steps; ++step) {
+            const uint64_t index = offset_words + (o.workload == "l1" ? block * slice : 0) + position;
+            const uint32_t value = random_word(index ^ o.seed);
+            cycle_sum += value;
+            if (step < o.iterations % period) prefix_sum += value;
+            position = (position + advance) % region_words;
+          }
+          const uint32_t expected = uint32_t(uint64_t(cycle_sum) * (o.iterations / period)) + prefix_sum;
+          uint32_t actual = 0;
+          CUDA_CHECK(cudaMemcpy(&actual, sink.ptr + block * o.threads + thread, sizeof(actual), cudaMemcpyDeviceToHost));
+          ++read_checked_values;
+          if (actual != expected) ++read_mismatched_values;
+        }
+      }
+      read_validation_status = read_mismatched_values ? "fail" : "pass";
+      finite = read_mismatched_values == 0;
+    }
+  }
   NonlinearCheck numerical;
   const char* checksum_kind = "uint32_sink_sample";
   if (nonlinear) {
@@ -765,8 +846,9 @@ void experiment(Options o, const cudaDeviceProp& p) {
     std::vector<uint32_t> sample(std::min(size_t(1024), size_t(lanes)));
     CUDA_CHECK(cudaMemcpy(sample.data(), sink.ptr, sample.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     for (uint32_t word : sample) checksum = checksum * 1315423911ULL + word;
-    // Read-only repeated XOR can cancel by design. This verifies a defined output
-    // transfer, not a full memory correctness test or validation of cache residency.
+    if (simple_memory_read) checksum_kind = "sum32_scalar_reads_per_thread_sample_hash";
+    // This verifies a defined sink transfer, not full memory correctness or
+    // cache residency. Write/copy still use the existing four-stream checksum.
   }
   uint64_t allocated_bytes = (words + offset_words + ((memory && o.access != "read") || nonlinear ? words + offset_words : 1) + lanes + gamma_count) * 4
     + (gemm_a_count + gemm_b_count) * 2 + gemm_c_count * 4 + kSmSlots * 25
@@ -780,7 +862,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
   if (sector_exact) sector_bound = latency ? words * 4 : (std::gcd(words, o.stride_elements) <= 8 ? words * 4 : reachable_words * 32);
   // Finite work matters because every non-latency memory launch restarts at
   // the same addresses. An unfiltered launch visits q*stride mod n for a
-  // contiguous q interval of length lanes*4*iterations. Full-period capacity
+  // contiguous q interval of length lanes*accesses_per_iteration*iterations.
+  // Read uses one access per iteration; write/copy retain four. Full-period capacity
   // alone must never qualify an HBM trial.
   const uint64_t region_words = o.workload == "l1" ? slice : words;
   const uint64_t region_lanes = o.workload == "l1" ? uint64_t(o.threads) : lanes;
@@ -789,7 +872,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
   if (memory) {
     if (latency) finite_words = std::min(words, uint64_t(std::min((long double)words, (long double)admitted_blocks * o.iterations)));
     else finite_words = std::min(region_words / std::gcd(region_words, o.stride_elements),
-      region_lanes * 4 * o.iterations) * (o.workload == "l1" ? o.blocks : 1);
+      region_lanes * memory_accesses_per_iteration * o.iterations) * (o.workload == "l1" ? o.blocks : 1);
   }
   uint64_t finite_sector_bound = std::min(sector_bound, finite_words * 32);
   bool finite_sector_exact = finite_words_exact && o.workload != "l1" && o.stride_elements == 1;
@@ -811,6 +894,15 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"fixed_batches\":" << o.fixed_batches << ",\"warmup_batches\":" << o.warmup_batches
     << ",\"mean_batch_duration_s\":" << timing.device_s / timing.batches
     << ",\"duration_scope\":\"CUDA event elapsed experiment window including gaps; not summed kernel busy time\""
+    << ",\"kernel_implementation_version\":" << quote(implementation_version)
+    << ",\"memory_accesses_per_thread_iteration\":" << (memory && !latency ? std::to_string(memory_accesses_per_iteration) : "null")
+    << ",\"memory_read_checksum_scope\":" << (simple_memory_read ? "\"sum32_of_all_reads_per_thread\"" : "null")
+    << ",\"memory_read_validation\":";
+  if (!simple_memory_read) std::cout << "null";
+  else std::cout << "{\"status\":" << quote(read_validation_status)
+    << ",\"checked_values\":" << read_checked_values << ",\"mismatched_values\":" << read_mismatched_values
+    << ",\"scope\":\"CPU deterministic input/index oracle for modulo-2^32 sums at up to eight distributed CTAs and three threads per CTA after measurement; repeated address cycles folded, at most 65536 unique steps per sampled thread; not exhaustive access or cache-path verification; filtered CTA identity unavailable\"}";
+  std::cout
     << ",\"operations\":" << operations << ",\"operation_unit\":" << quote(nonlinear ? "output elements of the complete function; not FLOPs or SFU instructions" : memory ? "32-bit memory accesses (copy pairs count once)" : o.workload == "control" ? "not attributed" : "dense FP FLOPs (FMA=2)")
     << ",\"logical_bytes\":" << logical_bytes
     << ",\"throughput_ops_s\":" << operations / timing.device_s
@@ -861,6 +953,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"max_absolute_error\":" << numerical.max_absolute_error << ",\"max_relative_error\":" << numerical.max_relative_error
     << ",\"absolute_tolerance\":0.000002,\"relative_tolerance\":0.0002,\"scope\":\"CPU double reference on distributed block slices/complete rows before warmup and after measurement; Softmax row sums also checked; not exhaustive\"}"
     << ",\"sanity\":{\"finite_output_sample\":" << (finite ? "true" : "false")
+    << ",\"memory_read_sample_matches_reference\":" << (simple_memory_read && read_checked_values ? (read_mismatched_values ? "false" : "true") : "null")
     << ",\"numerical_validation_passed\":" << (nonlinear ? (numerical.passed ? "true" : "false") : "null")
     << ",\"requested_sm_coverage_complete\":" << (missing.empty() ? "true" : "false") << "}"
     << ",\"profile_region\":" << (o.profile_region ? "true" : "false")
@@ -872,7 +965,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     if (o.workload == "tensor") epoch_operations = (long double)epoch.admitted_blocks * (o.threads / 32) * o.iterations * o.accumulators * 8192;
     else if (o.workload == "gemm") epoch_operations = (long double)epoch.batches * o.batch_launches * o.iterations * 2 * o.gemm_m * o.gemm_n * o.gemm_k;
     else if (latency) { epoch_operations = (long double)epoch.admitted_blocks * o.iterations; epoch_bytes = epoch_operations * 4; }
-    else if (memory) { epoch_operations = (long double)epoch.admitted_blocks * o.threads * o.iterations * 4; epoch_bytes = epoch_operations * 4 * (o.access == "copy" ? 2 : 1); }
+    else if (memory) { epoch_operations = (long double)epoch.admitted_blocks * o.threads * o.iterations * memory_accesses_per_iteration; epoch_bytes = epoch_operations * 4 * (o.access == "copy" ? 2 : 1); }
     else if (nonlinear) { epoch_operations = (long double)epoch.admitted_blocks * (words / o.blocks) * o.iterations; epoch_bytes = epoch_operations * (rowwise ? 16 : 8); }
     std::cout << (i ? "," : "") << "{\"host_monotonic_start_ns\":" << epoch.start_ns
       << ",\"host_monotonic_end_ns\":" << epoch.end_ns

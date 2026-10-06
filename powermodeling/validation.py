@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import math
 import statistics
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
+from .memory import VERSIONS as MEMORY_IMPLEMENTATION_VERSIONS, count_issues as memory_count_issues
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,9 @@ def _kernel_assessment(rows, evidence, policy):
                        component_scope="whole FP32 nonlinear function includes memory/reduction; SFU instructions do not define its energy denominator")
     elif workload in ("l1", "l2", "l2_latency", "hbm"):
         result = evidence.get("profile_benchmark") or {}
+        if result.get("kernel_implementation_version") in MEMORY_IMPLEMENTATION_VERSIONS:
+            _check(checks, "profile_memory_count_contract", memory_count_issues(result, workload), lambda v: not v,
+                   "versioned scalar memory operations and bytes match admission/thread/iteration counts")
         logical = _number(result.get("logical_bytes"))
         launches = _number(result.get("kernel_launches"))
         if launches != 1:
@@ -340,11 +344,13 @@ def validate_evidence(record, evidence, policy=None):
             _check(checks, "matching_parameter_" + name, config.get(name), lambda v, e=expected: v == e, "exact requested workload parameter")
     benchmark = evidence.get("profile_benchmark") or {}
     measured_benchmark = record.get("benchmark") or {}
-    effective_names = ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated")
+    effective_names = ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated", "kernel_implementation_version", "memory_accesses_per_thread_iteration")
     if record.get("workload") in NONLINEAR_WORKLOADS:
         effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
         if record.get("workload") == "rmsnorm": effective_names += ("rms_epsilon", "affine_gamma")
     for name in effective_names:
+        if name in ("kernel_implementation_version", "memory_accesses_per_thread_iteration") and benchmark.get(name) is None and measured_benchmark.get(name) is None:
+            continue
         if name in benchmark or name in measured_benchmark:
             _check(checks, "matching_effective_" + name, benchmark.get(name), lambda v, e=measured_benchmark.get(name): e is not None and v == e, "exact effective profile/energy workload parameter")
     clocks = provenance.get("requested_clocks") or {}

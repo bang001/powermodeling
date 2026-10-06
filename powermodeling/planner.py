@@ -359,6 +359,11 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
         for values in itertools.product(*(grid[k] for k in keys)):
             params = dict(spec.get("parameters", {}))
             params.update(dict(zip(keys, values)))
+            if workload in ("l1", "l2", "hbm"):
+                # A scalar read emits one load per iteration. Four times the
+                # former implicit loop count preserves default payload and
+                # finite-launch coverage; explicitly requested counts are literal.
+                params.setdefault("iterations", 4096 if params.get("access", "read") == "read" else 1024)
             if set(params)-PARAMETERS: raise ValueError(f"Unknown parameters: {set(params)-PARAMETERS}")
             resolved, env = {}, dict(names)
             for key in sorted(params, key=lambda k: (k not in ("blocks", "threads"), k)):

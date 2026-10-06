@@ -54,7 +54,12 @@ CUDA/NCU 버전이 필요하다. Literature의 isolated component pJ와 전체 G
 
 ## 코드 점검에서 확인한 것
 
-현재 Tensor 분모는 WMMA당 `2 × 16 × 16 × 16 = 8192 FLOP`, memory는
+아래 커널 점검은 `8892f8c`까지의 four-stream read 구현을 대상으로 했다. 현재는
+[단일 stream read v2](memory-read-v2.ko.md)로 변경했으며, read는 iteration당
+한 접근과 단순 uint32 합계를 사용한다. 기본 iterations를 4배로 늘려 기본 launch
+요청량을 유지했고, 명시적인 iteration 값은 변환하지 않는다. 이전 raw의 계산은 보존한다.
+
+당시 Tensor 분모는 WMMA당 `2 × 16 × 16 × 16 = 8192 FLOP`, memory는
 thread당 iteration마다 4개 32-bit 접근이며 copy는 read+write를 함께 센다.
 NVML의 전력 mW→W, 누적 에너지 mJ→J, logical byte→bit 계산에서도 공통 배율 오류는
 발견하지 못했다. 이는 실장비의 계측 정확도까지 확인했다는 뜻은 아니다.

@@ -287,6 +287,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "objective_eligible": {o: o == "total" or group.get(o + "_eligible") is True for o in OBJECTIVES},
                 "eligibility_reasons": {o: _eligibility_reasons(group, o, o + "_" + u["energy_suffix"], rate, minimum_repeats, policy) for o in OBJECTIVES},
                 "tensor_dense_peak_fraction": group.get("tensor_utilization_vs_dense_clock_peak"),
+                "measurement_diagnostics": group.get("measurement_diagnostics"),
                 "row_width": (group.get("nonlinear_contract") or {}).get("row_width"),
                 "pj_per_row": {o: group.get(o + "_pj_per_row") for o in OBJECTIVES},
                 "config": cfg})
@@ -304,6 +305,8 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                             "memory_mhz": cfg.get("memory_clock_mhz"), "cycles_per_access": probe["cycles_per_access"]})
             evidence.append({"group_id": group["group_id"], "status": group.get("ncu_status"), "checks": list(checks.values()),
                 "sampled_numerical_checks": [t.get("numerical_validation") for t in ts if t.get("numerical_validation")],
+                "traffic_amplification": [t["ncu_assessment"]["traffic_amplification"] for t in ts
+                                          if (t.get("ncu_assessment") or {}).get("traffic_amplification")],
                 "profile_rates": [t["profile_rates_summary"] for t in ts if t.get("profile_rates_summary")]})
         clocks, candidates = [], defaultdict(list)
         for (gfx, mem), rows in sorted(clock_buckets.items()):
@@ -352,9 +355,25 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "near_optimum_group_ids": [g["group_id"] for g in eligible if g[metric] <= winner[metric] * (1 + selection.get("near_optimum_fraction", 0.05))],
                 "factory_default_comparison": _comparison(winner, tagged, objective, rate, metric, minimum_repeats, policy, "factory_default"),
                 "exact_1110_comparison": _comparison(winner, tagged, objective, rate, metric, minimum_repeats, policy, "exact_1110")})
+        selection_diagnostics = []
+        for objective in OBJECTIVES:
+            metric = objective + "_" + u["energy_suffix"]
+            own = min(candidates[objective], key=lambda g: (g[metric], -g[rate], g["group_id"]), default=None)
+            recommendation = next(r for r in recommendations if r["objective"] == objective)
+            energy = recommendation.get("energy")
+            selection_diagnostics.append({"objective": objective,
+                "lowest_own_clock_candidate_group_id": own["group_id"] if own else None,
+                "lowest_own_clock_candidate_energy": own[metric] if own else None,
+                "own_clock_candidate_global_throughput_fraction": own[rate] / observed_peak if own and observed_peak else None,
+                "global_constraint_candidate_group_id": recommendation.get("group_id"),
+                "global_constraint_candidate_energy": energy,
+                "global_constraint_energy_over_own_clock_energy": energy / own[metric] if own and own[metric] > 0 and energy is not None else None,
+                "reason": "The lowest own-clock candidate falls below the full-sweep throughput threshold" if own and observed_peak and own[rate] < fraction * observed_peak else "The lowest own-clock candidate meets the full-sweep throughput threshold" if own else "No qualified own-clock candidate",
+                "scope": "Same count/profile/repeat/CI/geometry gates and own-clock throughput bar; comparing the added full-sweep throughput constraint, not correcting energy or proving saturation"})
         components.append({"component_id": component_id, "stratum": stratum, "gpu_name": groups[0].get("gpu_name"), "units": u,
             "trial_counts": dict(Counter("valid" if analyzed[i].get("valid") else "invalid" for g in groups for i in g["trial_ids"] if i in analyzed)),
             "points": point_rows, "clocks": clocks, "observed_peak": observed_peak, "recommendations": recommendations,
+            "energy_selection_diagnostics": selection_diagnostics,
             "profiler_evidence": evidence, "latency_points": latency,
             "correctness_scope": "distributed CPU-double output samples before/after measurement; not exhaustive" if workload in NONLINEAR_WORKLOADS else
                                  "finite output samples and issued-operation accounting; full mathematical reference not established" if workload in TENSOR else
@@ -369,5 +388,6 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             "limits": ["All optima are restricted to observed supported clocks and tested configurations.",
                        "Bootstrap intervals measure repeat variation, not sensor calibration accuracy.",
                        "Profiler counter rates use replay busy time and are never energy-run sustained throughput.",
+                       "Compare the same energy objective and denominator. Total/idle ratios and replay traffic amplification diagnose differences; they do not rescale the measured energy.",
                        "A resource plateau is empirical evidence; it does not prove hardware saturation or pure component energy.",
                        "Factory default means the advertised fixed clock pair; incoming driver policy is a separate reference."]}

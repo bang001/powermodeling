@@ -199,6 +199,60 @@ class EvaluationTests(unittest.TestCase):
         for kwargs in ({"minimum_resource_levels":2},{"plateau_tolerance_fraction":float('nan')},{"maximum_relative_ci_width":True}):
             with self.assertRaises(ValueError):EvaluationPolicy(**kwargs)
 
+    def test_full_sweep_performance_bar_can_select_higher_energy_than_own_clock_minimum(self):
+        plan, records = study_fixture()
+        for record in records:
+            if record["config"]["graphics_clock_mhz"] != 900:
+                continue
+            record["benchmark"]["operations"] *= 0.8
+            record["benchmark"]["logical_bytes"] *= 0.8
+            for epoch in record["benchmark"]["measure_epochs"]:
+                epoch["operations"] *= 0.8
+                epoch["logical_bytes"] *= 0.8
+            for name, phase in record["phases"].items():
+                for sample in phase["samples"]:
+                    sample.pop("energy_mj", None)
+                    if name == "measure":
+                        sample["power_w"] = 80
+        component = summarize(records, plan=plan)["evaluation"]["components"][0]
+        diagnostic = next(d for d in component["energy_selection_diagnostics"] if d["objective"] == "total")
+        self.assertAlmostEqual(diagnostic["own_clock_candidate_global_throughput_fraction"], 0.8)
+        self.assertGreater(diagnostic["global_constraint_candidate_energy"], diagnostic["lowest_own_clock_candidate_energy"])
+        self.assertNotEqual(diagnostic["lowest_own_clock_candidate_group_id"], diagnostic["global_constraint_candidate_group_id"])
+        self.assertIn("falls below", diagnostic["reason"])
+
+    def test_energy_accounting_preserves_scope_difference_and_unqualified_contrast(self):
+        records = []
+        for repeat in range(4):
+            record = synthetic_trial("hbm", active_power=184, throughput=1e12, repeat=repeat)
+            for name, phase in record["phases"].items():
+                for sample in phase["samples"]:
+                    sample.pop("energy_mj", None)
+                    sample["pstate"] = 8 if name.startswith("idle_") else 0
+                    if name.startswith("idle_"):
+                        sample["power_w"] = 64
+            records.append(record)
+        summary = summarize(records)
+        point = summary["evaluation"]["components"][0]["points"][0]
+        self.assertEqual(point["energies"]["total"], 23)
+        self.assertEqual(point["energies"]["operational_idle_increment"], 15)
+        self.assertFalse(point["objective_eligible"]["operational_idle_increment"])
+        diagnostics = point["measurement_diagnostics"]
+        self.assertEqual(diagnostics["power_contributions"]["idle_w"], 64)
+        self.assertAlmostEqual(diagnostics["scope_factors"]["total_over_idle_increment"], 23 / 15)
+        self.assertEqual(diagnostics["objectives"]["total"]["reconstructed_value"], 23)
+        with tempfile.TemporaryDirectory() as directory:
+            files = write_summary(summary, directory)
+            html = Path(files["evaluation_html"]).read_text()
+            self.assertIn("Energy accounting and comparison checks", html)
+            import csv
+            with Path(files["evaluation_csv"]).open() as stream:
+                rows = list(csv.DictReader(stream))
+            total = next(row for row in rows if row["objective"] == "total")
+            exported = json.loads(total["measurement_diagnostics"])
+            self.assertEqual(exported["objectives"]["total"]["reported_value"], 23)
+            self.assertFalse(exported["scope_factors"]["idle_increment_eligible"])
+
 
 if __name__ == "__main__":
     unittest.main()

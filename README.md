@@ -155,6 +155,7 @@ python -m powermodeling analyze --input results/nonlinear-validated \
 | [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
 | [configs/nonlinear-smoke.json](configs/nonlinear-smoke.json) | FP32 비선형 함수 5종의 실행·수치·센서 점검 |
 | [configs/nonlinear.json](configs/nonlinear.json) | 비선형 함수의 footprint·geometry·행 너비·clock별 pJ/element sweep |
+| [configs/component-diagnostics.json](configs/component-diagnostics.json) | Tensor·L1·L2·HBM 단가가 높을 때 iterations/batching·Tensor dependency·L1 footprint를 분리하는 추가 진단 |
 
 JSON의 `clock_pairs`로 검증된 특정 pair를 진단할 수 있다. **`saturation.json`·`dvfs.json`·`locality.json`·`nonlinear.json`의 energy sweep은 기본 `graphics_min_mhz: 900`, `graphics_step_mhz: 90`을 사용한다.** 간격은 60·90·120 MHz 등 양의 정수로 변경할 수 있다. 각 memory domain에서 900 MHz 이상의 지원 값에만 grid를 매핑하고 해당 평가 범위의 끝점, exact 1110 MHz(지원 domain), advertised factory-default 고정 pair와 incoming-policy reference를 포함한다. 일반 200–300 MHz sweep는 생성하지 않는다. 필수 default pair가 하한 아래이면 그 anchor만 예외로 포함한다. 1110 미지원은 사유를 기록하며 근사값으로 대체하지 않는다. incoming policy를 factory-default DVFS라고 단정하지 않는다. 지원/평가 범위·제외된 낮은 native 값·실제 간격은 `plan.clock_sweep_coverage`에 남긴다.
 
@@ -227,6 +228,14 @@ python -m powermodeling analyze --input results/validated \
 | `verified_target_coverage` | 전체/검증된 최고 처리량·비율·95% 통과 조건 수·미검증 또는 실패한 peak group을 보고 |
 
 `valid=true`는 기록의 품질 기준을 통과했다는 뜻이며, `target_verified=true`나 물리 블록 isolation의 증명이 아니다. worker는 약 1초 간격의 완료 batch 수와 실제 SM admission 수를 기록하고, 분석은 양 끝을 제외한 완료 구간에서 work count와 에너지를 함께 계산한다. 이 기록이 없는 과거 결과는 지속 처리량이 일정하다는 가정의 추정치로 남기고 검증된 최적값에는 사용하지 않는다. idle와 active의 실제 클럭이나 온도가 다르면 증가분에는 activation·주파수 상태·누설 변화가 섞일 수 있으며 경고가 남는다. 3–4회처럼 적은 반복의 bootstrap 범위는 거칠다. 수치 차이가 작으면 반복과 최소점 주변 지원 주파수 측정을 늘리고 온도·센서·counter evidence를 확인한다. V100·A100·H100의 최적 pJ/bit·pJ/FLOP 주파수는 각 UUID의 결과에서 독립적으로 선택하며 1110 MHz를 최적점으로 미리 지정하지 않는다. physical pJ/bit는 동일 energy-window의 계층 traffic provenance가 없어 현재 withheld이고 NCU replay bytes만으로 단가를 계산하지 않는다.
+
+## 기존 실험보다 에너지 단가가 높을 때
+
+먼저 같은 컴포넌트·단위·에너지 기준·실제 클럭을 비교한다. 전체 GPU 단가와 idle 증가분은 서로 다르고, 메모리의 legacy `pj_per_logical_byte`는 pJ/bit의 8배다. 같은 기준이라면 높은 단가는 전력 증가 또는 낮은 지속 처리량에서 생길 수 있다. 경로 검증 `pass`만으로 bandwidth 포화를 확인하지 않는다.
+
+기존 raw를 새 출력 폴더로 `analyze`하면 `measurement_diagnostics`가 같은 구간의 J/count 재구성, 전체/idle/reference 비율, 누적 에너지·전력 적분 crosscheck, timing과 occupancy 근거를 제공한다. `evaluation.html`의 **Energy accounting and comparison checks**에서 각 기준을 나란히 확인할 수 있다. NCU evidence에는 sector·DRAM traffic amplification을 추가했다. 에너지 숫자에 임의의 보정 배율을 적용하지 않는다.
+
+[원인 점검·재분석·추가 진단 지침](docs/high-energy-investigation.ko.md)에 비교 항목과 `component-diagnostics.json`의 stage별 실행 방법을 설명한다. 전체 진단은 clock 조건 하나에서 최소 약 2.29시간이며, 필요한 stage만 실행할 수 있다. 기존 raw는 원래 binary의 evidence를 유지하고 새 binary로 수행한 진단은 별도 결과로 저장한다.
 
 ## NCU를 통한 적절성 판단
 
@@ -311,5 +320,6 @@ CPU 테스트는 데이터 분석·모델 식별·plan·NVML mock·클럭 복원
 - [실험 설계: static/dynamic 기준, DVFS, hierarchy, near/far, fairness](docs/experiment-design.ko.md)
 - [비선형 함수: EXP·TANH·RMSNorm·Softmax·SiLU의 정의·실행·에너지 단위](docs/nonlinear-experiments.ko.md)
 - [컴포넌트별 평가·시각화: coverage·반복 정밀도·plateau·에너지 후보](docs/evaluation-design.ko.md)
+- [높은 Tensor·L1·L2·HBM 단가: 기준·계산·처리량 점검과 추가 진단](docs/high-energy-investigation.ko.md)
 - [전체 구현 자가점검: 발견 사항·수정·검증·남은 실측](docs/self-audit.ko.md)
 - [NVIDIA 공식 출처 및 검증이 필요한 주장](docs/sources.md)

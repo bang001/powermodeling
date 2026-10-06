@@ -359,6 +359,26 @@ __global__ void latency_kernel(const uint32_t* links, uint32_t* sink,
   atomicAdd(loads_per_sm + id, static_cast<unsigned long long>(iterations));
 }
 
+// Query compiled resources outside the measured phases. This is an occupancy
+// upper bound for one homogeneous kernel, never a measurement of achieved
+// occupancy, concurrent CTA count, Tensor utilization or cache residency.
+struct KernelResources {
+  bool available = false;
+  cudaFuncAttributes attributes{};
+  int max_active_blocks_per_sm = 0;
+  size_t dynamic_shared_bytes_per_block = 0;
+};
+template<class Kernel>
+KernelResources query_kernel_resources(Kernel kernel, int threads, size_t dynamic_shared_bytes = 0) {
+  KernelResources result;
+  CUDA_CHECK(cudaFuncGetAttributes(&result.attributes, kernel));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &result.max_active_blocks_per_sm, kernel, threads, dynamic_shared_bytes));
+  result.available = true;
+  result.dynamic_shared_bytes_per_block = dynamic_shared_bytes;
+  return result;
+}
+
 std::string uuid_string(const cudaUUID_t& uuid) {
   std::ostringstream out; out << "GPU-" << std::hex << std::setfill('0');
   for (int i = 0; i < 16; ++i) {
@@ -558,6 +578,26 @@ void experiment(Options o, const cudaDeviceProp& p) {
   // rate still require counters. No shared memory is consumed by this kernel.
   if (o.workload == "l1")
     CUDA_CHECK(cudaFuncSetAttribute(memory_kernel<true, 0>, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
+  KernelResources resources;
+  if (o.workload == "tensor") {
+    #define TENSOR_RESOURCE_CASE(N) case N: resources = query_kernel_resources(tensor_kernel<N>, o.threads); break
+    switch (o.accumulators) {
+      TENSOR_RESOURCE_CASE(1); TENSOR_RESOURCE_CASE(2); TENSOR_RESOURCE_CASE(3); TENSOR_RESOURCE_CASE(4);
+      TENSOR_RESOURCE_CASE(5); TENSOR_RESOURCE_CASE(6); TENSOR_RESOURCE_CASE(7); TENSOR_RESOURCE_CASE(8);
+    }
+    #undef TENSOR_RESOURCE_CASE
+  } else if (o.workload == "l1") resources = query_kernel_resources(memory_kernel<true, 0>, o.threads);
+  else if (o.workload == "l2" || o.workload == "hbm") {
+    if (o.access == "read") resources = query_kernel_resources(memory_kernel<false, 0>, o.threads);
+    else if (o.access == "write") resources = query_kernel_resources(memory_kernel<false, 1>, o.threads);
+    else resources = query_kernel_resources(memory_kernel<false, 2>, o.threads);
+  } else if (latency) resources = query_kernel_resources(latency_kernel, o.threads);
+  else if (o.workload == "control") resources = query_kernel_resources(control_kernel, o.threads);
+  else if (o.workload == "exp") resources = query_kernel_resources(pointwise_nonlinear_kernel<0>, o.threads);
+  else if (o.workload == "tanh") resources = query_kernel_resources(pointwise_nonlinear_kernel<1>, o.threads);
+  else if (o.workload == "silu") resources = query_kernel_resources(pointwise_nonlinear_kernel<2>, o.threads);
+  else if (o.workload == "softmax") resources = query_kernel_resources(row_nonlinear_kernel<true>, o.threads, o.threads * sizeof(float));
+  else if (o.workload == "rmsnorm") resources = query_kernel_resources(row_nonlinear_kernel<false>, o.threads, o.threads * sizeof(float));
   Blas blas;
   const bool filtered = !o.sm_ids.empty();
   uint64_t launch_nonce = o.seed;
@@ -796,6 +836,19 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"tensor_accumulators\":" << o.accumulators
     << ",\"gemm_m\":" << o.gemm_m << ",\"gemm_n\":" << o.gemm_n << ",\"gemm_k\":" << o.gemm_k
     << ",\"seed\":" << o.seed << ",\"checksum\":" << checksum << ",\"checksum_kind\":" << quote(checksum_kind)
+    << ",\"kernel_resources\":";
+  if (!resources.available) std::cout << "null";
+  else std::cout << "{\"registers_per_thread\":" << resources.attributes.numRegs
+    << ",\"local_bytes_per_thread\":" << resources.attributes.localSizeBytes
+    << ",\"static_shared_bytes_per_block\":" << resources.attributes.sharedSizeBytes
+    << ",\"dynamic_shared_bytes_per_block\":" << resources.dynamic_shared_bytes_per_block
+    << ",\"max_active_blocks_per_sm\":" << resources.max_active_blocks_per_sm
+    << ",\"max_active_warps_per_sm\":" << resources.max_active_blocks_per_sm * (o.threads / p.warpSize)
+    << ",\"occupancy_upper_bound_fraction\":" << double(resources.max_active_blocks_per_sm * o.threads) / p.maxThreadsPerMultiProcessor
+    << ",\"grid_average_blocks_per_sm\":" << double(o.blocks) / p.multiProcessorCount
+    << ",\"l1_slice_bytes_per_sm_at_occupancy_bound\":" << (o.workload == "l1" ? uint64_t(resources.max_active_blocks_per_sm) * slice * 4 : 0)
+    << ",\"scope\":\"CUDA compiled resources and theoretical residency limit; grid-average and L1 slice capacity are diagnostic bounds, not actual concurrent scheduling, occupancy, cache hit rate or Tensor utilization\"}";
+  std::cout
     << ",\"row_width\":" << (rowwise ? o.row_width : 0)
     << ",\"elements\":" << (nonlinear ? operations : 0)
     << ",\"row_evaluations\":" << (rowwise ? operations / o.row_width : 0)

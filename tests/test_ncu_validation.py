@@ -209,6 +209,110 @@ class TargetAdmissionTests(unittest.TestCase):
         change(evidence, L2_READ, 30000)
         self.assertEqual(assess_profile(evidence)["status"], "fail")
 
+    def test_path_admission_can_pass_with_eightfold_traffic_amplification(self):
+        _, evidence = pass_fixture("hbm")
+        change(evidence, L1_SECTORS, 25000)
+        change(evidence, L2_READ, 25000)
+        change(evidence, DRAM_READ, 800000)
+        result = assess_profile(evidence)
+        self.assertEqual(result["status"], "pass", result["reasons"])
+        traffic = result["traffic_amplification"]
+        self.assertEqual(traffic["logical_bytes"], 100000)
+        for key in ("l1_read_sector_bytes_per_logical_read_byte",
+                    "l2_read_sector_bytes_per_logical_read_byte",
+                    "l2_sector_bytes_per_logical_byte",
+                    "dram_read_bytes_per_logical_read_byte",
+                    "dram_bytes_per_logical_byte"):
+            self.assertEqual(traffic[key], 8)
+        self.assertEqual(traffic["dram_read_bytes"], 800000)
+        self.assertEqual(traffic["logical_payload_binding"], "one_observed_and_reported_microkernel")
+        self.assertEqual(traffic["energy_denominator_use"], "forbidden_separate_profiler_run")
+        self.assertIsNone(traffic["dram_write_bytes_per_logical_write_byte"])
+        self.assertEqual(result["rates_summary"]["traffic_amplification"], traffic)
+        self.assertNotIn("pj_per_physical_bit", traffic)
+
+    def test_missing_counter_or_unknown_units_leave_amplification_unknown(self):
+        for metric, field in ((DRAM_READ, "dram_read_bytes_per_logical_read_byte"),
+                              (L1_SECTORS, "l1_read_sector_bytes_per_logical_read_byte"),
+                              (L2_READ, "l2_read_sector_bytes_per_logical_read_byte")):
+            for mode in ("missing", "unknown", "missing_unit"):
+                with self.subTest(metric=metric, mode=mode):
+                    _, evidence = pass_fixture("hbm")
+                    change(evidence, metric, remove=mode == "missing",
+                           unit="unknown" if mode == "unknown" else "" if mode == "missing_unit" else None)
+                    result = assess_profile(evidence)
+                    self.assertEqual(result["status"], "inconclusive")
+                    self.assertIsNone(result["traffic_amplification"][field])
+                    self.assertEqual(result["traffic_amplification"]["logical_bytes"], 100000)
+
+    def test_directional_payloads_are_distinct_for_read_write_and_copy(self):
+        for access in ("read", "write", "copy"):
+            _, evidence = pass_fixture("hbm", access)
+            traffic = assess_profile(evidence)["traffic_amplification"]
+            self.assertEqual(traffic["dram_bytes_per_logical_byte"], 1)
+            self.assertEqual(traffic["dram_read_bytes_per_logical_read_byte"],
+                             1 if access in ("read", "copy") else None)
+            self.assertEqual(traffic["dram_write_bytes_per_logical_write_byte"],
+                             1 if access in ("write", "copy") else None)
+
+    def test_extra_profile_kernel_cannot_reuse_single_launch_payload(self):
+        for workload in ("l1", "l2", "l2_latency", "hbm"):
+            with self.subTest(workload=workload):
+                _, evidence = pass_fixture(workload)
+                second = copy.deepcopy(evidence["rows"])
+                for row in second:
+                    row["id"] = "1"
+                evidence["rows"].extend(second)
+                result = assess_profile(evidence)
+                self.assertEqual(result["status"], "fail")
+                self.assertTrue(any(check["name"] == "memory_profile_observed_launch_count"
+                                    and check["status"] == "fail" for check in result["checks"]))
+                self.assertIsNone(result["traffic_amplification"]["dram_bytes_per_logical_byte"])
+                self.assertEqual(result["traffic_amplification"]["logical_payload_binding"],
+                                 "unknown_missing_or_multiple_profile_kernels")
+
+    def test_one_launch_id_with_conflicting_kernel_names_fails(self):
+        _, evidence = pass_fixture("hbm")
+        second = copy.deepcopy(evidence["rows"])
+        for row in second:
+            row["kernel"] = "conflicting_kernel_name"
+        evidence["rows"].extend(second)
+        result = assess_profile(evidence)
+        self.assertEqual(result["status"], "fail")
+        self.assertTrue(any(check["name"] == "memory_profile_launch_id_unique_mapping"
+                            and check["status"] == "fail" for check in result["checks"]))
+
+    def test_one_observed_kernel_with_two_reported_launches_has_unknown_payload(self):
+        _, evidence = pass_fixture("hbm")
+        evidence["profile_benchmark"]["kernel_launches"] = 2
+        result = assess_profile(evidence)
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["traffic_amplification"]["logical_payload_binding"],
+                         "unknown_missing_or_multiple_profile_kernels")
+        self.assertIsNone(result["traffic_amplification"]["logical_bytes"])
+        self.assertIsNone(result["traffic_amplification"]["dram_bytes_per_logical_byte"])
+        self.assertTrue(any(check["name"] == "memory_profile_observed_launch_count"
+                            and check["status"] == "fail" for check in result["checks"]))
+
+    def test_missing_launch_id_or_count_is_inconclusive(self):
+        for missing in ("id", "kernel_launches", "invalid_id"):
+            with self.subTest(missing=missing):
+                _, evidence = pass_fixture("hbm")
+                if missing == "id":
+                    for row in evidence["rows"]:
+                        row.pop("id")
+                elif missing == "invalid_id":
+                    for row in evidence["rows"]:
+                        row["id"] = "²"
+                else:
+                    evidence["profile_benchmark"].pop("kernel_launches")
+                result = assess_profile(evidence)
+                self.assertEqual(result["status"], "inconclusive")
+                self.assertEqual(result["traffic_amplification"]["logical_payload_binding"],
+                                 "unknown_missing_or_multiple_profile_kernels")
+                self.assertTrue(any(check["name"] == "memory_profile_observed_launch_count"
+                                    and check["status"] == "inconclusive" for check in result["checks"]))
+
     def test_no_cross_kernel_ratio_average(self):
         _, evidence = pass_fixture()
         second = copy.deepcopy(evidence["rows"])

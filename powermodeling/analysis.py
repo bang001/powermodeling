@@ -391,6 +391,158 @@ def _treatment_design_stratum(record, benchmark):
             "reference_kind": protocol.get("reference_kind"),
             "paired_reference_context_allocated": benchmark.get("paired_reference_context_allocated", protocol.get("paired_reference_context_allocated"))}
 
+
+def _measurement_diagnostics(result, benchmark, epochs):
+    """Expose the measured numerator/denominator without changing any estimate.
+
+    Scope conversion factors explain an operational comparison, not physical
+    component attribution. CUDA event duration is an experiment span, never a
+    claim of summed kernel busy time; profiler replay cannot repair that span.
+    """
+    workload = result.get("workload")
+    memory, tensor = workload in _MEMORY_WORKLOADS, workload in _TENSOR_WORKLOADS
+    nonlinear = workload in NONLINEAR_WORKLOADS
+    duration = _finite(result.get("duration_s"))
+    exact = result.get("count_energy_time_alignment_exact") is True
+    if memory:
+        unit, suffix, rate = "logical bit", "pj_per_logical_bit", _finite(result.get("throughput_bytes_s"))
+        rate = rate * 8 if rate is not None else None
+        count = _finite(result.get("counted_measure_logical_bytes"))
+        count = count * 8 if count is not None else None
+    elif tensor or nonlinear:
+        unit, suffix = ("FLOP", "pj_per_flop") if tensor else ("element", "pj_per_element")
+        rate = _finite(result.get("throughput_ops_s"))
+        count = _finite(result.get("counted_measure_operations"))
+    else:
+        unit = suffix = rate = count = None
+
+    def ratio(a, b):
+        return a / b if a is not None and b is not None and b > 0 else None
+
+    objectives = {}
+    for objective, prefix, power_field, energy_field, eligible in (
+        ("total", "total_", "board_power_w", "total_energy_j", result.get("valid") is True and exact),
+        ("operational_idle_increment", "operational_idle_increment_", "operational_idle_increment_power_w", "operational_idle_increment_energy_j", result.get("operational_idle_increment_eligible") is True),
+        ("paired_active_reference", "paired_active_reference_", "paired_active_reference_power_w", "paired_active_reference_energy_j", result.get("paired_active_reference_eligible") is True),
+    ):
+        power, energy = _finite(result.get(power_field)), _finite(result.get(energy_field))
+        metric = prefix + suffix if suffix else None
+        reported = _finite(result.get(metric)) if metric else None
+        reconstructed = (ratio(energy, count) if exact else ratio(power, rate))
+        reconstructed = reconstructed * 1e12 if reconstructed is not None else None
+        objectives[objective] = {"metric": metric, "unit": "pJ/" + unit if unit else None,
+                                 "reported_value": reported, "reconstructed_value": reconstructed,
+                                 "reconstruction_difference": reported - reconstructed if None not in (reported, reconstructed) else None,
+                                 "power_w": power, "energy_j": energy, "eligible": eligible,
+                                 "scope": "whole-device total" if objective == "total" else "whole-device operational contrast; physical component energy is not isolated"}
+
+    board, idle = _finite(result.get("board_power_w")), _finite(result.get("idle_power_w"))
+    reference = _finite(result.get("active_reference_power_w"))
+    incremental = _finite(result.get("operational_idle_increment_power_w"))
+    paired = _finite(result.get("paired_active_reference_power_w"))
+    integral, counter = _finite(result.get("integrated_power_energy_j")), _finite(result.get("energy_counter_j"))
+    durations = [e["end_s"] - e["start_s"] for e in epochs]
+    span = epochs[-1]["end_s"] - epochs[0]["start_s"] if epochs else None
+    readbacks = [_finite(e.get("counter_readback_ns")) for e in epochs]
+    readback_s = sum(readbacks) / 1e9 if readbacks and all(v is not None and v >= 0 for v in readbacks) else None
+    mean_batch = _finite(benchmark.get("mean_batch_duration_s"))
+    operation_count, byte_count = _finite(result.get("counted_measure_operations")), _finite(result.get("counted_measure_logical_bytes"))
+    bits_per_operation = ratio(byte_count * 8 if byte_count is not None else None, operation_count) if memory else None
+    aliases = {}
+    if memory:
+        aliases["pj_per_logical_byte"] = {"canonical_metric": "operational_idle_increment_pj_per_logical_bit", "value_multiplier": 8, "unit": "pJ/logical byte"}
+        aliases["total_pj_per_logical_byte"] = {"canonical_metric": "total_pj_per_logical_bit", "value_multiplier": 8, "unit": "pJ/logical byte"}
+        aliases["pj_per_op"] = {"canonical_metric": "operational_idle_increment_pj_per_logical_bit", "value_multiplier": bits_per_operation, "unit": benchmark.get("operation_unit", "pJ/reported memory operation")}
+    elif tensor or nonlinear:
+        aliases["pj_per_op"] = {"canonical_metric": "operational_idle_increment_" + suffix, "value_multiplier": 1, "unit": "pJ/" + unit}
+        aliases["total_pj_per_op"] = {"canonical_metric": "total_" + suffix, "value_multiplier": 1, "unit": "pJ/" + unit}
+    assessment = result.get("ncu_assessment") or {}
+    profile = ((result.get("validation") or {}).get("profiler_evidence") or {}).get("profile_benchmark") or {}
+    replay_duration = _finite((assessment.get("rates_summary") or {}).get("kernel_duration_s"))
+    replay_count = _finite(profile.get("logical_bytes" if memory else "operations")) if unit else None
+    replay_count = replay_count * 8 if memory and replay_count is not None else replay_count
+    replay_rate = ratio(replay_count, replay_duration)
+    return {
+        "schema_version": 1,
+        "denominator": {"unit": unit, "measured_count": count if exact else None,
+                        "selected_epoch_count": count, "rate_per_s": rate, "aligned_window_s": duration,
+                        "exact_matching_window": exact,
+                        "kind": "same-window counted work" if exact else "stationary whole-run throughput estimate; no exact energy-window work count"},
+        "objectives": objectives,
+        "unit_conventions": {"bits_per_byte": 8 if memory else None, "flops_per_fma": 2 if tensor else None,
+                             "flop_convention": result.get("flop_count_convention"),
+                             "reported_operation_unit": benchmark.get("operation_unit"),
+                             "logical_bits_per_reported_memory_operation": bits_per_operation,
+                             "logical_byte_scope": "requested read payload plus requested write payload for copy; not physical cache-sector or DRAM traffic" if memory else None,
+                             "aliases": aliases},
+        "scope_factors": {"total_over_idle_increment": ratio(board, incremental),
+                          "total_over_paired_reference": ratio(board, paired),
+                          "idle_increment_eligible": result.get("operational_idle_increment_eligible") is True,
+                          "paired_reference_eligible": result.get("paired_active_reference_eligible") is True,
+                          "interpretation": "Numerical operational scope ratios only; ineligible contrasts and component literature must not be silently substituted."},
+        "power_contributions": {"total_w": board, "idle_w": idle, "idle_fraction": ratio(idle, board),
+                                "paired_reference_w": reference, "paired_reference_fraction": ratio(reference, board),
+                                "idle_increment_w": incremental, "paired_contrast_w": paired},
+        "telemetry_crosscheck": {"energy_source": result.get("energy_source"), "counter_energy_j": counter,
+                                 "integrated_power_energy_j": integral, "counter_over_integrated": ratio(counter, integral),
+                                 "disagreement_fraction": abs(counter - integral) / integral if counter is not None and integral is not None and integral > 0 else None},
+        "throughput_crosscheck": {"unit": unit + "/s" if unit else None, "sustained_rate_per_s": rate,
+                                  "profiler_replay_rate_per_s": replay_rate, "profiler_replay_count": replay_count,
+                                  "profiler_replay_summed_kernel_duration_s": replay_duration,
+                                  "profiler_over_sustained_rate": ratio(replay_rate, rate),
+                                  "profiler_target_verified": result.get("target_verified") is True,
+                                  "same_energy_run": False,
+                                  "note": "Profiler replay uses a different run and summed kernel duration. Rate disagreement can motivate timing/traffic review but does not prove host overhead, permit energy rescaling or supply same-window physical traffic."},
+        "execution": {"kernel_resources": benchmark.get("kernel_resources"),
+                      "execution_diagnostics": benchmark.get("execution_diagnostics"),
+                      "implementation_version": benchmark.get("kernel_implementation_version"),
+                      "saturation_status": "CUDA occupancy bounds and grid size do not establish achieved utilization or hardware saturation"},
+        "timing": {"host_duration_s": _finite(benchmark.get("host_duration_s")),
+                   "event_duration_s": _finite(benchmark.get("duration_s")),
+                   "event_duration_scope": benchmark.get("duration_scope", "CUDA experiment window; summed kernel busy time is not established"),
+                   "mean_batch_experiment_duration_s": mean_batch,
+                   "complete_epochs": len(epochs), "complete_epoch_span_s": span,
+                   "summed_epoch_duration_s": sum(durations) if durations else None,
+                   "inter_epoch_gap_s": max(0.0, span - sum(durations)) if span is not None else None,
+                   "counter_readback_s": readback_s, "counter_readback_fraction": ratio(readback_s, duration),
+                   "kernel_busy_time_s": None,
+                   "note": "Host synchronization, launch and readback gaps remain in sustained experiment energy and throughput. CUDA event-window rate is not a kernel-busy rate; NCU replay is a separate run."},
+        "quality": {"valid": result.get("valid") is True, "issues": result.get("issues", []),
+                    "baseline_valid": result.get("baseline_valid") is True, "baseline_issues": result.get("baseline_issues", []),
+                    "target_verified": result.get("target_verified") is True},
+    }
+
+
+def _group_measurement_diagnostics(valid, group):
+    """Aggregate repeat diagnostics, preserving the median-of-ratios meaning."""
+    diagnostics = [trial["measurement_diagnostics"] for trial in valid]
+    if not diagnostics:
+        return {"schema_version": 1, "valid_repeats": 0, "aggregation": "no valid repeat diagnostics"}
+
+    def aggregate(values):
+        present = [value for value in values if value is not None]
+        first = present[0] if present else None
+        if isinstance(first, dict):
+            keys = dict.fromkeys(key for value in present if isinstance(value, dict) for key in value)
+            return {key: aggregate([value.get(key) if isinstance(value, dict) else None for value in values]) for key in keys}
+        if isinstance(first, list):
+            items = [item for value in values if isinstance(value, list) for item in value]
+            return list({json.dumps(item, sort_keys=True): item for item in items}.values())
+        if isinstance(first, bool):
+            return all(value is True for value in values)
+        numbers = [_finite(value) for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+        numbers = [value for value in numbers if value is not None]
+        return statistics.median(numbers) if numbers else first
+
+    grouped = aggregate(diagnostics)
+    grouped.update(schema_version=1, valid_repeats=len(valid),
+                   aggregation="Each numeric diagnostic is the median of valid repeat diagnostics; reconstructed energy/work and scope factors are medians of per-repeat ratios, not ratios of separately aggregated powers/counts.")
+    for objective in ("operational_idle_increment", "paired_active_reference"):
+        eligible = group.get(objective + "_eligible") is True
+        grouped["objectives"][objective]["eligible"] = eligible
+        grouped["scope_factors"]["idle_increment_eligible" if objective == "operational_idle_increment" else "paired_reference_eligible"] = eligible
+    return grouped
+
 def analyze_trial(record: Mapping[str, Any], policy: AnalysisPolicy | Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Calculate operational incremental energy for one sustained trial.
 
@@ -644,7 +796,11 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
                                 "driver_version": device.get("driver_version"), "nvml_version": device.get("nvml_version"),
                                 "runtime_versions": {key: (record.get("cuda_device") or {}).get(key) for key in ("cuda_runtime_version", "cuda_driver_version", "cuda_compile_version", "cublas_version")},
                                 "power_limit_w": power_limit, "power_scope": (record.get("telemetry") or {}).get("power_scope", device.get("power_scope_note")),
-                                "power_usage_semantics": device.get("power_usage_semantics")},
+                                "power_usage_semantics": device.get("power_usage_semantics"),
+                                "kernel_implementation_version": benchmark.get("kernel_implementation_version")},
+        "kernel_resources": benchmark.get("kernel_resources"),
+        "execution_diagnostics": benchmark.get("execution_diagnostics"),
+        "kernel_implementation_version": benchmark.get("kernel_implementation_version"),
         "validation": validation, "duration_s": duration, "benchmark_duration_s": measured_duration,
         "profile_rates_summary": assessment.get("rates_summary"),
         "validation_binding": {"condition_id": record.get("condition_id"), "workload": record.get("workload"),
@@ -752,6 +908,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
                           ("paired_active_reference_", result.get("paired_active_reference_power_w"))):
         result[prefix + "pj_per_element"] = power / element_rate * 1e12 if power is not None and element_rate else None
         result[prefix + "pj_per_row"] = power / row_rate * 1e12 if power is not None and row_rate else None
+    result["measurement_diagnostics"] = _measurement_diagnostics(result, benchmark, epochs)
     return result
 
 
@@ -1095,6 +1252,9 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
                  "nonlinear_contract": repeats[0].get("nonlinear_contract"),
                  "config": {k: v for k, v in repeats[0]["config"].items() if k not in _REPEAT_KEYS},
                  "benchmark_sha256": repeats[0]["benchmark_sha256"], "measurement_stratum": repeats[0]["measurement_stratum"],
+                 "kernel_resources": repeats[0].get("kernel_resources"),
+                 "execution_diagnostics": repeats[0].get("execution_diagnostics"),
+                 "kernel_implementation_version": repeats[0].get("kernel_implementation_version"),
                  "treatment_design_stratum": repeats[0]["treatment_design_stratum"],
                  "resource_geometry": repeats[0]["resource_geometry"],
                  "repeats": len(repeats), "valid_repeats": len(valid), "trial_ids": [t["trial_id"] for t in repeats],
@@ -1126,6 +1286,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
         group["paired_reference_order_effect_power_w"] = arm_medians["AB"] - arm_medians["BA"] if None not in arm_medians.values() else None
         group["ncu_target_suitability"] = group["target_verified"]
         group["ncu_utilization_status"] = "diagnostic_only" if valid and all(trial["ncu_utilization_status"] == "diagnostic_only" for trial in valid) else "inconclusive"
+        group["measurement_diagnostics"] = _group_measurement_diagnostics(valid, group)
         groups.append(group)
     summary = {"schema_version": 2, "trials": trials, "groups": groups, "duplicate_trial_ids_ignored": duplicate_ids,
             "within_clock_best": _selections(groups, throughput_fraction, min_repeats, False),

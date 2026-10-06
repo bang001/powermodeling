@@ -79,6 +79,28 @@ def _ratio(a, b, scale=1):
     return a / b * scale if a is not None and b is not None and b > 0 else None
 
 
+def _traffic_amplification(derived):
+    """Compare replay traffic with that same launch's logical payload only."""
+    fields = {key: derived.get(source) for key, source in (
+        ("logical_bytes", "logical_bytes"), ("logical_read_bytes", "logical_read_bytes"),
+        ("logical_write_bytes", "logical_write_bytes"),
+        ("l1_read_sector_bytes", "l1_read_sector_bytes"),
+        ("l2_read_sector_bytes", "l2_read_bytes"), ("l2_write_sector_bytes", "l2_write_bytes"),
+        ("l2_sector_bytes", "l2_sector_bytes"),
+        ("dram_read_bytes", "dram_read_bytes"), ("dram_write_bytes", "dram_write_bytes"),
+        ("dram_bytes", "dram_bytes"))}
+    for key, numerator, denominator in (
+        ("l1_read_sector_bytes_per_logical_read_byte", "l1_read_sector_bytes", "logical_read_bytes"),
+        ("l2_read_sector_bytes_per_logical_read_byte", "l2_read_sector_bytes", "logical_read_bytes"),
+        ("l2_write_sector_bytes_per_logical_write_byte", "l2_write_sector_bytes", "logical_write_bytes"),
+        ("l2_sector_bytes_per_logical_byte", "l2_sector_bytes", "logical_bytes"),
+        ("dram_read_bytes_per_logical_read_byte", "dram_read_bytes", "logical_read_bytes"),
+        ("dram_write_bytes_per_logical_write_byte", "dram_write_bytes", "logical_write_bytes"),
+        ("dram_bytes_per_logical_byte", "dram_bytes", "logical_bytes")):
+        fields[key] = _ratio(fields[numerator], fields[denominator])
+    return fields
+
+
 def _metrics(rows):
     # Parse raw values again; a hand-edited numeric_value cannot bypass checking.
     from .profiling import normalize_metric_value
@@ -164,6 +186,8 @@ def _kernel_assessment(rows, evidence, policy):
                        dram_read_bytes=dram_read, dram_write_bytes=dram_write, dram_bytes=dram_total,
                        l1_global_read_hit_pct=l1_hit, l2_tex_read_hit_pct=l2_hit,
                        l2_read_bytes=l2_read_bytes, l2_write_bytes=l2_write_bytes,
+                       l1_read_sector_bytes=sectors * 32 if sectors is not None else None,
+                       l2_sector_bytes=l2_total,
                        l1_sectors_per_global_read_request=_ratio(sectors, metrics.get(L1_REQUESTS)),
                        dram_bytes_per_logical_byte=_ratio(dram_total, logical),
                        dram_bytes_per_l2_byte=_ratio(dram_total, l2_total),
@@ -203,6 +227,7 @@ def _kernel_assessment(rows, evidence, policy):
         # Pointer chasing requests one 4B value per 32B sector by design.
         minimum = policy.min_sector_bytes_per_logical_byte
         _check(checks, "sector_inflation", inflation, lambda v: minimum <= v <= policy.max_sector_inflation, f"{minimum}..{policy.max_sector_inflation} sector bytes/logical bytes; record coalescing costs explicitly")
+        derived["traffic_amplification"] = _traffic_amplification(derived)
     else:
         checks.append({"name": "workload_target", "status": "inconclusive", "value": workload, "requirement": "tensor, gemm, l1, l2, l2_latency or hbm target"})
     return {"id": rows[0].get("id"), "kernel": rows[0].get("kernel"), "status": _status(checks), "checks": checks, "metrics": metrics, "derived": derived}
@@ -216,6 +241,20 @@ def assess_profile(evidence, policy=None):
         if isinstance(row, dict): groups.setdefault((row.get("id"), row.get("kernel")), []).append(row)
     kernels = [_kernel_assessment(rows, evidence, policy) for rows in groups.values()]
     checks = [check for kernel in kernels for check in kernel["checks"]]
+    if evidence.get("workload") in ("l1", "l2", "l2_latency", "hbm"):
+        # Raw launch IDs bind the one profiled custom launch to its payload.
+        # An extra otherwise-valid kernel must not silently reuse that payload.
+        ids = [int(str(kernel["id"])) for kernel in kernels if str(kernel.get("id")).isdecimal()]
+        ids_known = bool(kernels) and len(ids) == len(kernels)
+        _check(checks, "memory_profile_launch_id_unique_mapping",
+               len(ids) == len(set(ids)) if ids_known else None, bool,
+               "each numeric profile launch ID maps to exactly one kernel name")
+        reported = _number((evidence.get("profile_benchmark") or {}).get("kernel_launches"))
+        reported = reported if reported is not None and reported > 0 and reported.is_integer() else None
+        _check(checks, "memory_profile_observed_launch_count",
+               len(set(ids)) if ids_known and reported is not None else None,
+               lambda value: value == reported,
+               "number of distinct observed kernel launch IDs matches reported positive integer kernel_launches")
     if evidence.get("workload") == "gemm":
         paths = [k["derived"].get("tensor_instructions") if k["derived"].get("tensor_instructions") is not None else k["derived"].get("tensor_active_pct") for k in kernels]
         paths = [v for v in paths if v is not None]
@@ -227,7 +266,22 @@ def assess_profile(evidence, policy=None):
         values = [k["metrics"].get(metric) for k in kernels]
         rate_summary[key] = sum(values) * scale / duration if values and all(v is not None for v in values) and duration > 0 else None
     rate_summary["tensor_activity_by_kernel"] = [{"id": k["id"], "kernel": k["kernel"], "active_pct": k["derived"].get("tensor_active_pct"), "scope": k["derived"].get("tensor_utilization_scope"), "instructions": k["derived"].get("tensor_instructions")} for k in kernels]
-    return {"status": _status(checks), "checks": checks, "kernels": kernels, "rates_summary": rate_summary, "policy": asdict(policy),
+    traffic_kernels = [kernel for kernel in kernels if "traffic_amplification" in kernel["derived"]]
+    # The application payload is attributable only to one observed microkernel.
+    # Multiple observed kernels with one reported launch cannot reuse that total.
+    bound = (len(kernels) == len(traffic_kernels) == 1
+             and str(traffic_kernels[0].get("id")).isdecimal()
+             and _number((evidence.get("profile_benchmark") or {}).get("kernel_launches")) == 1
+             and (traffic_kernels[0]["derived"].get("logical_bytes") or 0) > 0)
+    traffic = {**(traffic_kernels[0]["derived"]["traffic_amplification"] if bound else _traffic_amplification({})),
+               "scope": "same profiler replay launch counters/logical payload; separate from the energy experiment",
+               "logical_payload_binding": "one_observed_and_reported_microkernel" if bound else "unknown_missing_or_multiple_profile_kernels",
+               "energy_denominator_use": "forbidden_separate_profiler_run",
+               "interpretation": "A ratio above one can reflect sector overfetch/coalescing or other traffic. Path admission does not imply unit traffic amplification or saturation.",
+               "by_kernel": [{"id": kernel["id"], "kernel": kernel["kernel"], **kernel["derived"]["traffic_amplification"]} for kernel in traffic_kernels]}
+    rate_summary["traffic_amplification"] = traffic
+    return {"status": _status(checks), "checks": checks, "kernels": kernels, "rates_summary": rate_summary,
+            "traffic_amplification": traffic, "policy": asdict(policy),
             "reasons": [c["name"] + ": " + c["requirement"] for c in checks if c["status"] != "pass"],
             "scope": "path/residency admission for whole-device incremental-energy experiments; does not isolate rail or block energy"}
 

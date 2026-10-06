@@ -1,6 +1,6 @@
 # NVIDIA GPU power modeling
 
-**SXM 모듈의 V100·A100·H100**에서 **충분히 활용한 조건의 실측 pJ/FLOP·pJ/bit 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM의 working set·thread/block·stride·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다.
+**SXM 모듈의 V100·A100·H100**에서 **충분히 활용한 조건의 실측 pJ/FLOP·pJ/bit·pJ/element 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM과 **EXP·TANH·RMSNorm·Softmax·SiLU**의 입력 크기·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
 
 SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter로 검증하기 전에는 목표 계층과 물리 회로 에너지를 동일시하지 않는다.
 
@@ -13,6 +13,7 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 | Tensor | FP16 입력·FP32 누산 WMMA 반복, 독립 accumulator sweep, cuBLAS dense GEMM 비교 |
 | L1·L2·HBM | `.ca`/`.cg` load, working set·grid·thread·stride·주소 offset·read/copy sweep |
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
+| 비선형 함수 | FP32 EXP·TANH·RMSNorm·Softmax·SiLU의 완전한 함수 적용, CPU 기준 표본 검증, pJ/element·행 연산의 pJ/row |
 | 전력 측정 | capability 기반 NVML 평균/현재/누적에너지, 지원되는 memory scope, raw timestamps·오류 |
 | 시간·기준 | 같은 context·버퍼·clock policy의 전후 idle 및 AB/BA paired active reference, arm별 warmup·완료 epoch의 정렬 적분 |
 | 클럭·DVFS | 900 MHz 이상 지원 pair의 60/90/120 등 가변 간격 graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
@@ -52,11 +53,6 @@ CUDA 12 compiler를 별도 경로로 지정하려면 `-DCMAKE_CUDA_COMPILER=/usr
 
 ## 첫 실험
 
-EXP·TANH·SiLU·RMSNorm·Softmax의 FP32 **pJ/element** 실험도 지원한다.
-RMSNorm/Softmax는 reduction과 메모리 접근을 포함한 완전한 행 연산이며
-**pJ/row**도 보고한다. `configs/nonlinear-smoke.json`, `configs/nonlinear.json`과
-[비선형 함수 실험 설계·실행 지침](docs/nonlinear-experiments.ko.md)을 사용한다.
-
 먼저 장치를 조회하고 기본 DVFS 상태의 smoke sweep으로 실행·센서·결과 형식을 확인한다. smoke도 평균 센서 때문에 수초씩 실행하며, 포화 조건을 전수 탐색하는 용도는 아니다.
 
 ```bash
@@ -79,6 +75,75 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 `locked` 방식에서는 이전 lock 정책을 일반적으로 읽어 복원할 수 없으므로 기존 범위를 `--locked-restore` JSON으로 제공하거나, 실행 전 unlocked 상태가 확인된 소유 GPU에 `--clock-reset-on-exit`을 명시한다. 이 옵션은 실행 뒤 lock을 기본 상태로 해제한다. 기존 정책이 있는 공유 GPU에서 추측하여 사용하지 않는다. 도구는 power limit·persistence·MIG 상태를 자동 변경하지 않는다.
 
 완료된 실험을 이어 실행하려면 같은 plan/output에 `--resume`을 추가한다. 실패한 측정은 raw 로그를 남기며 성공한 결과로 처리되지 않는다. `--limit 3`은 일부 trial의 실행 점검에 사용할 수 있지만 repeat나 sweep가 불완전하면 효율 최적값을 확정할 수 없다.
+
+## 비선형 함수 실험: EXP·TANH·RMSNorm·Softmax·SiLU
+
+5개 함수를 독립 workload로 실행하고 **FP32 입력·출력, CUDA 표준 math, global load/store를 포함한 전체 함수 적용의 pJ/element**를 측정한다. `--use_fast_math`는 사용하지 않는다. 측정 전후에 CPU double 기준값으로 출력 표본을 검사하며, 수치 검증이나 완료 원소 수가 잘못된 결과는 에너지 후보에서 제외한다.
+
+| 함수 / workload | 측정하는 연산 | 에너지 단위 |
+|---|---|---|
+| EXP / `exp` | `expf(x)` | pJ/element |
+| TANH / `tanh` | `tanhf(x)` | pJ/element |
+| RMSNorm / `rmsnorm` | 행별 `x[i] * gamma[i] / sqrt(mean(x²) + 1e-5)` | pJ/element, pJ/row |
+| Softmax / `softmax` | 행별 max 차감, exp 합계 reduction, 정규화; exp를 두 번 계산하는 3-pass 구현 | pJ/element, pJ/row |
+| SiLU / `silu` | `x / (1 + expf(-x))` | pJ/element |
+
+`element`는 **완료한 출력 원소 1개**다. 행 너비가 N이면 `pJ/row = N × pJ/element`이며 RMSNorm·Softmax의 reduction 비용도 포함한다. 이 workload의 `operations`와 `*_pj_per_op` 별칭도 출력 원소를 세며 FLOP나 SFU instruction 수를 뜻하지 않는다. 입력을 반복 처리한 횟수도 분모에 포함한다. `working_set_bytes`는 입력 버퍼 크기이고, 같은 크기의 출력 버퍼와 RMSNorm의 gamma 벡터는 별도다. 측정값에는 메모리 접근·reduction·launch 비용이 포함되므로 함수만의 물리 회로 에너지로 해석하지 않는다.
+
+### 실행·수치·센서 점검
+
+설치와 빌드를 마친 뒤 사용할 실행 파일을 선택한다. A100 + CUDA 13.0이면 첫 줄을 `export POWERBENCH=build-a100-cuda13/powerbench`로 바꾼다. 아래 `--plots`에는 matplotlib가 필요하므로 plots 의존성을 설치한다.
+
+```bash
+export POWERBENCH=build/powerbench
+python -m pip install -e ".[plots]"
+python -m powermodeling discover --device 0 --bench "$POWERBENCH" \
+  --output results/nonlinear-discovery.json
+python -m powermodeling plan --config configs/nonlinear-smoke.json \
+  --device 0 --bench "$POWERBENCH" --output results/nonlinear-smoke-plan.json
+python -m powermodeling run --plan results/nonlinear-smoke-plan.json \
+  --device 0 --bench "$POWERBENCH" --output results/nonlinear-smoke
+python -m powermodeling analyze --input results/nonlinear-smoke \
+  --output results/nonlinear-smoke-report --plots
+```
+
+Smoke는 5개 함수 × 4회 반복 = **20 trials, 최소 약 15분**이다. 준비·클럭 안정화·측정 overrun은 추가된다. 클럭을 변경하지 않는 기능 점검이며 고정 클럭의 효율 최적점을 확정하지 않는다.
+
+### 고정 클럭 sweep과 NCU 검증
+
+전체 설정은 blocks 2/4×SM, threads 128/256, 작은/큰 입력 footprint를 비교한다. RMSNorm·Softmax는 행 너비 128/1024/4096도 비교한다. 기본 graphics 범위는 **900 MHz 이상·90 MHz 간격**이며 지원되는 exact 1110 MHz와 advertised factory-default 고정 pair, 현재 정책 reference를 포함한다. 간격은 설정 파일의 `clock_sweep.graphics_step_mhz`를 60·120 MHz 등으로 바꿀 수 있다. `plan`이 보여 주는 trial 수·최소 예상 시간을 확인한 뒤 전용 GPU에서 실행한다.
+
+```bash
+python -m powermodeling plan --config configs/nonlinear.json \
+  --device 0 --bench "$POWERBENCH" --output results/nonlinear-plan.json
+python -m powermodeling run --plan results/nonlinear-plan.json \
+  --device 0 --bench "$POWERBENCH" --output results/nonlinear \
+  --apply-clocks --clock-method applications
+python -m powermodeling validate-run --plan results/nonlinear-plan.json \
+  --input results/nonlinear --output results/nonlinear-validated \
+  --profiles-dir results/nonlinear-profiles --device 0 --bench "$POWERBENCH" \
+  --apply-clocks --clock-method applications
+python -m powermodeling analyze --input results/nonlinear-validated \
+  --plan results/nonlinear-plan.json --output results/nonlinear-report --plots
+```
+
+`validate-run`은 전력 측정과 분리한 NCU replay로 커널·SFU 활동·spill·수치/카운트·측정 조건의 일치를 검사한다. 필요한 counter가 없으면 `inconclusive`로 남는다. 설치한 호환 NCU를 선택하려면 `--ncu /설치경로/ncu`를 추가한다. `applications` 클럭이 지원되지 않는 장치는 위의 locked-clock 복원 지침에 따라 run과 validate-run에 같은 정책을 사용한다. pointwise/rowwise를 나누려면 plan에 `--stage pointwise` 또는 `--stage rowwise`를 지정하고 plan·결과 경로도 나눈다.
+
+### 단가와 그래프 읽기
+
+| 결과 필드 | 의미 |
+|---|---|
+| `total_pj_per_element` | 측정한 전체 GPU 에너지 / 완료 출력 원소 수 |
+| `operational_idle_increment_pj_per_element` | 승인된 전후 idle 대비 증가분 / 완료 출력 원소 수 |
+| `paired_active_reference_pj_per_element` | 같은 process에서 AB/BA로 짝지은 active reference 대비 / 완료 출력 원소 수 |
+| 각 `*_pj_per_row` | RMSNorm·Softmax의 완전한 행 1회 적용 단가 |
+| `throughput_elements_s`, `throughput_rows_s` | 같은 에너지 적분 구간에서 완료한 원소/초, 행/초 |
+
+`results/nonlinear-report/evaluation.html`을 열어 GPU·함수·입력 footprint·행 너비·에너지 기준을 선택한다. 클럭별 Gelement/s와 pJ/element, 처리량 대비 에너지, 실행 geometry 응답, 반복 신뢰구간, factory-default·1110 MHz 대비를 확인할 수 있다. 같은 폴더에 `evaluation.json`·`evaluation.csv`·`summary.json`·`trials.csv`와 `--plots`로 생성한 PNG/SVG가 저장된다. GPU·CUDA 버전·함수·footprint·행 너비가 다른 결과는 별도 조건으로 비교한다.
+
+전체·idle 증가분·paired 대비는 각각 평가한다. 후보는 측정 품질·정확한 카운트·NCU·반복 정밀도·실행 geometry 조건을 통과하고 관측 최고 처리량의 기본 95% 이상을 유지해야 한다. 계획 누락이나 plateau 근거 부족이 있으면 잠정 후보로 표시하며, 음의 차감값은 효율 최적점으로 선택하지 않는다. 실제 pJ 값은 GPU에서 실행해야 얻을 수 있다.
+
+커널·입력 분포·수치 허용 오차는 [비선형 함수 실험 설계·실행 지침](docs/nonlinear-experiments.ko.md), 후보 승인 기준과 시각화는 [컴포넌트별 평가·시각화 설계](docs/evaluation-design.ko.md)를 참조한다.
 
 ## sweep 구성
 
@@ -126,6 +191,8 @@ python -m powermodeling analyze --input results/validated \
 | `total_pj_per_flop`, `total_pj_per_logical_bit` | 전체 GPU 단가. FMA=2 FLOP, logical bit=요청 byte×8 |
 | `operational_idle_increment_pj_per_flop`, `operational_idle_increment_pj_per_logical_bit` | 전후 idle 대비 증가분 단가; 승인 여부와 함께 읽음 |
 | `paired_active_reference_pj_per_flop`, `paired_active_reference_pj_per_logical_bit` | 같은 process의 짝지은 control 대비 단가; 물리 component isolation이 아님 |
+| `total_pj_per_element`, `operational_idle_increment_pj_per_element`, `paired_active_reference_pj_per_element` | 비선형 함수의 전체·idle 증가분·paired 대비 단가; 분모는 완료 출력 원소 수 |
+| 각 `*_pj_per_row`, `throughput_elements_s`, `throughput_rows_s` | RMSNorm·Softmax의 행 단가와 원소/행 처리량; 행 너비별로 비교 |
 | `baseline_state_matched`, `baseline_state_issues` | 조회 가능한 pstate/enforced power cap의 일치·불일치 근거 |
 | `baseline_valid`, `baseline_issues`, `operational_idle_increment_eligible` | 전후 idle 품질과 실제 상태 일치에 따라 증가분 최적점 사용을 승인 |
 | `paired_active_reference_eligible`, `paired_active_reference_issues` | arm별 geometry·시간 정렬·actual clock·온도·cap·간섭·protocol, 조회 가능한 pstate/enforced cap 검사 |
@@ -187,6 +254,7 @@ python -m powermodeling analyze --input results/verified --output results/verifi
 | L1 | L1 hit와 요청 sector, 하위 L2·DRAM traffic | L1이 주된 공급원인지 |
 | L2 | L2 hit, 요청 sector와 DRAM traffic | L2가 주된 공급원인지; near/far는 추가 지도 필요 |
 | HBM | DRAM read/write byte, L2 요청 sector, L2 hit | 실제 DRAM 이동이 충분한지; logical byte와 physical byte를 구분 |
+| EXP·TANH·RMSNorm·Softmax·SiLU | 대상 커널·SFU instruction 활동·spill·duration, CPU 기준 표본 검증, 원소/행 카운트와 조건 일치 | 전체 함수 구현 경로의 근거; SFU의 물리 에너지나 처리량 포화 증명과 구분 |
 
 기본 policy는 L1/L2 read hit ≥95%, L2/HBM read의 L1 hit ≤5%, cache의 하위 traffic ≤logical byte의 10%를 사용한다. HBM read는 L2 hit ≤20%, 요청 방향 DRAM byte ≥logical byte의 75%, DRAM/L2 byte 비율 0.75–1.25를 요구한다. sector inflation 허용 범위는 0.90–8.25, profile actual clock 오차·drift 허용은 3%다. 모든 목표에서 local load/store sector가 0인지 확인한다. 이는 초기 프로젝트 기준이며 실제 장치의 replay 오차·쓰기가 kernel 종료 뒤 writeback되는 현상에 맞춰 검토해야 한다. L2 write/copy는 read hit 정책만으로 적절성을 증명하지 못하므로 현재 `inconclusive`로 남긴다.
 
@@ -241,5 +309,7 @@ python -m unittest discover -s tests -v
 CPU 테스트는 데이터 분석·모델 식별·plan·NVML mock·클럭 복원을 검증한다. CUDA 컴파일, actual GPU 실행, cache attribution과 측정 정확도는 V100/A100/H100 장비에서 확인해야 한다.
 
 - [실험 설계: static/dynamic 기준, DVFS, hierarchy, near/far, fairness](docs/experiment-design.ko.md)
+- [비선형 함수: EXP·TANH·RMSNorm·Softmax·SiLU의 정의·실행·에너지 단위](docs/nonlinear-experiments.ko.md)
+- [컴포넌트별 평가·시각화: coverage·반복 정밀도·plateau·에너지 후보](docs/evaluation-design.ko.md)
 - [전체 구현 자가점검: 발견 사항·수정·검증·남은 실측](docs/self-audit.ko.md)
 - [NVIDIA 공식 출처 및 검증이 필요한 주장](docs/sources.md)

@@ -131,3 +131,7 @@ HBM의 짧은 iterations 조건은 한 launch에서 전체 요청 footprint를 �
 4. 값의 개선은 같은 board-energy scope·logical-work unit·baseline·precision에서만 비교합니다. 문헌의 isolated physical component energy와 board energy/logical FLOP 또는 bit를 직접 같다고 취급하지 않습니다.
 
 새 CUDA binary의 raw `benchmark.kernel_resources`는 registers/thread, local bytes/thread, shared bytes/CTA, occupancy 상한, grid 평균 blocks/SM, L1 slice 합의 이론적 상한을 기록합니다. 이 query는 측정 phase 밖에서 수행하며 실제 kernel 동작과 count 식은 변경하지 않습니다. cuBLAS는 internal kernel별 자원이 달라 이 object가 `null`이고, NCU의 kernel별 정보를 확인해야 합니다. 실제 occupancy·Tensor utilization·cache hit rate는 NCU 등 별도 관측으로 확인합니다.
+
+## 128-byte line과 32-byte sector의 확인
+
+[L1/L2 sector·정렬 검토](cache-sector-review.ko.md)에 공식 Nsight Compute 원문 근거, 현재 scalar load의 단위, 정렬·stride별 예상 요청 sector 수와 추가 진단 설정을 정리했다. 기존 locality offset들은 모두 128 B 정렬이므로 misalignment 검증을 대신하지 못한다. Counter는 sector당 32 B로 올바르게 변환하고 있어, line 크기를 이유로 기존 에너지 값을 4로 나누는 보정은 하지 않는다.

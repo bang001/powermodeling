@@ -1,0 +1,41 @@
+{
+  "description": "Diagnostic L1/L2 scalar-load sector comparisons: stride-1 byte offsets 0/4/32/128 and fixed-allocation strides 1/2/4/8/32. Incoming-policy clocks are observational; match the original supported fixed clock pair for controlled comparisons. Offset 32 preserves the ideal four sectors per contiguous 128-byte warp payload while crossing a 128-byte address group; this does not identify physical cache-line or DRAM granularity. Stride changes reachable footprint and may cause wrap or duplicate lane addresses, especially in the small L1 slice; inspect actual counters and finite-footprint metadata.",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "randomization_seed": 2026,
+  "clock_pairs": [
+    {"graphics_mhz": null, "memory_mhz": null}
+  ],
+  "target_form_factor": "SXM",
+  "paired_reference": true,
+  "study_design": "diagnostic",
+  "experiments": [
+    {
+      "workload": "l1",
+      "stage": "sector_alignment",
+      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "blocks*8192", "stride_elements": 1},
+      "grid": {"offset_bytes": [0, 4, 32, 128]}
+    },
+    {
+      "workload": "l2",
+      "stage": "sector_alignment",
+      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "l2_bytes*0.5", "stride_elements": 1},
+      "grid": {"offset_bytes": [0, 4, 32, 128]}
+    },
+    {
+      "workload": "l1",
+      "stage": "sector_stride",
+      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "blocks*8192", "offset_bytes": 0},
+      "grid": {"stride_elements": [1, 2, 4, 8, 32]}
+    },
+    {
+      "workload": "l2",
+      "stage": "sector_stride",
+      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "l2_bytes*0.5", "offset_bytes": 0},
+      "grid": {"stride_elements": [1, 2, 4, 8, 32]}
+    }
+  ]
+}

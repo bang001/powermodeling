@@ -237,6 +237,8 @@ python -m powermodeling analyze --input results/validated \
 
 [원인 점검·재분석·추가 진단 지침](docs/high-energy-investigation.ko.md)에 비교 항목과 `component-diagnostics.json`의 stage별 실행 방법을 설명한다. 전체 진단은 clock 조건 하나에서 최소 약 2.29시간이며, 필요한 stage만 실행할 수 있다. 기존 raw는 원래 binary의 evidence를 유지하고 새 binary로 수행한 진단은 별도 결과로 저장한다.
 
+[L1/L2 sector·정렬 검토](docs/cache-sector-review.ko.md)는 128-byte cache line과 32-byte 최소 접근 단위를 구분하고, offset 0/4/32/128 B와 stride 1/2/4/8/32의 비교 방법을 설명한다. `configs/cache-sector-diagnostics.json`으로 L1/L2만 실행할 수 있으며, clock 조건 하나에서 alignment 최소 24분, stride 최소 30분이다. NCU replay 시간은 별도다.
+
 ## NCU를 통한 적절성 판단
 
 권장 순서는 **전력 sweep → 전체 조건의 NCU 검증 → 분석**이다. `validate-run`은 같은 condition의 반복 중 하나를 별도로 profile하고 모든 반복에 판정을 연결한다. 처리한 조건과 남은 조건을 manifest에 남기며 전체 energy trial을 보존한다. 고정 클럭 조건에는 전력 실행과 같은 클럭 적용 옵션을 사용한다.

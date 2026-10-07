@@ -53,6 +53,7 @@ def q_grid_trial(workload="exp", *, elements=97, width=129, threads=96,
 
 
 def one_trial(workload, parameters, *, device=DEVICE):
+    parameters = {"nonlinear_mode": "streaming", **parameters}
     plan = expand_plan({"paired_reference": False, "study_design": "diagnostic",
                         "clock_pairs": [{"graphics_mhz": None, "memory_mhz": None}],
                         "experiments": [{"workload": workload, "parameters": parameters}]}, device)
@@ -286,6 +287,7 @@ class NonlinearQGridTests(unittest.TestCase):
 class NonlinearQGridGpuTests(unittest.TestCase):
     def run_function(self, workload, elements, *, threads=96, width=129, grid_mode="auto", blocks=None):
         command = [os.environ.get("POWERBENCH", "build/powerbench"), "--workload", workload,
+                   "--nonlinear-mode", "streaming",
                    "--grid-mode", grid_mode, "--threads", str(threads), "--iterations", "2",
                    "--working-set-bytes", str(elements * 4), "--seconds", "0.1",
                    "--warmup-seconds", "0", "--idle-seconds", "0", "--batch-launches", "1",
@@ -336,7 +338,8 @@ class NonlinearQGridGpuTests(unittest.TestCase):
         )
         for workload, parameters, reason in invalid:
             with self.subTest(workload=workload, parameters=parameters):
-                command = [os.environ.get("POWERBENCH", "build/powerbench"), "--workload", workload, *parameters]
+                command = [os.environ.get("POWERBENCH", "build/powerbench"), "--workload", workload,
+                           "--nonlinear-mode", "streaming", *parameters]
                 completed = subprocess.run(command, text=True, capture_output=True, timeout=60)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(reason, completed.stderr)

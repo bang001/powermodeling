@@ -14,7 +14,7 @@ from .sfu import SFU_WORKLOADS, REFERENCE_KIND as SFU_REFERENCE_KIND
 WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS
 PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "iterations",
               "tensor_accumulators", "access", "sm_ids", "seed", "offset_bytes",
-              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode", "sfu_lanes", "sfu_chains"}
+              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode", "sfu_lanes", "sfu_chains", "nonlinear_mode"}
 
 
 def numeric_expression(value, names):
@@ -322,6 +322,10 @@ def resolve_clocks(config, supported):
 
 def expand_plan(config, device, supported_clocks=None, stage=None):
     device = declare_sxm(device, config.get("target_form_factor", "SXM"))
+    if stage is not None:
+        available_stages = sorted({spec.get("stage", "saturation") for spec in config["experiments"]}, key=str)
+        if stage not in available_stages:
+            raise ValueError(f"Unknown stage {stage!r}; available stages: {', '.join(map(str, available_stages)) or '(none)'}")
     seconds = float(config.get("seconds", 12))
     warmup = float(config.get("warmup_seconds", 3))
     idle = float(config.get("idle_seconds", 6))
@@ -386,8 +390,12 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             resolved, env = {}, dict(names)
             for key in sorted(params, key=lambda k: (k not in ("blocks", "threads"), k)):
                 value = params[key]
-                resolved[key] = value if key in ("access", "sm_ids", "grid_mode") else numeric_expression(value, env)
+                resolved[key] = value if key in ("access", "sm_ids", "grid_mode", "nonlinear_mode") else numeric_expression(value, env)
                 env[key] = resolved[key]
+            if workload in NONLINEAR_WORKLOADS and resolved.get("nonlinear_mode") != "streaming":
+                raise ValueError(f"Legacy streaming workload {workload!r} requires nonlinear_mode='streaming'; use sfu_* workloads for register SFU experiments")
+            if "nonlinear_mode" in resolved and workload not in NONLINEAR_WORKLOADS:
+                raise ValueError("nonlinear_mode applies only to legacy streaming nonlinear workloads")
             blocks, threads = resolved.get("blocks", names["sm_count"]*2), resolved.get("threads", 256)
             if blocks < 1 or threads < 32 or threads > 1024 or threads % 32:
                 raise ValueError("blocks>=1 and threads must be a multiple of warp size32 within32..1024")

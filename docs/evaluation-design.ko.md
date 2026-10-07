@@ -1,10 +1,13 @@
 # 컴포넌트 실험의 평가와 시각화
 
 이 문서는 V100·A100·H100의 Tensor, GEMM, L1, L2, HBM, locality,
-EXP·TANH·SiLU·RMSNorm·Softmax 실험에서 **무엇을 확인한 뒤 어떤 결론을
+native SFU 실험에서 **무엇을 확인한 뒤 어떤 결론을
 허용하는지** 정의한다. 구현은 `powermodeling/evaluation.py`,
 `dashboard.py`, `reporting.py`이며 `analyze`가 평가를 함께 수행한다.
-평가 대상은 측정한 GPU 전체 scope의 해당 workload 에너지다.
+기본 nonlinear 설정은 register SFU이고, 주 결과는 matched control과의 signed
+전력 차분을 scalar instruction 처리율로 나눈 값이다. 전체 GPU·idle 값은 별도 진단이다.
+[과거 전체 함수 실험](legacy/nonlinear-streaming.ko.md)은 명시적 streaming 모드와
+별도 정의로 계속 분석한다. 이 평가에서 물리적 회로별 rail 에너지를 분리하지 않는다.
 
 ## 1. 클럭 범위와 필수 비교 조건
 
@@ -32,6 +35,9 @@ native 최저 클럭 끝점은 실행하지 않는다. `graphics_min_mhz`로 하
 915로 매핑한다. 정확한 목표가 지원되지 않아 생기는 매핑 오차·간격은 plan에
 기록한다. domain 전체가 하한보다 낮으면 grid를 만들지 않고 범위를
 `not_applicable`로 남긴다. memory MHz는 SM 간격으로 생성하지 않는다.
+Native SFU에서 memory clock은 환경 통제 변수이며 L1/L2/HBM working set이나
+stride를 sweep하는 의미가 아니다. SFU의 반복 내부에는 global/shared/local
+데이터 load/store가 없다. Constant-bank operand까지 없다는 뜻은 아니다.
 
 다음 조건은 모든 해당 실행 geometry에서 유지한다.
 
@@ -61,8 +67,10 @@ ECC/MIG, treatment protocol, 함수 정의를 분리한다. GPU 간 결과를 �
 
 메모리는 access·stride·주소 offset·SM filter·유효 footprint를 분리한다.
 L1은 전체 할당 대신 **CTA당 slice 크기**를 사용해 blocks를 늘리는 geometry
-실험을 같은 조건으로 비교할 수 있게 한다. nonlinear은 FP32/math 구현,
-입력 분포, footprint(Q), 행 너비, epsilon/gamma, grid mode와 구현 버전을 분리한다. locality는
+실험을 같은 조건으로 비교할 수 있게 한다. 기본 nonlinear/SFU는 primitive·근사/FTZ·
+입력 recurrence·register lane Q·chains·iterations·grid mode·구현 버전을 분리한다.
+Legacy streaming은 FP32/math 구현, 입력 분포, footprint(Q), 행 너비,
+epsilon/gamma, grid mode와 구현 버전을 분리한다. locality는
 blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 지도 축으로
 남긴다. 같은 pJ 단위여도 이 정의가 다르면 평균하거나 같은 곡선으로 연결하지 않는다.
 
@@ -74,9 +82,9 @@ blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 �
 | L2 | pJ/logical bit, logical GB/s | L2 hit·DRAM 유입·L1 bypass·finite 주소 footprint·spill | footprint/stride/access별 성능; write/copy의 현재 residency 판정 한계 | footprint/stride/access 분리 그림; 누락/미확정 cell 표시 |
 | HBM | pJ/logical bit, logical GB/s | read/write 방향의 DRAM/logical ratio·L2 hit·sector inflation·finite footprint | memory별 SM clock 공급능력 plateau, replay DRAM rate는 별도 진단 | memory×SM energy matrix, bandwidth/energy, 조건·품질 표 |
 | L2 locality | dependent cycles/access | admitted SM·offset·loads/cycles, L2/fabric counter는 별도 근거 필요 | concurrent blocks·loop overhead·온도/clock; energy optimum으로 선택하지 않음 | clock/geometry별 SM×offset 지도; near/far label 없음 |
-| EXP/TANH/SiLU | pJ/element, Gelement/s | 전후 분산 CPU double sample, complete output element/epoch, 표준 math·SFU activity·spill | auto grid의 Q scaling과 Q별 geometry/clock 비교, 메모리 비용 포함 | 함수·Q별 독립 그림, Q-scaling 그림·표, 수치 검증 표 |
-| Native register SFU | 주 결과는 SFU 없는 register-loop control 대비 pJ/scalar instruction | Native opcode·warp/scalar count 구분, SHA/architecture/chain에 연결한 raw SASS 재검사, hot-loop memory·spill 부재, one-step 수치 검증 | Q·threads·chains·iterations, 양 arm resource/rate 차이, loop 길이 amortization; 물리 SFU rail 분리는 주장하지 않음 | Signed 차분·CI·Q scaling; 음수/zero-crossing은 표시하되 최적값 선정 제외, 전체/idle은 진단만 |
-| RMSNorm/Softmax | pJ/element와 pJ/row | 위 조건 + row count/width, RMS epsilon/gamma, stable max/sum 및 Softmax 행 합 | 행 너비별 성능·에너지; `pJ/row = width × pJ/element` | 행 너비별 독립 그림과 row 단가 표 |
+| Native register SFU — 기본 nonlinear | 주 결과는 SFU 없는 register-loop control 대비 pJ/scalar SFU instruction | Native opcode·warp/scalar count 구분, SHA/architecture/chain에 연결한 raw SASS 재검사, hot-loop 데이터 load/store·spill 부재, one-step 수치 검증 | Q·threads·chains·iterations, 양 arm resource/rate 차이, 초기화·최종 store·launch 비용 amortization; 물리 SFU rail 분리는 주장하지 않음 | Signed 차분·CI·Q scaling; 음수/zero-crossing은 표시하되 최적값 선정 제외, 전체/idle은 진단만 |
+| Legacy streaming EXP/TANH/SiLU | pJ/element, Gelement/s | 전후 분산 CPU double sample, complete output element/epoch, 표준 math·SFU activity·spill | 명시적 streaming 모드; auto grid의 Q scaling과 Q별 geometry/clock 비교, 메모리 비용 포함 | 함수·Q별 독립 그림, Q-scaling 그림·표, 수치 검증 표 |
+| Legacy streaming RMSNorm/Softmax | pJ/element와 pJ/row | 위 조건 + row count/width, RMS epsilon/gamma, stable max/sum 및 Softmax 행 합 | 명시적 streaming 모드; 행 너비별 성능·에너지; `pJ/row = width × pJ/element` | 행 너비별 독립 그림과 row 단가 표 |
 | Control / paired arm | active reference 전력과 signed contrast | 같은 process/context·geometry·clock·온도·cap, AB/BA 균형·완료 epoch | matching 실패 시 contrast 선택 제외 | 전력/온도 trace와 order/quality; component 단가로 선택하지 않음 |
 
 기존 NCU threshold는 `validation.py`의 명시적 정책을 그대로 재평가한다.
@@ -103,15 +111,19 @@ write/copy residency 판정이 미확정이면 해당 에너지는 보존하지�
    seed/offset만 다른 조건은 새 자원 level이 아니다. 다른 clock의 geometry를
    합쳐 plateau를 만들지 않는다. 결과는 관측 근거이며 hardware saturation
    증명은 계속 false다.
-   **Nonlinear V2 auto grid 예외:** blocks×threads가 Q에 묶이므로 기존 자원
-   plateau를 적용하지 않는다. 함수·행 너비·threads·iterations·grid mode·binary·
-   환경·고정 clock을 맞춘 별도 Q 곡선에서 가장 큰 유효 Q 3개를 선택한다.
+   **Q 기반 auto grid 예외:** blocks×threads가 Q에 묶이므로 기존 자원
+   plateau를 적용하지 않는다. 기본 SFU는 primitive·입력 recurrence·chains·threads·
+   iterations·grid mode·binary·환경·고정 clock을 맞춘 별도 register lane Q 곡선을
+   사용한다. Legacy streaming V2는 함수·행 너비를 맞춘 input-element Q 곡선을
+   사용한다. 각 곡선에서 가장 큰 유효 Q 3개를 선택한다.
    각 Q에 경로·정확한 count·반복·CI·해당 에너지 objective 요건을 통과한 근거가
    있고, 모두 전체 유효 Q 곡선 peak의 95% 이상이며 처리량 폭이 5% 이내여야 한다.
    추천 후보의 Q도 이 구간에 있어야 `observed_input_size_plateau`가 된다.
    미검증인 큰 Q를 건너뛰어 낮은 구간을 확정하지 않는다. Q별 에너지 통계·후보는
-   분리하며 이 진단 곡선에서 합산하지 않는다. Q 변화는 cache와 launch 비용도
-   바꾸므로 SFU 포화 증명이 아니다. fixed/v1 nonlinear은 기존 판정을 유지한다.
+   분리하며 이 진단 곡선에서 합산하지 않는다. SFU에서 Q 변화는 launch당 작업량과
+   최종 sink 크기도 바꾸며, streaming에서는 cache 효과도 바뀐다. 어느 경우도
+   SFU 포화 증명이 아니다. Fixed SFU는 자원 plateau가 있어도 잠정 결과로 남기고,
+   legacy streaming fixed/v1은 기존 자원 판정을 유지한다.
 5. **에너지 후보:** 같은 clock에서 최소 2개의 검증 geometry와 exact count,
    반복/CI 요건을 통과한 조건 중 처리량 기준을 만족하는 에너지 최소를 고른다.
    own-clock 최소와 **전체 관측 peak의 95% 성능을 유지하는 전체 clock 후보**를
@@ -136,12 +148,14 @@ write/copy residency 판정이 미확정이면 해당 에너지는 보존하지�
 contrast를 별도로 평가한다. 차감 결과로 전체 에너지를 대체하지 않는다.
 음의 contrast는 그래프/표에 남기지만 에너지 최소 후보에서는 제외한다.
 
-Register SFU 실험의 주 결과는 `sfu_reference_delta_pj_per_instruction`이다.
+기본 nonlinear/register SFU 실험의 주 결과는 `sfu_reference_delta_pj_per_instruction`이다.
 `register_loop_without_sfu` control과의 `ΔP / treatment instruction rate`를 사용하며
 idle만 뺀 값을 주 결과로 삼지 않는다. 측정 가능한 signed 차분과 양의 효율 후보
 자격을 구분한다. 95% CI의 하한이 0 이하이면 양의 SFU 단가를 확인한 후보로
 선정하지 않는다. 전체 GPU/idle objective는 진단으로만 제공하며 SFU 추천값을
-생성하지 않는다. 자세한 계약은 [SFU register 실험](sfu-register-experiments.ko.md)에 있다.
+생성하지 않고 `diagnostic_only`로 표시한다. scalar instruction 한 번은 원소 하나에
+native primitive를 적용한 호출 한 번이며, 분모는 완료 launches×Q×chains×iterations다.
+자세한 계약은 [기본 nonlinear/SFU 실험](nonlinear-experiments.ko.md)에 있다.
 
 Factory default와 exact 1110은 같은 input·seed·geometry·환경의 reference와
 비교한다. 1110은 후보와 같은 memory domain을 사용한다. reference가 유일하지
@@ -182,6 +196,8 @@ python -m powermodeling analyze --input results/validated \
   clock–에너지, energy/throughput, 자원–처리량, SM×memory 최소 에너지 cell,
   NCU별 valid/rejected 반복을 보여준다. 여러 memory domain은 그림도 분리한다.
   locality는 주파수별 SM×offset 지도, control은 실제 전력/온도 trace를 낸다.
+  기본 SFU는 signed paired contrast를 먼저 표시하고, Q–처리량·Q–차분 그림에는
+  primitive·chains·iterations와 register lane 단위를 명시한다. 음수 값도 남긴다.
 
 Factory default는 보라 ring, exact 1110은 검은 ring, 후보는 큰 marker로 표시한다.
 counter 상태는 색·marker로 구분한다. 없는 값/미승인 에너지 cell은 공백이고,

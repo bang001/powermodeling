@@ -1,6 +1,6 @@
 # NVIDIA GPU power modeling
 
-**SXM 모듈의 V100·A100·H100**에서 **충분히 활용한 조건의 실측 pJ/FLOP·pJ/bit·pJ/element 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM과 **EXP·TANH·RMSNorm·Softmax·SiLU**의 입력 크기·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
+**SXM 모듈의 V100·A100·H100**에서 **충분히 활용한 조건의 실측 pJ/FLOP·pJ/bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
 
 SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter로 검증하기 전에는 목표 계층과 물리 회로 에너지를 동일시하지 않는다.
 
@@ -14,7 +14,6 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 | L1·L2·HBM | `.ca`/`.cg` load, working set·grid·thread·stride·주소 offset·read/copy sweep |
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
 | Register SFU | EX2·LG2·RCP·RSQ·SQRT·native TANH의 register 반복, SFU를 뺀 control 대비 차분 pJ/scalar instruction |
-| 전체 비선형 함수 | FP32 EXP·TANH·RMSNorm·Softmax·SiLU의 global 입출력을 포함한 함수 적용, pJ/element·pJ/row; SFU 자체의 단가와 별도 |
 | 전력 측정 | capability 기반 NVML 평균/현재/누적에너지, 지원되는 memory scope, raw timestamps·오류 |
 | 시간·기준 | 같은 context·버퍼·clock policy의 전후 idle 및 AB/BA paired active reference, arm별 warmup·완료 epoch의 정렬 적분 |
 | 클럭·DVFS | 900 MHz 이상 지원 pair의 60/90/120 등 가변 간격 graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
@@ -77,111 +76,70 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 
 완료된 실험을 이어 실행하려면 같은 plan/output에 `--resume`을 추가한다. 실패한 측정은 raw 로그를 남기며 성공한 결과로 처리되지 않는다. `--limit 3`은 일부 trial의 실행 점검에 사용할 수 있지만 repeat나 sweep가 불완전하면 효율 최적값을 확정할 수 없다.
 
-## Register-resident SFU 기본 명령 실험
+## 비선형 실험: SFU 마이크로벤치
 
-**SFU 연산의 차분 에너지를 보려면 `configs/sfu-register*.json`을 사용한다.** 반복 루프에서 global/shared/local load/store를 제거하고, 동일한 bounded register loop에서 SFU 명령을 뺀 control과 AB/BA로 비교한다. 주 결과 `sfu_reference_delta_pj_per_instruction`은 `(P_treatment − P_control) / treatment의 scalar SFU 명령 처리율`이다. 전체 GPU 단가와 idle 증가분은 별도 진단값으로 보존한다. Register/issue/실행 시간 차이의 영향까지 완전히 제거한 물리 SFU rail 에너지로 해석하지 않는다.
+**`configs/nonlinear*.json`은 register-resident SFU 실험이다.** 반복 루프에서 global/shared/local load/store를 제거하고, 동일한 bounded register loop에서 SFU 명령을 뺀 control과 AB/BA로 비교한다. L1·L2·HBM working set·stride·행 너비는 sweep하지 않는다. 기존 `sfu-register*.json`도 같은 설정으로 유지한다.
 
-| 연산 | 의미 | V100 | A100/H100 |
+| 연산 / workload | 의미 | V100 | A100/H100 |
 |---|---|---|---|
 | EX2 / `sfu_ex2` | 2ˣ | 지원 | 지원 |
 | LG2 / `sfu_lg2` | log₂x | 지원 | 지원 |
 | RCP / `sfu_rcp` | 1/x | 지원 | 지원 |
 | RSQ / `sfu_rsqrt` | 1/√x | 지원 | 지원 |
 | SQRT / `sfu_sqrt` | √x | 지원 | 지원 |
-| TANH / `sfu_tanh` | native tanh(x) | 미지원, 명시적으로 skip | 지원 |
+| TANH / `sfu_tanh` | native tanh(x) | 미지원, skip 사유 기록 | 지원 |
 
-모두 FP32 **근사 명령**이다. EXP(eˣ), RMSNorm, Softmax, SiLU 전체의 단가가 아니다. Q=`sfu_lanes`와 independent chains를 바꿔 처리량을 검사하며, 최종 결과 검증용 lane당 4B store 한 번은 반복이 끝난 뒤 수행한다. 그 비용의 amortization도 별도로 점검한다. 음수·0을 포함하는 CI는 숨기지 않고 진단으로 표시한다.
+모두 FP32 **근사 명령**이다. EXP(eˣ)는 EX2(2ˣ)와 다르고, RMSNorm·Softmax·SiLU 전체에는 다른 산술·reduction이 필요하므로 기본 SFU 실험에 포함하지 않는다.
+
+Q=`sfu_lanes`는 register 작업 lane 수이며 블록 수는 `ceil(Q/threads)`다. Q 3개 × threads 2개 × 독립 chains 3개로 처리량을 점검한다. 각 chain의 다음 입력을 register에서 유효 범위로 재구성하며 control도 같은 재구성 작업을 한다. 마지막 검증용 lane당 4B store 한 번은 반복 후에만 수행한다. `nonlinear-amortization.json`으로 반복 길이에 따른 초기화·최종 store·launch 비용의 영향을 확인한다. Q만 늘렸다고 포화가 입증되는 것은 아니다.
+
+### 실행과 검증
 
 ```bash
 export POWERBENCH=build/powerbench  # A100/CUDA13: build-a100-cuda13/powerbench
-python tools/check_sfu_sass.py --binary "$POWERBENCH" --output results/sfu-sass.json
-python -m powermodeling plan --config configs/sfu-register-smoke.json \
-  --bench "$POWERBENCH" --device 0 --sfu-sass-evidence results/sfu-sass.json \
-  --output results/sfu-smoke-plan.json
-python -m powermodeling run --plan results/sfu-smoke-plan.json \
-  --bench "$POWERBENCH" --device 0 --output results/sfu-smoke
-python -m powermodeling analyze --input results/sfu-smoke \
-  --output results/sfu-smoke-report --plots
-```
-
-Smoke는 V100 20 trials/최소15분, A100/H100 24 trials/최소18분이다. 고정 clock 최적점을 확정하는 실험은 아니다. 전체 `sfu-register.json`은 Q 3개 × threads 2개 × chains 3개를 비교하며 clock 조건 하나당 V100 최소4.5시간, A100/H100 최소5.4시간이다. NCU 검증·준비·overrun은 추가된다. [SFU register 실험 지침](docs/sfu-register-experiments.ko.md)에 전체 sweep, SASS 증거, 차분 식, loop 길이 진단과 해석 한계를 설명한다.
-
-## 전체 비선형 함수 실험: EXP·TANH·RMSNorm·Softmax·SiLU
-
-아래 `nonlinear*.json`은 **global 입출력을 포함한 전체 함수 실험**이다. Register SFU 명령 단가는 위 실험으로 측정한다.
-
-5개 함수를 독립 workload로 실행하고 **FP32 입력·출력, CUDA 표준 math, global load/store를 포함한 전체 함수 적용의 pJ/element**를 측정한다. `--use_fast_math`는 사용하지 않는다. 측정 전후에 CPU double 기준값으로 출력 표본을 검사하며, 수치 검증이나 완료 원소 수가 잘못된 결과는 에너지 후보에서 제외한다.
-
-| 함수 / workload | 측정하는 연산 | 에너지 단위 |
-|---|---|---|
-| EXP / `exp` | `expf(x)` | pJ/element |
-| TANH / `tanh` | `tanhf(x)` | pJ/element |
-| RMSNorm / `rmsnorm` | 행별 `x[i] * gamma[i] / sqrt(mean(x²) + 1e-5)` | pJ/element, pJ/row |
-| Softmax / `softmax` | 행별 max 차감, exp 합계 reduction, 정규화; exp를 두 번 계산하는 3-pass 구현 | pJ/element, pJ/row |
-| SiLU / `silu` | `x / (1 + expf(-x))` | pJ/element |
-
-`element`는 **완료한 출력 원소 1개**다. 행 너비가 N이면 `pJ/row = N × pJ/element`이며 RMSNorm·Softmax의 reduction 비용도 포함한다. 이 workload의 `operations`와 `*_pj_per_op` 별칭도 출력 원소를 세며 FLOP나 SFU instruction 수를 뜻하지 않는다. 입력을 반복 처리한 횟수도 분모에 포함한다. `working_set_bytes`는 입력 버퍼 크기이고, 같은 크기의 출력 버퍼와 RMSNorm의 gamma 벡터는 별도다. 측정값에는 메모리 접근·reduction·launch 비용이 포함되므로 함수만의 물리 회로 에너지로 해석하지 않는다.
-
-기본 `grid_mode: "auto"`는 **Q = working_set_bytes / 4**를 기준으로 EXP·TANH·SiLU에 `ceil(Q/threads)`개 블록, RMSNorm·Softmax에 `Q/row_width`개 블록(한 행/CTA)을 실행한다. 기존 2/4×SM 고정 grid는 Q를 늘려도 동시 실행 후보 블록 수가 늘지 않는 제한이 있었다. 새 방식은 이 제한을 제거하며, 처리량 포화 여부는 Q sweep과 profiler로 따로 평가한다. `grid_mode: "fixed"`와 명시적 `blocks`는 제한된 grid를 비교하는 진단용이다. 이전 설정 파일에 `blocks`가 있으면 제거하거나 `fixed`를 지정해야 한다.
-
-### 실행·수치·센서 점검
-
-설치와 빌드를 마친 뒤 사용할 실행 파일을 선택한다. A100 + CUDA 13.0이면 첫 줄을 `export POWERBENCH=build-a100-cuda13/powerbench`로 바꾼다. 아래 `--plots`에는 matplotlib가 필요하므로 plots 의존성을 설치한다.
-
-```bash
-export POWERBENCH=build/powerbench
 python -m pip install -e ".[plots]"
-python -m powermodeling discover --device 0 --bench "$POWERBENCH" \
-  --output results/nonlinear-discovery.json
+python tools/check_sfu_sass.py --binary "$POWERBENCH" --output results/sfu-sass.json
 python -m powermodeling plan --config configs/nonlinear-smoke.json \
-  --device 0 --bench "$POWERBENCH" --output results/nonlinear-smoke-plan.json
+  --bench "$POWERBENCH" --device 0 --sfu-sass-evidence results/sfu-sass.json \
+  --output results/nonlinear-smoke-plan.json
 python -m powermodeling run --plan results/nonlinear-smoke-plan.json \
-  --device 0 --bench "$POWERBENCH" --output results/nonlinear-smoke
+  --bench "$POWERBENCH" --device 0 --output results/nonlinear-smoke
 python -m powermodeling analyze --input results/nonlinear-smoke \
   --output results/nonlinear-smoke-report --plots
-```
 
-Smoke는 5개 함수 × 4회 반복 = **20 trials, 최소 약 15분**이다. 준비·클럭 안정화·측정 overrun은 추가된다. 클럭을 변경하지 않는 기능 점검이며 고정 클럭의 효율 최적점을 확정하지 않는다.
-
-### 고정 클럭 sweep과 NCU 검증
-
-전체 설정은 **Q = 2²⁴/2²⁵/2²⁶ 원소(입력 64/128/256 MiB), threads 128/256/512**를 비교한다. RMSNorm·Softmax는 행 너비 128/1024/4096도 비교한다. 기본 graphics 범위는 **900 MHz 이상·90 MHz 간격**이며 지원되는 exact 1110 MHz와 advertised factory-default 고정 pair, 현재 정책 reference를 포함한다. 간격은 설정 파일의 `clock_sweep.graphics_step_mhz`를 60·120 MHz 등으로 바꿀 수 있다. `plan`이 보여 주는 trial 수·최소 예상 시간을 확인한 뒤 전용 GPU에서 실행한다.
-
-현재 전체 설정은 clock 조건 하나당 81개 조건 × 4회 반복으로 **최소 4.05시간**이다(pointwise 1.35시간, rowwise 2.70시간). GPU별 지원 clock 수를 곱하고 준비·overrun·별도 NCU 시간을 추가해야 한다. GPU 모델명만으로 전체 시간을 확정할 수 없다.
-
-```bash
+# 고정 클럭 sweep 및 별도 NCU 검증
 python -m powermodeling plan --config configs/nonlinear.json \
-  --device 0 --bench "$POWERBENCH" --output results/nonlinear-plan.json
+  --bench "$POWERBENCH" --device 0 --sfu-sass-evidence results/sfu-sass.json \
+  --output results/nonlinear-plan.json
 python -m powermodeling run --plan results/nonlinear-plan.json \
-  --device 0 --bench "$POWERBENCH" --output results/nonlinear \
+  --bench "$POWERBENCH" --device 0 --output results/nonlinear \
   --apply-clocks --clock-method applications
 python -m powermodeling validate-run --plan results/nonlinear-plan.json \
   --input results/nonlinear --output results/nonlinear-validated \
-  --profiles-dir results/nonlinear-profiles --device 0 --bench "$POWERBENCH" \
+  --profiles-dir results/nonlinear-profiles --bench "$POWERBENCH" --device 0 \
   --apply-clocks --clock-method applications
 python -m powermodeling analyze --input results/nonlinear-validated \
   --plan results/nonlinear-plan.json --output results/nonlinear-report --plots
 ```
 
-`validate-run`은 전력 측정과 분리한 NCU replay로 커널·SFU 활동·spill·수치/카운트·측정 조건의 일치를 검사한다. 필요한 counter가 없으면 `inconclusive`로 남는다. 설치한 호환 NCU를 선택하려면 `--ncu /설치경로/ncu`를 추가한다. `applications` 클럭이 지원되지 않는 장치는 위의 locked-clock 복원 지침에 따라 run과 validate-run에 같은 정책을 사용한다. pointwise/rowwise를 나누려면 plan에 `--stage pointwise` 또는 `--stage rowwise`를 지정하고 plan·결과 경로도 나눈다.
+SASS 검사는 실제 native 명령, 반복당 명령 수, hot loop의 메모리 접근·spill 여부를 확인하며 증거를 실행 파일 SHA256에 연결한다. 실행 파일을 다시 빌드했다면 certificate와 plan도 새로 만든다. NCU replay는 전력 측정과 분리하며 누락된 검증은 `inconclusive`로 남긴다. 지원되지 않는 clock 적용 방식의 대안과 복원 방법은 위 클럭 지침을 따른다.
 
-### 단가와 그래프 읽기
+Smoke는 V100 20 trials/최소15분, A100/H100 24 trials/최소18분이다. 전체 sweep은 **clock 조건 하나당 V100 최소4.5시간, A100/H100 최소5.4시간**이며 NCU·준비·overrun 시간은 추가된다. graphics sweep은 900 MHz 이상·기본90 MHz 간격, 지원되는 exact1110 MHz·advertised factory default·현재 정책 reference를 포함한다. Memory clock은 treatment/control의 환경 조건으로 기록하고 domain별로 비교한다. SFU 커널이 메모리 계층을 읽는 실험이라는 뜻은 아니다.
 
-| 결과 필드 | 의미 |
-|---|---|
-| `total_pj_per_element` | 측정한 전체 GPU 에너지 / 완료 출력 원소 수 |
-| `operational_idle_increment_pj_per_element` | 승인된 전후 idle 대비 증가분 / 완료 출력 원소 수 |
-| `paired_active_reference_pj_per_element` | 같은 process에서 AB/BA로 짝지은 active reference 대비 / 완료 출력 원소 수 |
-| 각 `*_pj_per_row` | RMSNorm·Softmax의 완전한 행 1회 적용 단가 |
-| `throughput_elements_s`, `throughput_rows_s` | 같은 에너지 적분 구간에서 완료한 원소/초, 행/초 |
+### 단가와 평가
 
-`results/nonlinear-report/evaluation.html`을 열어 GPU·함수·입력 footprint·행 너비·에너지 기준을 선택한다. 클럭별 Gelement/s와 pJ/element, 처리량 대비 에너지, 실행 geometry 응답, 반복 신뢰구간, factory-default·1110 MHz 대비를 확인할 수 있다. 같은 폴더에 `evaluation.json`·`evaluation.csv`·`summary.json`·`trials.csv`와 `--plots`로 생성한 PNG/SVG가 저장된다. GPU·CUDA 버전·함수·footprint·행 너비가 다른 결과는 별도 조건으로 비교한다.
+주 결과 `sfu_reference_delta_pj_per_instruction`은 다음과 같다.
 
-Q scaling 그림·표는 같은 clock·함수·행 너비·threads에서 Q에 따른 처리량과 단가를 비교한다. 최소 3개 Q의 큰 입력 구간에서 처리량이 안정되는지 확인하며, Q별 에너지 후보와 반복 통계는 따로 유지한다. Q 변화에는 cache와 launch 비용의 영향도 있으므로 `observed_input_size_plateau`를 SFU 하드웨어 포화로 해석하지 않는다.
+```text
+SFU 실행 수 N = 완료 launches × Q × chains × iterations
+SFU 차분 pJ/instruction = (P_treatment − P_control) / (N / treatment 시간) × 10¹²
+```
 
-전체·idle 증가분·paired 대비는 각각 평가한다. 후보는 측정 품질·정확한 카운트·NCU·반복 정밀도·실행 geometry 조건을 통과하고 관측 최고 처리량의 기본 95% 이상을 유지해야 한다. 계획 누락이나 plateau 근거 부족이 있으면 잠정 후보로 표시하며, 음의 차감값은 효율 최적점으로 선택하지 않는다. 실제 pJ 값은 GPU에서 실행해야 얻을 수 있다.
+여기서 scalar 명령 적용 1회를 element 1회로 정의하면 pJ/element와 같은 수치다. 초기 Q로만 나누지 않는다. **Idle을 뺀 값이나 전체 GPU 에너지가 주 결과가 아니다.** 전체 단가와 idle 증가분은 진단으로 보존한다. Register/issue·실행 시간 차이의 영향이 남으므로 이 차분을 물리 SFU 전원선만의 에너지로 단정하지 않는다.
 
-커널·입력 분포·수치 허용 오차는 [비선형 함수 실험 설계·실행 지침](docs/nonlinear-experiments.ko.md), 후보 승인 기준과 시각화는 [컴포넌트별 평가·시각화 설계](docs/evaluation-design.ko.md)를 참조한다.
+`evaluation.html`에서 primitive·Q·chains·클럭별 차분과 반복 CI, 처리량, control 전력, factory default·1110 MHz 대비를 확인한다. Q·chains·반복 수가 다른 단가를 하나의 median으로 합치지 않는다. 후보는 정확한 count·수치·SASS/NCU·paired 상태·반복 정밀도·Q scaling 근거를 검사한다. 처리량 기본95% 기준은 비교 가능한 sweep에서 **관측한 최고 처리량**에 대한 유지율이며, 이론적 SFU 최대 성능의 95%를 요구하는 뜻은 아니다. 음수·0을 포함하는 CI는 진단으로 표시하고 에너지 최적점으로 승인하지 않는다. 전체 선정 순서와 시각화는 [평가 설계](docs/evaluation-design.ko.md), 커널·control·실행 지침은 [비선형 SFU 실험 설계](docs/nonlinear-experiments.ko.md)를 참조한다.
+
+이전 global 입출력 기반 EXP·TANH·RMSNorm·Softmax·SiLU 설정은 `configs/legacy/nonlinear-streaming*.json`으로 옮겼다. 이 workload를 새로 실행하려면 config의 각 experiment `parameters`에 `nonlinear_mode: "streaming"`, 직접 CLI에는 `--nonlinear-mode streaming`을 명시한다. 기존 raw 결과는 계속 분석할 수 있으며 SFU 결과와 단위·조건을 분리한다. [이전 streaming 실험 지침](docs/legacy/nonlinear-streaming.ko.md)
 
 ## sweep 구성
 
@@ -191,11 +149,10 @@ Q scaling 그림·표는 같은 clock·함수·행 너비·threads에서 Q에 �
 | [configs/saturation.json](configs/saturation.json) | warp/block·working set·accumulator·GEMM 크기와 고정 클럭 탐색 |
 | [configs/dvfs.json](configs/dvfs.json) | memory×SM clock 도메인의 bandwidth plateau와 효율 탐색 |
 | [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
-| [configs/nonlinear-smoke.json](configs/nonlinear-smoke.json) | FP32 비선형 함수 5종의 실행·수치·센서 점검 |
-| [configs/sfu-register-smoke.json](configs/sfu-register-smoke.json) | Native SFU register loop와 대응 control의 실행·수치·센서 점검 |
-| [configs/sfu-register.json](configs/sfu-register.json) | SFU 기본 명령의 Q·threads·chains·clock별 차분 pJ/instruction |
-| [configs/sfu-register-amortization.json](configs/sfu-register-amortization.json) | SFU loop 길이에 따른 초기화·최종 store·launch 비용 영향 점검 |
-| [configs/nonlinear.json](configs/nonlinear.json) | 비선형 함수의 footprint·geometry·행 너비·clock별 pJ/element sweep |
+| [configs/nonlinear-smoke.json](configs/nonlinear-smoke.json) | Native SFU 5/6종과 대응 register control의 실행·수치·센서 점검 |
+| [configs/nonlinear.json](configs/nonlinear.json) | SFU 기본 명령의 Q·threads·chains·clock별 차분 pJ/instruction |
+| [configs/nonlinear-amortization.json](configs/nonlinear-amortization.json) | SFU 반복 길이에 따른 초기화·최종 store·launch 비용 영향 점검 |
+| `configs/sfu-register*.json` | 대응하는 `nonlinear*.json`과 같은 SFU 설정; 기존 경로 호환 |
 | [configs/component-diagnostics.json](configs/component-diagnostics.json) | Tensor·L1·L2·HBM 단가가 높을 때 iterations/batching·Tensor dependency·L1 footprint를 분리하는 추가 진단 |
 
 JSON의 `clock_pairs`로 검증된 특정 pair를 진단할 수 있다. **`saturation.json`·`dvfs.json`·`locality.json`·`nonlinear.json`의 energy sweep은 기본 `graphics_min_mhz: 900`, `graphics_step_mhz: 90`을 사용한다.** 간격은 60·90·120 MHz 등 양의 정수로 변경할 수 있다. 각 memory domain에서 900 MHz 이상의 지원 값에만 grid를 매핑하고 해당 평가 범위의 끝점, exact 1110 MHz(지원 domain), advertised factory-default 고정 pair와 incoming-policy reference를 포함한다. 일반 200–300 MHz sweep는 생성하지 않는다. 필수 default pair가 하한 아래이면 그 anchor만 예외로 포함한다. 1110 미지원은 사유를 기록하며 근사값으로 대체하지 않는다. incoming policy를 factory-default DVFS라고 단정하지 않는다. 지원/평가 범위·제외된 낮은 native 값·실제 간격은 `plan.clock_sweep_coverage`에 남긴다.
@@ -210,7 +167,7 @@ HBM stride 실험은 stride가 커질 때 전체 할당 크기도 늘리고 순�
 
 ## Treatment·idle·active reference
 
-Treatment는 측정하려는 대상 작업이다. `paired_reference: true`인 custom workload는 같은 worker process·context·할당·clock policy에서 issue-loop `control`을 AB/BA 순서로 짝지어 실행한다. grid/thread·loop·SM filter·batch 설정과 actual clocks·온도·cap·간섭을 검사하며, 각 arm의 에너지와 완료 count를 독립적으로 정렬한다. control도 정수 연산·제어·launch·store 전력을 쓰므로 두 arm의 차이는 operational contrast다.
+Treatment는 측정하려는 대상 작업이다. `paired_reference: true`인 custom workload는 같은 worker process·context·할당·clock policy에서 `control`을 AB/BA 순서로 짝지어 실행한다. SFU는 대상 명령을 제거한 register recurrence control, Tensor·memory는 기존 issue-loop control을 사용한다. grid/thread·loop·SM filter·batch 설정과 actual clocks·온도·cap·간섭을 검사하며, 각 arm의 에너지와 완료 count를 독립적으로 정렬한다. control도 정수 연산·제어·launch·store 전력을 쓰므로 두 arm의 차이는 operational contrast다.
 
 전후 idle는 active 시점에 보간하고 drift·actual clock·온도를 검사한다. baseline가 실패해도 treatment 전체 에너지의 품질 판정은 보존한다. 미승인 차감값과 음의 대비는 진단값으로 남기지만 승인된 최적점 후보로 사용하지 않는다. 전체 에너지, 승인된 idle 증가분, 승인된 paired 대비를 서로 대체하지 않으며 순수 static/dynamic·회로 에너지로 이름 붙이지 않는다. 이전 plan/결과와 새 paired protocol을 같은 repeat로 합치지 않는다.
 
@@ -367,8 +324,8 @@ python -m unittest discover -s tests -v
 CPU 테스트는 데이터 분석·모델 식별·plan·NVML mock·클럭 복원을 검증한다. CUDA 컴파일, actual GPU 실행, cache attribution과 측정 정확도는 V100/A100/H100 장비에서 확인해야 한다.
 
 - [실험 설계: static/dynamic 기준, DVFS, hierarchy, near/far, fairness](docs/experiment-design.ko.md)
-- [비선형 함수: EXP·TANH·RMSNorm·Softmax·SiLU의 정의·실행·에너지 단위](docs/nonlinear-experiments.ko.md)
-- [Register-resident SFU 기본 명령: 차분 pJ/instruction·control·SASS 검증](docs/sfu-register-experiments.ko.md)
+- [비선형 SFU 마이크로벤치: register loop·차분 pJ/instruction·control·SASS 검증](docs/nonlinear-experiments.ko.md)
+- [이전 streaming 전체 함수 실험: EXP·TANH·RMSNorm·Softmax·SiLU](docs/legacy/nonlinear-streaming.ko.md)
 - [컴포넌트별 평가·시각화: coverage·반복 정밀도·plateau·에너지 후보](docs/evaluation-design.ko.md)
 - [높은 Tensor·L1·L2·HBM 단가: 기준·계산·처리량 점검과 추가 진단](docs/high-energy-investigation.ko.md)
 - [전체 구현 자가점검: 발견 사항·수정·검증·남은 실측](docs/self-audit.ko.md)

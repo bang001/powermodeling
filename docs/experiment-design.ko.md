@@ -4,6 +4,13 @@
 
 실측 전력이 없으면 idle 전력이나 각 블록의 에너지를 숫자로 확정하지 않는다. 이 저장소는 측정과 분석을 재현하는 도구이며, 예제나 CPU 테스트 결과는 GPU 측정 결과가 아니다.
 
+기본 nonlinear 실험은 [register-resident native SFU microbenchmark](nonlinear-experiments.ko.md)다.
+`configs/nonlinear*.json`은 EX2·LG2·RCP·RSQRT·SQRT·TANH 근사 명령을 대상으로 한다.
+V100은 native TANH가 없어 5개를 실행한다. 주 결과는 SFU 명령을 제거한 register-loop
+control 대비 signed pJ/scalar SFU instruction이며, 전체 GPU·idle 단가는 진단용이다.
+Global 입출력·reduction을 포함한 [과거 전체 함수 실험](legacy/nonlinear-streaming.ko.md)은
+명시적 `nonlinear_mode: "streaming"` 설정으로만 새로 실행하며 별도 분석 계약을 유지한다.
+
 [시각화 HTML 문서](experiment-design.html)는 treatment/reference 도식, clock coverage, 실제 plan·summary JSON의 로컬 뷰어를 제공한다. 외부 자원이나 서버 업로드 없이 실행된다. 문서 도식은 측정 데이터가 아니다.
 
 **대상 GPU는 모두 SXM 모듈이다.** SXM은 GPU 모듈 장착 형태이고 HBM(High Bandwidth Memory)은 측정하려는 메모리 계층이다. SXM과 HBM은 서로 대체되는 GPU 버전 이름이 아니다. 대표 비교 표기는 V100 SXM2·A100 SXM4·H100 SXM5이며, 실제 SKU·메모리 용량·SM 수·power limit은 discovery로 확인한다. SXM 이름이 확인되지 않는 장치는 계획 단계에서 자동 확정하지 않으며 명시적 SXM 확인 근거가 필요하다.
@@ -18,6 +25,7 @@
 | paired active-reference 대비 | `P_treatment − P_active_reference` | 같은 process·context·할당·clock policy에서 AB/BA로 짝지어 측정; 제어 커널도 전력을 쓰며 순수 회로 isolation이 아님 |
 | 메모리 scope 전력 | 지원 장치에서 별도로 보고되는 GPU 메모리 전력 | API 지원·센서 범위를 확인해야 하며 HBM 셀만의 전력으로 단정하지 않음 |
 | pJ/FLOP | `P / FLOP/s × 10^12` | 곱셈과 덧셈을 각각 1 FLOP으로 계산; MMA의 FMA는 2 FLOP |
+| SFU pJ/scalar instruction | `(P_treatment − P_register_control) / treatment instruction/s × 10^12` | Native primitive를 원소 하나에 적용한 호출 1회; 분모는 완료 launches×Q×chains×iterations이며 순수 SFU rail 에너지는 아님 |
 | pJ/logical-bit | `E / (완료 요청 byte×8) × 10^12` | 코드가 요청한 유효 payload bit당 에너지; `pJ/bit=pJ/byte÷8`, DRAM에서 실제 움직인 바이트와 다름 |
 | pJ/physical-bit | `E / 실제 계층 전송 bit × 10^12` | 해당 계층 counter와 지속 에너지 구간의 work·시간 기준 provenance 필요; 현재 NCU replay byte만으로 산출하지 않음 |
 
@@ -58,8 +66,10 @@ A100의 두 partition은 공식 백서에서 확인된다. H100의 50 MB와 part
 flowchart TD
   W["고정 클럭의 반복 워크로드"] --> T["Tensor: FP16 입력·FP32 누산"]
   W --> M["메모리: working set·stride 변화"]
+  W --> S["Nonlinear: register SFU·Q·chains·iterations"]
   T --> P["별도 전력 실행: NVML 파형"]
   M --> P
+  S --> P
   M --> C["별도 검증 실행: cache·DRAM counters"]
   P --> A["처리량·기준 대비 증가분 분석"]
   C --> A
@@ -69,6 +79,7 @@ flowchart TD
 |---|---|---|---|
 | Tensor WMMA | 작은 타일을 한 번 준비하고 반복 MMA; 여러 독립 accumulator, warp/block 및 block 수 sweep | FP16 입력·FP32 누산, 연산이 제거되지 않음, tensor 명령이 실제 생성됨 | Tensor operand 전달, register file, instruction issue, 제어 및 최소 입출력 |
 | Tensor cuBLAS GEMM | 행렬 크기를 늘려 지속 dense FP16 GEMM을 실행 | `2MNK`, datatype, 누산, 라이브러리·툴킷, 실제 Tensor 경로·finite sample/checksum; 기준 결과와의 정확도 비교는 별도 | Tensor와 데이터 이동·캐시·HBM 전체 |
+| Native SFU — 기본 nonlinear | Q개 register lane의 1/4/8 chain에서 native 근사 명령 반복; 같은 loop에서 SFU를 뺀 control | Binary-bound SASS에서 native 명령 유지·hot-loop 데이터 load/store·spill 부재, scalar/warp count, one-step 수치 검증, matched control과 CI | Signed control 차분에도 issue·register·scheduling 차이가 남음; 초기화·loop 후 lane당 4 B sink·launch를 iterations로 amortize |
 | L1 | `ld.global.ca`로 block별 작은 working set을 반복 읽음 | resident block들의 총 working set, L1 hit 및 낮은 L2/DRAM 트래픽 | load/store unit, 주소 계산, register·L1·제어 |
 | L2 | `ld.global.cg`로 L1을 우회하고 L2보다 작은 working set을 반복 읽음 | L2 hit, DRAM bytes, L2 fabric 트래픽, partition 충돌 | L2+interconnect+SM의 load 발행/수신 |
 | HBM | `ld.global.cg`, L2보다 충분히 큰 working set, coalesced streaming | DRAM 실측 대역폭, L2 hit, 메모리·SM 클럭에 따른 plateau | HBM+controller+L2+interconnect+SM |
@@ -94,6 +105,14 @@ PTX의 `.ca`는 cache-all, `.cg`는 global-level caching의 힌트이다. `.cg`�
 | address offset | 정렬된 여러 offset | 주소에 따른 slice/partition 행동을 경험적으로 관찰 |
 | 데이터 | 재현되는 nonzero pseudo-random | zero-filled 데이터의 압축·낮은 토글 활동과 구분 |
 
+위 working-set·stride·offset 축은 메모리 실험에 적용한다. 기본 nonlinear/SFU의 Q는
+메모리 footprint가 아니라 register lane 수다. 기본 sweep은 Q=131072/262144/524288,
+threads=128/256, chains=1/4/8이며 auto grid는 `ceil(Q/threads)`다. 반복 내부에
+global/shared/local 데이터 load/store가 없고 초기화와 마지막 lane당 4 B sink가 있다.
+Constant-bank operand의 공급까지 없다는 뜻은 아니다. SFU를
+고정 blocks/SM으로 제한하는 실행은 진단용으로 남기며, Q를 늘렸다는 이유만으로
+포화를 가정하지 않는다. 별도 iteration sweep으로 고정 비용의 영향을 확인한다.
+
 `KiB = 1,024 bytes`, `MiB = 1,048,576 bytes`이고, `GB/s = 10^9 bytes/s`이다. Nsight Compute의 정의에서 L1/L2 cache line은 128 bytes, sector는 32 bytes이며 최소 접근 크기는 sector 하나다. Line이 4 sectors라고 매 요청이 항상 128 bytes를 전송하는 것은 아니다. Full warp의 32개 thread가 각각 연속된 4-byte 원소를 읽고 시작 주소가 32-byte 정렬이면 요청량은 128 bytes, 요청 sector 수는 4다. 128-byte 정렬된 기준 주소에서 시작점을 4 bytes 옮기면 5 sectors, 32 bytes 옮기면 두 128-byte line에 걸쳐도 4 sectors이다. 현재 single-stream read v2는 이런 scalar load를 thread당 iteration마다 1개 실행하므로 warp당 logical payload는 128 bytes이다. 이전 four-stream read는 4개/512 bytes였고 write/copy는 기존 네 접근을 유지한다. [변경된 read count와 재실험 방법](memory-read-v2.ko.md)을 참고한다. [sector 검토와 정렬 비교 설정](cache-sector-review.ko.md)을 별도로 제공한다. stride가 커지면 같은 logical bytes를 읽어도 많은 sectors가 움직일 수 있다. HBM stride sweep은 전체 stride cycle에서 가능한 sector footprint와 **한 launch가 유한한 iteration 동안 방문하는 footprint**를 구분한다. 주소 시작점이 같은 짧은 launch를 반복하면 큰 할당도 cache에 머물 수 있다. worker는 정확한 footprint 또는 상한임을 표시하고 주소 정렬·SM filter 한계를 기록한다. write/copy는 각 thread의 목적지 소유권을 겹치지 않게 유효 footprint를 조정한다. actual DRAM counter는 여전히 필요하며 cache throughput과 HBM bandwidth를 logical bytes만으로 비교하지 않는다. [S9]
 
 ## 5. 센서와 측정 시간
@@ -105,6 +124,11 @@ NVML 호출 이름이 같아도 평균 창이 다르다. 현재 공식 설명은
 측정 시계는 monotonic host clock을 쓰고 CUDA event elapsed도 진단값으로 기록한다. CUDA event는 event 사이의 launch gap을 포함하므로 kernel busy time으로 이름 붙이지 않는다. worker는 약 1초 단위로 완료된 batch 수·SM admission 수와 host 시작/끝을 보고한다. 분석은 treatment와 reference 각각에서 양 끝을 제외한 구간 안의 완전한 epoch만 선택해 **같은 시작/끝에서 work count와 에너지 적분**을 계산한다. 부분 batch를 비례 배분하지 않는다. admission counter의 readback overhead도 해당 시간에 포함해 기록한다. 과거 epoch 없는 결과는 whole-run rate의 정상 상태 가정에 따른 추정치이며 검증된 최적값에서 제외한다.
 
 Python의 process 시작 시점으로 active 시작을 추정하지 않고 worker 단계 메시지로 setup·warmup·active·idle을 구분한다. NVML sensor epoch timestamp와 host monotonic query midpoint는 다른 시계이므로 직접 비교하지 않는다. 누적 counter도 같은 구간에서 비교하고, 실패·누락 sensor를 0으로 바꾸지 않는다.
+
+Native SFU는 hot loop에 admission atomic이나 SMID 계측을 넣지 않는다. 동기화로
+확인한 완료 launches×Q×chains×iterations를 같은 epoch의 scalar instruction 수로
+사용한다. Control의 SFU instruction 수는 0이며 대응 register-loop slot 수를 따로
+기록한다. 두 arm의 수행 시간·완료 launch 수·register 사용이 같다고 가정하지 않는다.
 
 memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보고한다. 동일 시각·평균창·포함 관계가 확인되지 않은 GPU와 memory 값을 단순히 더하거나 빼서 core rail을 확정하지 않는다. 최신 NVML에는 `NVML_POWER_SCOPE_MEMORY`가 있고, `nvidia-smi`는 GPU Memory Power Readings를 문서화한다. 공개 API의 존재는 개별 H100에서 지원된다는 보장이 아니다. [S2, S10]
 
@@ -132,6 +156,9 @@ memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보
 
 네 energy-sweep 설정 모두 `all_memory_clocks: true`로 모든 광고된 memory domain을 선택하고 geometry 또는 locality 축을 함께 바꾼다. 설정한 간격은 graphics/core domain 간격이며 HBM memory frequency를 같은 간격으로 강제하는 설정이 아니다. `study_design: "energy_sweep"` 계획은 요구사항 coverage를 검사한다. advertised default pair가 미확정이면 plan의 `execution_allowed: false`와 `requirements_status: "incomplete"`를 남기고 runner가 변경·실행 전에 차단한다. null/null current-policy reference는 advertised-default 확인을 대체하지 못한다. Runner는 기록된 native 지원 clock 목록에서 선언한 하한·간격의 grid·평가 끝점·default·1110 조건을 다시 계산하고, 각 geometry와 treatment design 층의 실제 trial 목록에 그 조건이 모두 포함되는지 실행 전에 검사한다. selected coverage와 trial 목록을 함께 축소해도 원래 기록된 지원 목록에 따른 필수 grid 검사로 누락을 확인한다.
 
+SFU에서 memory clock은 환경 통제·비교 축이다. 이를 L1/L2/HBM working-set/stride
+실험으로 해석하거나 memory bandwidth를 SFU 처리량으로 사용하지 않는다.
+
 임의 MHz를 직접 넣은 explicit `clock_pairs`나 제한 memory domain은 full-study 요구 coverage가 확인되어야 energy sweep로 승인된다. `smoke.json`은 `study_design: "diagnostic"`으로 무설정 센서·실행 점검을 허용하는 예외이며 full frequency sweep 또는 효율 최적점 검증을 의미하지 않는다. 모든 미확정·적용 불가 조건은 `requirement_checks`와 `requirement_reasons`에서 확인한다.
 
 실측 최소점 주변을 정밀하게 보려면 지원 목록 안의 추가 15–30 MHz 이웃 등으로 새 계획·새 반복을 만든다. refinement는 선택 사항이며 실측되지 않은 주파수의 단가를 곡선 보간으로 채우지 않는다.
@@ -139,6 +166,11 @@ memory scope가 실제 지원되면 메모리와 전체 GPU 채널을 각각 보
 HBM에서는 memory clock을 고정한 뒤 SM clock을 올려 bandwidth가 포화되는 지점을 찾고, SM clock을 고정한 뒤 memory clock을 바꾼다. 낮은 SM clock에서 HBM bandwidth가 떨어지는 이유는 memory clock만이 아니라 load 발행량·주소 계산·interconnect·L2의 공급 능력일 수 있다. tensor·L1·L2도 클럭별 plateau를 따로 찾는다.
 
 각 층에서 반복 중앙값을 사용한다. `empirical_gpu_energy_optima`는 GPU UUID·workload·access·고정 memory MHz·objective별로, 각 clock pair에서 **최소 2개의 검증된 resource geometry를 실제 비교하고 전체 유효 관측 population의 peak** 대비 `R >= 0.95 × R_max`를 만족하는 검증 후보 중 단가 최소를 선택한다. `empirical_gpu_overall_energy_optima`는 검증된 measured memory domain도 함께 비교한다. 전체 단가, 승인된 idle 증가분, 승인된 paired-reference 대비는 각각 선택한다. 최적 graphics/memory MHz가 V100·A100·H100마다 같다고 가정하지 않는다. `R_max`는 이론 peak가 아닌 관측값이다. current-policy reference와 고정 클럭 탐색은 분리하고 seed·binary·clock policy·환경이 다른 결과를 같은 repeat로 합치지 않는다.
+
+기본 nonlinear/SFU에서는 register-control 차분만 효율 후보로 선택하고 전체·idle
+objective는 진단으로 남긴다. 음수나 0을 포함하는 CI는 보존하되 양의 비용을 확인한
+최적점으로 선택하지 않는다. 같은 primitive·chains·threads·iterations·clock의 Q 곡선에서
+처리량 안정성을 확인하고 Q별 단가는 합치지 않는다. 절차는 [평가 설계](evaluation-design.ko.md)를 따른다.
 
 geometry 개수는 blocks·threads·Tensor accumulator 또는 GEMM dimensions처럼 자원 실행 배치를 바꾸는 설정으로 계산한다. seed·working set·data/주소 offset·stride만 바꾼 기록을 여러 resource geometry로 부풀리지 않는다. 검증된 resource geometry가 하나뿐이면 자기 자신 대비 100%이므로 높은 활용을 확인한 최적점으로 승인하지 않고 `exploratory_single_geometry_energy_optima`와 `exploratory_single_geometry_overall_energy_optima`에 별도 진단을 남긴다. `own_clock_verified_distinct_geometry_count`·`own_clock_observed_distinct_geometry_count`·`geometry_evidence_status`·`selection_policy.min_geometries`를 확인한다. `own_clock_distinct_geometry_count`는 검증된 geometry 수 alias다. 처리량 분모는 두 승인 geometry로만 낮추지 않고 전체 유효 관측 population의 peak를 유지한다. 2개 비교는 최소 근거이며 실제 plateau·포화 증명은 아니므로 `saturation_proven: false`로 표시한다. incomplete geometry/frequency/NCU coverage에서 global hardware optimum을 주장하지 않는다.
 

@@ -43,32 +43,79 @@ phase boundaries and emits flushed JSONL on stdout. Diagnostic errors go to
 stderr; a failed coverage/sanity check exits nonzero even if a result record was
 emitted, and such a trial must be rejected.
 
+The canonical [nonlinear study](../configs/nonlinear.json) and
+[nonlinear smoke study](../configs/nonlinear-smoke.json) use native register SFU
+microbenchmarks. Start with `sfu_ex2`, `sfu_lg2`, `sfu_rcp`, `sfu_rsqrt`,
+`sfu_sqrt`, or `sfu_tanh`:
+
+```sh
+build/powerbench --device 0 --workload sfu_ex2 --paired-reference \
+  --seconds 12 --warmup-seconds 3 --idle-seconds 6 --threads 256 \
+  --sfu-lanes 262144 --sfu-chains 4 --iterations 16384 --batch-launches 1
+```
+
+`Q=--sfu-lanes` counts logical scalar lanes. The default auto grid is
+`ceil(Q/threads)`; the partial last CTA performs only real lanes. A fixed grid
+requires `--grid-mode fixed --blocks N` and traverses all Q lanes. Each lane
+holds 1, 4, or 8 independent register chains, with bounded positive normal
+FP32 operands in `[0.5,1)`. The long recurrence loop contains no global/shared/
+local load/store instructions or telemetry atomics; immutable kernel arguments
+may be constant-bank operands. A final per-lane hash store remains outside that
+loop. Reported `sfu_instructions` counts completed launches × Q × iterations ×
+chains, with zero logical input bytes and zero complete-function output elements.
+
+The paired register-loop reference removes the native SFU primitive while
+retaining initialization, bit remapping, loop and hash epilogue. Its PTX MOV can
+be coalesced by the compiler. Both arms report compiled resource bounds; their
+register pressure, instruction latency, operand trajectories and achieved
+occupancy can differ. The signed power contrast per target instruction is an
+operational proxy, with a separate total-device result. It does not measure an
+isolated SFU power rail. Native `sfu_tanh` requires `sm_75` or newer and is
+explicitly unsupported on V100/sm70. EX2/LG2 use base 2; EXP is not an alias for
+EX2. Numerical checks validate native primitive one-step outputs against CPU
+double references, without claiming full approximate recurrence equivalence.
+
 | Workload | Issued work | Interpretation |
 | --- | --- | --- |
 | `tensor` | FP16 WMMA 16×16×16, FP32 accumulators, register operands loaded once per launch | Tensor reuse microbenchmark; identical operand matrices across warps. It does not implement Hopper WGMMA. |
 | `gemm` | cuBLAS dense FP16 × FP16 → FP32 GEMM | Sustained dense throughput reference; includes input/cache/memory and output work. Launch geometry and SM filters cannot control cuBLAS internals. |
-| `l1` | Four independent coalesced scalar `.ca` loads per thread iteration | Total allocation is divided into disjoint per-block slices; maximum L1 carveout is requested. Cache residency requires counters. Read only. |
-| `l2` | Four independent `.cg` loads/stores per thread iteration | Shared footprint across all blocks; L1 bypass. Cache residency requires counters. |
-| `hbm` | Same `.cg` loop over a larger incompressible footprint | The name is a requested target, not proof that payload reached DRAM. Verify DRAM counters and effective address footprint. |
+| `l1` | One coalesced scalar `.ca` load and one uint32 sum per thread iteration | Total allocation is divided into disjoint per-block slices; maximum L1 carveout is requested. Cache residency requires counters. Read only. |
+| `l2` | Read: one scalar `.cg` load and uint32 sum per thread iteration. Write/copy: four scalar stores or load/store pairs. | Shared footprint across all blocks; L1 bypass. Cache residency requires counters. |
+| `hbm` | Same read/write/copy `.cg` loops over a larger incompressible footprint | The name is a requested target, not proof that payload reached DRAM. Verify DRAM counters and effective address footprint. |
 | `l2_latency` | One active lane per admitted block traverses a randomized full-cycle linked list through dependent `.cg` loads | Per-SM cycles/access diagnostic; clocks, loop overhead and concurrent blocks matter. Address/SM probes do not establish near/far partition labels. |
 | `control` | Four integer issue operations per inner loop plus result/telemetry stores | Active issue-loop power reference, not transistor static power or a precisely matched memory/Tensor control. |
-| `exp`, `tanh`, `silu` | Complete FP32 elementwise standard CUDA math, input load and output store | Counted output elements; memory and supporting arithmetic included, not isolated SFU energy. |
-| `rmsnorm` | FP32 row sum-of-squares, epsilon 1e-5, column gamma and normalized output | Two input passes, gamma and output; pJ/element and pJ/row; no mean subtraction. |
-| `softmax` | Stable FP32 row max, exp-sum reduction and normalized output | Three input passes and two exp evaluations per element; complete function energy. |
+| `sfu_ex2`, `sfu_lg2`, `sfu_rcp`, `sfu_rsqrt`, `sfu_sqrt`, `sfu_tanh` | Native approximate FP32 SFU instruction on independent register chains | Scalar-lane instruction counts; no global input buffer or hot global/shared/local loads/stores. Paired register-loop power contrast; TANH requires sm75+. |
+| `exp`, `tanh`, `silu` | Complete FP32 elementwise standard CUDA math, input load and output store | Requires `--nonlinear-mode streaming`; counted output elements with memory and supporting arithmetic included. |
+| `rmsnorm` | FP32 row sum-of-squares, epsilon 1e-5, column gamma and normalized output | Requires `--nonlinear-mode streaming`; two input passes, gamma and output; pJ/element and pJ/row; no mean subtraction. |
+| `softmax` | Stable FP32 row max, exp-sum reduction and normalized output | Requires `--nonlinear-mode streaming`; three input passes and two exp evaluations per element; complete function energy. |
 
-Nonlinear workloads default to one complete input application per launch and
-16 launches per batch. `--iterations` repeats the entire application with fresh
-volatile loads/stores. Input/output slices are disjoint per block; the footprint
-must divide into complete equal slices/rows. `--row-width` defaults to 1024 for
-RMSNorm/Softmax; these workloads support full-grid execution only. Before and
-after measurement, distributed outputs are checked against CPU double references.
-See [the nonlinear experiment protocol](../docs/nonlinear-experiments.ko.md).
+Complete streaming functions remain available through an explicit opt-in:
 
-`--iterations` defaults to 1024 inner iterations per microkernel, and one cuBLAS
-invocation for GEMM. `--batch-launches` defaults to 16 for microkernels and one
-for GEMM: multiple launches are queued before host synchronization. Defaults are
-starting points; use geometry/iteration sweeps and profiler counters to confirm
-that launch gaps and address generation do not cap throughput.
+```sh
+build/powerbench --workload exp --nonlinear-mode streaming \
+  --working-set-bytes 4194304 --threads 256 --iterations 1
+```
+
+Without that flag, the five complete-function workloads fail before CUDA device
+initialization. Streaming defaults to one complete input application per launch
+and 16 launches per batch. `--iterations` repeats the entire application with
+input loads and output stores. Q is `working-set-bytes/4`; auto grids use
+`ceil(Q/threads)` for pointwise functions and one CTA per complete row for
+RMSNorm/Softmax. Explicit fixed grids use global element/row-stride traversal,
+including pointwise tails; whole rows are required. `--row-width` defaults to
+1024 for RMSNorm/Softmax. Before and after measurement, distributed outputs are
+checked against CPU double references. The result explicitly records
+`nonlinear_mode="streaming"`. See [the legacy streaming function
+protocol](../docs/legacy/nonlinear-streaming.ko.md).
+
+`--iterations` defaults to 16384 for register SFU, 4096 for L1/L2/HBM reads,
+1024 for Tensor/control/write/copy/dependent-latency loops, and one for GEMM or
+complete streaming functions. Explicit iterations retain their literal count:
+one scalar memory read per thread/iteration, or four write/copy accesses per
+thread/iteration. `--batch-launches` defaults to one for register SFU and GEMM,
+and 16 for other workloads; queued launches precede each host synchronization.
+Defaults are starting points; use geometry/iteration sweeps and profiler counters
+to confirm that launch gaps and address generation do not cap throughput.
 
 `--working-set-bytes` is total input footprint, not per-SM footprint. L1 rounds
 it down to an integer number of 32-bit words per block; the effective size is
@@ -97,8 +144,9 @@ subset. `finite_launch_reachable_bytes_upper_bound` and
 `finite_launch_sector_bytes_upper_bound` report finite-work bounds; their
 respective `*_exact` fields identify exact address-footprint calculations.
 For unfiltered read/write/copy, the unique per-region word count is
-`min(n / gcd(n, stride), lanes * 4 * iterations)`; L1 uses per-block `n` and
-`lanes`, then sums disjoint slices. Bounds for SM-filtered runs do not prove the
+`min(n / gcd(n, stride), lanes * accesses_per_iteration * iterations)`, with
+`accesses_per_iteration=1` for reads and `4` for write/copy. L1 uses per-block
+`n` and `lanes`, then sums disjoint slices. Bounds for SM-filtered runs do not prove the
 actual subset was visited. Dependent latency probes use a varying deterministic
 start on a randomized full cycle and report a bound over measured probes.
 
@@ -108,9 +156,11 @@ block counts and SM IDs are recorded. Missing requested SMs reject the trial.
 `allocated_sm_working_set` reports L1 slice bytes multiplied by the average
 number of blocks dispatched to that SM per launch. It describes assignment, not
 concurrent residency or cache occupancy.
+Register SFU and complete streaming functions reject SM filters; their completed
+CTA counts come from synchronized launches and report no physical-SM histogram.
 
 Each run allocates and initializes data before any measurement phase. New plans
-use a paired active reference for custom Tensor/L1/L2/HBM kernels; standalone
+use a paired active reference for register SFU and custom Tensor/L1/L2/HBM kernels; standalone
 `powerbench` requires `--paired-reference` to enable it. The initial target
 `warmup` precedes `idle_pre`, which keeps the CUDA context and all buffers
 allocated. Every arm then has its own warmup, outside its measurement window:
@@ -120,8 +170,10 @@ allocated. Every arm then has its own warmup, outside its measurement window:
 | `AB` | `warmup_reference` → `active_reference` → `warmup_treatment` → `measure` |
 | `BA` | `warmup_treatment` → `measure` → `warmup_reference` → `active_reference` |
 
-`A` is an integer issue-loop control and `B` is the requested treatment. Each arm
-runs for the configured sustained window (at least 10 s); each arm's warmup is
+`A` is the declared active reference and `B` is the requested treatment. Register
+SFU uses its common register loop without the native SFU primitive; Tensor,
+memory and complete streaming functions use an integer issue-loop reference.
+Each arm runs for the configured sustained window (at least 10 s); each arm's warmup is
 at least 1 s, and each idle bracket is at least 6 s. A plan assigns AB/BA order by
 repeat parity with a seeded random flip per condition. Four repeats give exact
 order balance; three leave one extra order. Changing trial order and balanced
@@ -130,9 +182,12 @@ cuBLAS launch geometry is not matched and its active-reference contrast is
 ineligible for attribution. Latency/control diagnostic workloads are unpaired by
 default.
 
-The reference shares the custom treatment's blocks, threads, iterations, SM
-admission mask and batch-launch count. Dedicated reference sinks and admission
-counters keep a BA reference from overwriting the treatment's output or counts.
+The reference shares the custom treatment's blocks, threads, iterations and
+batch-launch count. SFU also matches Q and independent register-chain count.
+For workloads using an SM admission mask, the reference shares that mask and
+keeps separate admission counters. Dedicated reference sinks keep a BA reference
+from overwriting the treatment's output. Register SFU and complete streaming
+functions derive completed CTA counts from synchronized launch completion.
 The context, allocations and requested clock policy remain constant across both
 arms. This is a practical **operational contrast**, not an exact instruction
 counterfactual: register pressure, occupancy, cache/DRAM residency, instruction
@@ -145,8 +200,9 @@ state energy and paired-reference energy separately.
 `type=treatment_protocol` records the actual order, phase order and scope.
 `type=active_reference_result` records reference timing, exact per-epoch complete
 batch/admission counts and requested-SM coverage; `operations` and
-`logical_bytes` are zero because the integer reference is neither target FLOPs
-nor target memory payload. The Python runner stores these as top-level
+`logical_bytes` are zero because these references are not target FLOPs, SFU
+instructions or target memory payload. SFU reports its common control work as
+`reference_loop_slots`, with `sfu_instructions=0`. The Python runner stores these as top-level
 `treatment_protocol` and `active_reference` and rejects missing/duplicate arms,
 wrong order, changed geometry or overlapping warmup/measurement phases. The
 usual `type=result` still contains treatment `measure_epochs`.
@@ -170,10 +226,13 @@ it is not the sum of profiler kernel busy times. `host_duration_s` is also
 reported. `measure_epochs` records approximately one second of complete batches
 with exact admitted block counts, operations and logical bytes. Epochs carry
 `host_monotonic_start_ns` / `host_monotonic_end_ns` plus `start_s` / `end_s` in the
-same Linux monotonic timebase as power samples. They include counter readback
-gaps; `counter_readback_ns` records that overhead. Microbenchmarks read back
-32 KiB of admission counters at most once per roughly one second and once for
-the final partial epoch. No per-epoch stdout occurs during measurement. The
+same Linux monotonic timebase as power samples. Ordinary memory/Tensor/control
+epochs include counter readback gaps; `counter_readback_ns` records that overhead.
+Those workloads read back 32 KiB of admission counters at most once per roughly
+one second and once for the final partial epoch. Register SFU and complete
+streaming functions use synchronized launch counts without admission counter
+readbacks and report `counter_readback_ns=0`; host epoch bookkeeping remains in
+their timing window. No per-epoch stdout occurs during measurement. The
 analyzer can sum complete epochs wholly inside the trimmed steady-state window
 and integrate power over those exact bounds. It must not interpolate work in an
 unknown partial batch or silently substitute full-run throughput. FLOPs use dense

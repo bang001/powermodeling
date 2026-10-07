@@ -1,0 +1,139 @@
+{
+  "target_form_factor": "SXM",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "paired_reference": true,
+  "randomization_seed": 2026,
+  "description": "Legacy opt-in streaming complete-function experiment with global input/output, not the register SFU microbenchmark. Q-driven complete FP32 nonlinear sweep: pointwise ceil(Q/threads), rowwise one CTA per row. Compare Q=16M/32M/64M elements and block sizes independently. Q scaling is empirical throughput evidence, not proof of SFU saturation; keep each Q and row width as a separate energy stratum.",
+  "study_design": "energy_sweep",
+  "experiments": [
+    {
+      "workload": "exp",
+      "stage": "pointwise",
+      "parameters": {
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      },
+      "grid": {
+        "threads": [
+          128,
+          256,
+          512
+        ],
+        "working_set_bytes": [
+          67108864,
+          134217728,
+          268435456
+        ]
+      }
+    },
+    {
+      "workload": "tanh",
+      "stage": "pointwise",
+      "parameters": {
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      },
+      "grid": {
+        "threads": [
+          128,
+          256,
+          512
+        ],
+        "working_set_bytes": [
+          67108864,
+          134217728,
+          268435456
+        ]
+      }
+    },
+    {
+      "workload": "silu",
+      "stage": "pointwise",
+      "parameters": {
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      },
+      "grid": {
+        "threads": [
+          128,
+          256,
+          512
+        ],
+        "working_set_bytes": [
+          67108864,
+          134217728,
+          268435456
+        ]
+      }
+    },
+    {
+      "workload": "rmsnorm",
+      "stage": "rowwise",
+      "parameters": {
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      },
+      "grid": {
+        "threads": [
+          128,
+          256,
+          512
+        ],
+        "working_set_bytes": [
+          67108864,
+          134217728,
+          268435456
+        ],
+        "row_width": [
+          128,
+          1024,
+          4096
+        ]
+      }
+    },
+    {
+      "workload": "softmax",
+      "stage": "rowwise",
+      "parameters": {
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      },
+      "grid": {
+        "threads": [
+          128,
+          256,
+          512
+        ],
+        "working_set_bytes": [
+          67108864,
+          134217728,
+          268435456
+        ],
+        "row_width": [
+          128,
+          1024,
+          4096
+        ]
+      }
+    }
+  ],
+  "clock_sweep": {
+    "graphics_step_mhz": 90,
+    "all_memory_clocks": true,
+    "required_graphics_mhz": [
+      1110
+    ],
+    "include_default_policy": true,
+    "include_advertised_default": true,
+    "graphics_min_mhz": 900
+  }
+}

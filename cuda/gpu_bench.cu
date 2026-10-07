@@ -85,12 +85,14 @@ struct Options {
   uint64_t offset_bytes = 0, seed = 1;
   std::string workload = "tensor", access = "read", reference_order = "AB";
   std::string grid_mode = "auto";
+  std::string nonlinear_mode;
   uint64_t sfu_lanes = 262144;
   int sfu_chains = 4;
   std::vector<unsigned> sm_ids;
   bool describe = false, profile_region = false, paired_reference = false;
   bool blocks_explicit = false, grid_mode_explicit = false;
   bool sfu_options_explicit = false;
+  bool nonlinear_mode_explicit = false;
 };
 
 uint64_t parse_u64(const std::string& value, const char* flag) {
@@ -113,7 +115,7 @@ double parse_time(const std::string& value, const char* flag) {
 }
 void usage() {
   std::cout << "powerbench --describe [--device N]\n"
-    "powerbench --workload tensor|gemm|l1|l2|l2_latency|hbm|control|exp|tanh|silu|rmsnorm|softmax|sfu_ex2|sfu_lg2|sfu_rcp|sfu_rsqrt|sfu_sqrt|sfu_tanh [options]\n"
+    "powerbench --workload tensor|gemm|l1|l2|l2_latency|hbm|control|sfu_ex2|sfu_lg2|sfu_rcp|sfu_rsqrt|sfu_sqrt|sfu_tanh|exp|tanh|silu|rmsnorm|softmax [options]\n"
     "  --device N --seconds 10 --warmup-seconds 3 --idle-seconds 6\n"
     "  --blocks N --threads 256 --iterations N --tensor-accumulators 1..8\n"
     "  --batch-launches N (default 16 microkernels, 1 GEMM)\n"
@@ -125,9 +127,11 @@ void usage() {
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
     "  --row-width 1024 (RMSNorm/Softmax, FP32 full row operations)\n"
     "  --grid-mode auto|fixed (nonlinear/SFU; default auto)\n"
+    "  --nonlinear-mode streaming (required opt-in for complete exp/tanh/silu/rmsnorm/softmax)\n"
     "  --sfu-lanes 262144 --sfu-chains 1|4|8 (register SFU; iterations=16384, batch-launches=1)\n"
     "Register SFU hot loops have no global/shared/local load/store instructions; one final hash store/lane.\n"
     "Native SFU TANH requires compute capability >=7.5; EX2/LG2 use base2.\n"
+    "Canonical nonlinear experiments use sfu_* workloads. Complete streaming functions include global I/O and reductions.\n"
     "Memory stride is in 32-bit words; footprint is total input bytes.\n"
     "L1/L2/HBM read issues one scalar load per thread/iteration with one sum32; default iterations=4096.\n"
     "Write/copy keeps four accesses per thread/iteration; default iterations=1024.\n"
@@ -149,6 +153,7 @@ Options parse_options(int argc, char** argv) {
     if (flag == "--device") o.device = parse_int(value, flag.c_str());
     else if (flag == "--blocks") { o.blocks = parse_int(value, flag.c_str()); o.blocks_explicit = true; }
     else if (flag == "--grid-mode") { o.grid_mode = value; o.grid_mode_explicit = true; }
+    else if (flag == "--nonlinear-mode") { o.nonlinear_mode = value; o.nonlinear_mode_explicit = true; }
     else if (flag == "--sfu-lanes") { o.sfu_lanes = parse_u64(value, flag.c_str()); o.sfu_options_explicit = true; }
     else if (flag == "--sfu-chains") { o.sfu_chains = parse_int(value, flag.c_str()); o.sfu_options_explicit = true; }
     else if (flag == "--threads") o.threads = parse_int(value, flag.c_str());
@@ -198,6 +203,10 @@ Options parse_options(int argc, char** argv) {
   if (o.batch_launches > 65536) throw std::runtime_error("--batch-launches must be <= 65536");
   if (o.workload != "tensor" && o.workload != "gemm" && o.workload != "l1" && o.workload != "l2" && o.workload != "l2_latency" && o.workload != "hbm" && o.workload != "control" && !nonlinear_workload(o.workload) && !sfu_workload(o.workload))
     throw std::runtime_error("unknown workload " + o.workload);
+  if (nonlinear_workload(o.workload) && o.nonlinear_mode != "streaming")
+    throw std::runtime_error("complete nonlinear functions require explicit --nonlinear-mode streaming; these include global I/O and supporting arithmetic/reductions; use sfu_* workloads for SFU-only experiments (EXP is not EX2)");
+  if (!nonlinear_workload(o.workload) && o.nonlinear_mode_explicit)
+    throw std::runtime_error("--nonlinear-mode streaming applies only to complete exp/tanh/silu/rmsnorm/softmax workloads");
   if (o.access != "read" && o.access != "write" && o.access != "copy") throw std::runtime_error("unknown memory access " + o.access);
   if (o.workload == "l1" && o.access != "read") throw std::runtime_error("L1 global-store/copy attribution is unsupported; use L1 read");
   if (o.workload == "l2_latency" && o.access != "read") throw std::runtime_error("dependent latency probes support read only");
@@ -966,6 +975,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"mean_batch_duration_s\":" << timing.device_s / timing.batches
     << ",\"duration_scope\":\"CUDA event elapsed experiment window including gaps; not summed kernel busy time\""
     << ",\"kernel_implementation_version\":" << quote(implementation_version)
+    << ",\"nonlinear_mode\":" << (nonlinear ? quote(o.nonlinear_mode) : "null")
     << ",\"grid_mode\":" << (nonlinear ? quote(o.grid_mode) : "null")
     << ",\"input_elements\":" << (nonlinear ? std::to_string(words) : "null")
     << ",\"elements_per_launch\":";

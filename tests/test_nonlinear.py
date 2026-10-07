@@ -85,7 +85,7 @@ def nonlinear_evidence(record):
 class NonlinearTests(unittest.TestCase):
     def test_all_functions_plan_and_profile_keep_counting_parameters(self):
         root = Path(__file__).resolve().parents[1]
-        plan = expand_plan(json.loads((root / "configs/nonlinear-smoke.json").read_text()), DEVICE)
+        plan = expand_plan(json.loads((root / "configs/legacy/nonlinear-streaming-smoke.json").read_text()), DEVICE)
         self.assertEqual(len(plan["trials"]), 20)
         self.assertEqual({t["workload"] for t in plan["trials"]}, NONLINEAR_WORKLOADS)
         for trial in plan["trials"]:
@@ -109,10 +109,10 @@ class NonlinearTests(unittest.TestCase):
         for parameters in invalid:
             with self.subTest(parameters=parameters), self.assertRaises(ValueError):
                 expand_plan({"clock_pairs": [{"graphics_mhz": None, "memory_mhz": None}],
-                             "experiments": [{"workload": "softmax", "parameters": parameters}]}, DEVICE)
+                             "experiments": [{"workload": "softmax", "parameters": {"nonlinear_mode": "streaming", **parameters}}]}, DEVICE)
         with self.assertRaisesRegex(ValueError, "row_width"):
             expand_plan({"clock_pairs": [{"graphics_mhz": None, "memory_mhz": None}],
-                         "experiments": [{"workload": "exp", "parameters": {"row_width": 128}}]}, DEVICE)
+                         "experiments": [{"workload": "exp", "parameters": {"nonlinear_mode": "streaming", "row_width": 128}}]}, DEVICE)
 
     def test_energy_is_per_complete_element_and_row_never_flop(self):
         for workload in NONLINEAR_WORKLOADS:
@@ -258,6 +258,7 @@ class NonlinearGpuTests(unittest.TestCase):
             for width in ((1, 129, 1024) if workload in ROW_WORKLOADS else (131,)):
                 with self.subTest(workload=workload, width=width):
                     command = [os.environ.get("POWERBENCH", "build/powerbench"), "--workload", workload,
+                               "--nonlinear-mode", "streaming",
                                "--grid-mode", "fixed", "--blocks", "2", "--threads", "96", "--iterations", "2",
                                "--working-set-bytes", str(2 * width * 3 * 4),
                                "--seconds", "0.1", "--warmup-seconds", "0", "--idle-seconds", "0",

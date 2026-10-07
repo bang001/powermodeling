@@ -7,128 +7,169 @@
   "sample_interval_s": 0.05,
   "paired_reference": true,
   "randomization_seed": 2026,
-  "description": "Q-driven complete FP32 nonlinear sweep: pointwise ceil(Q/threads), rowwise one CTA per row. Compare Q=16M/32M/64M elements and block sizes independently. Q scaling is empirical throughput evidence, not proof of SFU saturation; keep each Q and row width as a separate energy stratum.",
+  "description": "Native approximate FP32 SFU instructions in register recurrence loops; primary result is signed board-power contrast vs the same bounded remap loop without the SFU instruction. Not isolated SFU rail energy. No global/shared/local access in the hot loop; one 4-byte sink store per logical lane after the loop. Q and chain sweeps assess sustained throughput; native TANH is explicitly unavailable on V100.",
   "study_design": "energy_sweep",
   "experiments": [
     {
-      "workload": "exp",
-      "stage": "pointwise",
+      "workload": "sfu_ex2",
+      "stage": "sfu",
       "parameters": {
-        "iterations": 1,
-        "grid_mode": "auto"
+        "grid_mode": "auto",
+        "iterations": 16384,
+        "batch_launches": 1
       },
       "grid": {
+        "sfu_lanes": [
+          131072,
+          262144,
+          524288
+        ],
+        "sfu_chains": [
+          1,
+          4,
+          8
+        ],
         "threads": [
           128,
-          256,
-          512
-        ],
-        "working_set_bytes": [
-          67108864,
-          134217728,
-          268435456
+          256
         ]
       }
     },
     {
-      "workload": "tanh",
-      "stage": "pointwise",
+      "workload": "sfu_lg2",
+      "stage": "sfu",
       "parameters": {
-        "iterations": 1,
-        "grid_mode": "auto"
+        "grid_mode": "auto",
+        "iterations": 16384,
+        "batch_launches": 1
       },
       "grid": {
+        "sfu_lanes": [
+          131072,
+          262144,
+          524288
+        ],
+        "sfu_chains": [
+          1,
+          4,
+          8
+        ],
         "threads": [
           128,
-          256,
-          512
-        ],
-        "working_set_bytes": [
-          67108864,
-          134217728,
-          268435456
+          256
         ]
       }
     },
     {
-      "workload": "silu",
-      "stage": "pointwise",
+      "workload": "sfu_rcp",
+      "stage": "sfu",
       "parameters": {
-        "iterations": 1,
-        "grid_mode": "auto"
+        "grid_mode": "auto",
+        "iterations": 16384,
+        "batch_launches": 1
       },
       "grid": {
+        "sfu_lanes": [
+          131072,
+          262144,
+          524288
+        ],
+        "sfu_chains": [
+          1,
+          4,
+          8
+        ],
         "threads": [
           128,
-          256,
-          512
-        ],
-        "working_set_bytes": [
-          67108864,
-          134217728,
-          268435456
+          256
         ]
       }
     },
     {
-      "workload": "rmsnorm",
-      "stage": "rowwise",
+      "workload": "sfu_rsqrt",
+      "stage": "sfu",
       "parameters": {
-        "iterations": 1,
-        "grid_mode": "auto"
+        "grid_mode": "auto",
+        "iterations": 16384,
+        "batch_launches": 1
       },
       "grid": {
+        "sfu_lanes": [
+          131072,
+          262144,
+          524288
+        ],
+        "sfu_chains": [
+          1,
+          4,
+          8
+        ],
         "threads": [
           128,
-          256,
-          512
-        ],
-        "working_set_bytes": [
-          67108864,
-          134217728,
-          268435456
-        ],
-        "row_width": [
-          128,
-          1024,
-          4096
+          256
         ]
       }
     },
     {
-      "workload": "softmax",
-      "stage": "rowwise",
+      "workload": "sfu_sqrt",
+      "stage": "sfu",
       "parameters": {
-        "iterations": 1,
-        "grid_mode": "auto"
+        "grid_mode": "auto",
+        "iterations": 16384,
+        "batch_launches": 1
       },
       "grid": {
+        "sfu_lanes": [
+          131072,
+          262144,
+          524288
+        ],
+        "sfu_chains": [
+          1,
+          4,
+          8
+        ],
         "threads": [
           128,
-          256,
-          512
-        ],
-        "working_set_bytes": [
-          67108864,
-          134217728,
-          268435456
-        ],
-        "row_width": [
-          128,
-          1024,
-          4096
+          256
         ]
       }
+    },
+    {
+      "workload": "sfu_tanh",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "iterations": 16384,
+        "batch_launches": 1
+      },
+      "grid": {
+        "sfu_lanes": [
+          131072,
+          262144,
+          524288
+        ],
+        "sfu_chains": [
+          1,
+          4,
+          8
+        ],
+        "threads": [
+          128,
+          256
+        ]
+      },
+      "skip_if_unsupported": true
     }
   ],
   "clock_sweep": {
+    "graphics_min_mhz": 900,
     "graphics_step_mhz": 90,
     "all_memory_clocks": true,
     "required_graphics_mhz": [
       1110
     ],
     "include_default_policy": true,
-    "include_advertised_default": true,
-    "graphics_min_mhz": 900
+    "include_advertised_default": true
   }
 }

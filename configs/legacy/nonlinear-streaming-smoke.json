@@ -1,0 +1,77 @@
+{
+  "target_form_factor": "SXM",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "paired_reference": true,
+  "randomization_seed": 2026,
+  "description": "Legacy opt-in streaming complete-function experiment with global input/output, not the register SFU microbenchmark. Q-driven FP32 nonlinear functional/telemetry smoke with Q=1048576 input elements; no fixed-clock optimum or saturation claim.",
+  "study_design": "diagnostic",
+  "clock_pairs": [
+    {
+      "graphics_mhz": null,
+      "memory_mhz": null
+    }
+  ],
+  "experiments": [
+    {
+      "workload": "exp",
+      "stage": "nonlinear-smoke",
+      "parameters": {
+        "threads": 256,
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      }
+    },
+    {
+      "workload": "tanh",
+      "stage": "nonlinear-smoke",
+      "parameters": {
+        "threads": 256,
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      }
+    },
+    {
+      "workload": "silu",
+      "stage": "nonlinear-smoke",
+      "parameters": {
+        "threads": 256,
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      }
+    },
+    {
+      "workload": "rmsnorm",
+      "stage": "nonlinear-smoke",
+      "parameters": {
+        "threads": 256,
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "row_width": 1024,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      }
+    },
+    {
+      "workload": "softmax",
+      "stage": "nonlinear-smoke",
+      "parameters": {
+        "threads": 256,
+        "working_set_bytes": 4194304,
+        "iterations": 1,
+        "row_width": 1024,
+        "grid_mode": "auto",
+        "nonlinear_mode": "streaming"
+      }
+    }
+  ]
+}

@@ -17,20 +17,21 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
 from .memory import count_issues as memory_count_issues
+from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, REFERENCE_KIND as SFU_REFERENCE_KIND, count_issues as sfu_count_issues
 from .evaluation import experiment_contract, evaluate
 
 _TENSOR_WORKLOADS = {"tensor", "fp16_tensor", "tensor_fp16", "gemm"}
 _MEMORY_WORKLOADS = {"l1", "l2", "hbm"}
-_COMPUTE_WORKLOADS = _TENSOR_WORKLOADS | NONLINEAR_WORKLOADS
+_COMPUTE_WORKLOADS = _TENSOR_WORKLOADS | NONLINEAR_WORKLOADS | SFU_WORKLOADS
 _ENERGY_WORKLOADS = _COMPUTE_WORKLOADS | _MEMORY_WORKLOADS
 
 
 def _throughput_metric(workload):
-    return "throughput_ops_s" if workload in _COMPUTE_WORKLOADS else "throughput_bytes_s"
+    return "throughput_sfu_instructions_s" if workload in SFU_WORKLOADS else "throughput_ops_s" if workload in _COMPUTE_WORKLOADS else "throughput_bytes_s"
 
 
 def _energy_metric(workload, prefix):
-    return prefix + ("pj_per_element" if workload in NONLINEAR_WORKLOADS else "pj_per_flop" if workload in _TENSOR_WORKLOADS else "pj_per_logical_bit")
+    return prefix + ("pj_per_instruction" if workload in SFU_WORKLOADS else "pj_per_element" if workload in NONLINEAR_WORKLOADS else "pj_per_flop" if workload in _TENSOR_WORKLOADS else "pj_per_logical_bit")
 
 
 @dataclass(frozen=True)
@@ -288,6 +289,9 @@ def _paired_reference_contrast(record, phase_records, result, pre, post, measure
     protocol = record.get("treatment_protocol") or (record.get("benchmark") or {}).get("treatment_protocol") or {}
     reference_record = record.get("active_reference") or {}
     reference_phase = phase_records.get("active_reference")
+    sfu = record.get("workload") in SFU_WORKLOADS
+    if sfu:
+        result.update(sfu_reference_delta_measurement_valid=False, sfu_reference_delta_positive_optimum_eligible=False)
     result.update(paired_active_reference_eligible=False, paired_active_reference_power_w=None,
                   paired_active_reference_energy_j=None, paired_active_reference_pj_per_flop=None,
                   paired_active_reference_pj_per_logical_bit=None, paired_active_reference_issues=[],
@@ -309,7 +313,7 @@ def _paired_reference_contrast(record, phase_records, result, pre, post, measure
     for field in ("same_process", "same_allocations", "same_clock_policy", "launch_geometry_matched"):
         if protocol.get(field) is not True:
             issues.append("paired_protocol_unverified:" + field)
-    if protocol.get("kind") != "paired_active_reference" or protocol.get("reference_kind") != "issue_loop" or protocol.get("reference_workload") != "control":
+    if protocol.get("kind") != "paired_active_reference" or protocol.get("reference_kind") != (SFU_REFERENCE_KIND if sfu else "issue_loop") or protocol.get("reference_workload") != "control":
         issues.append("paired_reference_definition_unverified")
     order = protocol.get("order")
     if order not in ("AB", "BA"):
@@ -322,6 +326,11 @@ def _paired_reference_contrast(record, phase_records, result, pre, post, measure
     for field in ("blocks", "threads", "batch_launches", "iterations_per_launch"):
         if reference_record.get(field) is None or treatment_benchmark.get(field) is None or reference_record[field] != treatment_benchmark[field]:
             issues.append("paired_geometry_mismatch:" + field)
+    if sfu:
+        issues.extend(sfu_count_issues(reference_record, record.get("workload"), reference=True))
+        for field in ("sfu_lanes", "sfu_chains", "sfu_primitive", "sfu_input_policy", "grid_mode", "math_implementation", "sfu_ptx_opcode"):
+            if reference_record.get(field) != treatment_benchmark.get(field):
+                issues.append("paired_sfu_contract_mismatch:" + field)
     state_deltas = {}
     reference_clock_fields = ["graphics_clock_mhz", "memory_clock_mhz"]
     if any(_finite(sample.get("sm_clock_mhz")) is not None for phase in (measure, reference) for sample in phase.get("_selected", [])):
@@ -367,7 +376,7 @@ def _paired_reference_contrast(record, phase_records, result, pre, post, measure
     duration = result.get("duration_s")
     if contrast is None:
         issues.append("paired_power_unavailable")
-    elif contrast <= 0:
+    elif contrast <= 0 and not sfu:
         issues.append("nonpositive_paired_contrast; signed observation retained but cannot minimize an energy objective")
     result.update(paired_active_reference_power_w=contrast,
                   paired_active_reference_energy_j=contrast * duration if contrast is not None and duration else None,
@@ -375,7 +384,30 @@ def _paired_reference_contrast(record, phase_records, result, pre, post, measure
                   paired_active_reference_issues=sorted(set(issues)),
                   paired_active_reference_state_deltas=state_deltas,
                   active_reference_power_w=reference_power,
+                  active_reference_duration_s=reference.get("duration_s"),
                   active_reference_total_energy_j=reference.get("energy_counter_j") if reference.get("energy_counter_j") is not None else reference.get("integrated_power_energy_j"))
+    if sfu:
+        result["sfu_reference_delta_measurement_valid"] = result["paired_active_reference_eligible"]
+        result["paired_active_reference_interpretation"] = "signed whole-device power contrast against the target-free register recurrence; differing instruction paths, issue rates, occupancy, launch work and epilogues remain; not isolated physical SFU energy"
+        slot_counts = [_finite(epoch.get("reference_loop_slots")) for epoch in reference_epochs]
+        reference_slots = sum(slot_counts) if slot_counts and all(value is not None for value in slot_counts) else None
+        result["active_reference_counted_loop_slots"] = reference_slots
+        result["active_reference_loop_slots_s"] = reference_slots / reference["duration_s"] if reference_slots is not None and reference.get("duration_s") else None
+        result["sfu_reference_delta_diagnostics"] = {
+            "estimator": "mean_power_contrast_normalized_by_treatment_instruction_rate",
+            "formula": "(treatment_mean_power_w - reference_mean_power_w) / treatment_scalar_instruction_rate_s * 1e12",
+            "equal_work_energy_difference": False, "same_duration_required": False,
+            "treatment_duration_s": result.get("duration_s"), "reference_duration_s": reference.get("duration_s"),
+            "treatment_power_w": treatment_power, "reference_power_w": reference_power, "power_delta_w": contrast,
+            "treatment_counted_instructions": result.get("counted_measure_operations"), "reference_counted_loop_slots": reference_slots,
+            "treatment_completed_launches": treatment_benchmark.get("kernel_launches"), "reference_completed_launches": reference_record.get("kernel_launches"),
+            "reference_actual_sfu_instructions": reference_record.get("sfu_instructions"),
+            "reference_kernel_implementation_version": reference_record.get("kernel_implementation_version"),
+            "reference_kernel_resources": reference_record.get("kernel_resources"),
+            "reference_auxiliary_work": reference_record.get("auxiliary_work"),
+            "reference_count_source": reference_record.get("block_completion_count_source"),
+            "signed_observation": True, "hardware_attribution_proven": False,
+            "uncertainty_scope": "repeat uncertainty is reported separately; telemetry bias and comparator-model error are not included"}
     tensor = record.get("workload") in _TENSOR_WORKLOADS
     memory = record.get("workload") in _MEMORY_WORKLOADS
     ops_rate, byte_rate = result.get("throughput_ops_s"), result.get("throughput_bytes_s")
@@ -403,6 +435,7 @@ def _measurement_diagnostics(result, benchmark, epochs):
     workload = result.get("workload")
     memory, tensor = workload in _MEMORY_WORKLOADS, workload in _TENSOR_WORKLOADS
     nonlinear = workload in NONLINEAR_WORKLOADS
+    sfu = workload in SFU_WORKLOADS
     duration = _finite(result.get("duration_s"))
     exact = result.get("count_energy_time_alignment_exact") is True
     if memory:
@@ -410,8 +443,8 @@ def _measurement_diagnostics(result, benchmark, epochs):
         rate = rate * 8 if rate is not None else None
         count = _finite(result.get("counted_measure_logical_bytes"))
         count = count * 8 if count is not None else None
-    elif tensor or nonlinear:
-        unit, suffix = ("FLOP", "pj_per_flop") if tensor else ("element", "pj_per_element")
+    elif tensor or nonlinear or sfu:
+        unit, suffix = ("scalar SFU instruction", "pj_per_instruction") if sfu else ("FLOP", "pj_per_flop") if tensor else ("element", "pj_per_element")
         rate = _finite(result.get("throughput_ops_s"))
         count = _finite(result.get("counted_measure_operations"))
     else:
@@ -495,6 +528,9 @@ def _measurement_diagnostics(result, benchmark, epochs):
                                   "same_energy_run": False,
                                   "note": "Profiler replay uses a different run and summed kernel duration. Rate disagreement can motivate timing/traffic review but does not prove host overhead, permit energy rescaling or supply same-window physical traffic."},
         "execution": {"kernel_resources": benchmark.get("kernel_resources"),
+                      "sfu_contract": result.get("sfu_contract"),
+                      "sfu_reference_delta": result.get("sfu_reference_delta_diagnostics"),
+                      "auxiliary_work": benchmark.get("auxiliary_work"),
                       "execution_diagnostics": benchmark.get("execution_diagnostics"),
                       "implementation_version": benchmark.get("kernel_implementation_version"),
                       "memory_accesses_per_thread_iteration": benchmark.get("memory_accesses_per_thread_iteration"),
@@ -710,8 +746,12 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
     nonlinear_issues = count_issues(benchmark, record.get("workload"))
     issues.extend(nonlinear_issues)
     issues.extend(memory_count_issues(benchmark, record.get("workload")))
+    sfu_issues = sfu_count_issues(benchmark, record.get("workload"))
+    issues.extend(sfu_issues)
     if record.get("workload") in NONLINEAR_WORKLOADS and not count_alignment_exact:
         issues.append("nonlinear_requires_matching_work_energy_epochs")
+    if record.get("workload") in SFU_WORKLOADS and not count_alignment_exact:
+        issues.append("sfu_requires_matching_work_energy_epochs")
     incremental_power = incremental / duration if incremental is not None and duration else None
     rail_energy = _finite(measure.get("memory_rail_energy_j"))
     rail_incremental = rail_energy - idle_memory_power * duration if rail_energy is not None and idle_memory_power is not None and duration else None
@@ -808,7 +848,9 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "resource_geometry": {field: benchmark.get(field, config.get(field)) for field in (
             ("gemm_m", "gemm_n", "gemm_k") if record.get("workload") == "gemm" else
             ("blocks", "threads", "tensor_accumulators") if record.get("workload") in _TENSOR_WORKLOADS else
+            ("blocks", "threads", "sfu_chains") if record.get("workload") in SFU_WORKLOADS else
             ("blocks", "threads"))},
+        "sfu_contract": {field: benchmark.get(field) for field in SFU_CONTRACT_FIELDS} if record.get("workload") in SFU_WORKLOADS else None,
         "nonlinear_contract": {field: benchmark.get(field) for field in (
             "row_width", "working_set_bytes", "input_elements", "grid_mode", "input_precision", "math_implementation",
             "kernel_implementation_version", "block_completion_count_source", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution")} if record.get("workload") in NONLINEAR_WORKLOADS else None,
@@ -915,6 +957,32 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         result["control_subtracted_power_w"] = None
         result["control_subtraction_note"] = "Standalone activation control is descriptive; paired protocol and state checks are required for an active-reference contrast."
     _paired_reference_contrast(record, phase_records, result, pre, post, measure, policy)
+    sfu = record.get("workload") in SFU_WORKLOADS
+    if sfu:
+        instruction_rate = ops_rate if not sfu_issues and count_alignment_exact and ops_rate and ops_rate > 0 else None
+        result.update(throughput_sfu_instructions_s=instruction_rate,
+                      counted_measure_sfu_instructions=counted_operations if instruction_rate else None,
+                      sfu_instruction_count_convention="one approximate PTX primitive application per active scalar lane; not warp instructions, FLOPs or complete-function elements",
+                      sfu_reference_delta_estimator="mean_power_contrast_normalized_by_treatment_instruction_rate",
+                      sfu_hardware_attribution_proven=False, pj_per_op=None, total_pj_per_op=None)
+        for prefix, power in (("total_", board_power), ("operational_idle_increment_", incremental_power),
+                              ("paired_active_reference_", result.get("paired_active_reference_power_w"))):
+            result[prefix + "pj_per_instruction"] = power / instruction_rate * 1e12 if power is not None and instruction_rate else None
+        result["sfu_reference_delta_pj_per_instruction"] = result.get("paired_active_reference_pj_per_instruction")
+        result["sfu_reference_delta_power_w"] = result.get("paired_active_reference_power_w")
+        result["sfu_reference_delta_issues"] = sorted(set(result.get("paired_active_reference_issues", [])
+            + ["treatment:" + issue for issue in result.get("issues", [])]))
+        diagnostics = result.get("sfu_reference_delta_diagnostics")
+        if diagnostics is not None:
+            diagnostics["treatment_scalar_instruction_rate_s"] = instruction_rate
+            diagnostics["reference_loop_slots_s"] = result.get("active_reference_loop_slots_s")
+            reference_rate = result.get("active_reference_loop_slots_s")
+            diagnostics["reference_to_treatment_issue_rate_ratio"] = reference_rate / instruction_rate if reference_rate is not None and instruction_rate else None
+            reference_slots = result.get("active_reference_counted_loop_slots")
+            diagnostics["reference_to_treatment_count_ratio"] = reference_slots / counted_operations if reference_slots is not None and counted_operations else None
+            diagnostics["equal_selected_loop_slot_counts"] = reference_slots == counted_operations
+            diagnostics["epilogue_logical_bytes_per_treatment_instruction"] = 4 / (benchmark["iterations_per_launch"] * benchmark["sfu_chains"]) if not sfu_issues else None
+            diagnostics["epilogue_scope"] = "one final4B hash store per lane/launch; requested logical output only, not observed physical memory traffic"
     nonlinear = record.get("workload") in NONLINEAR_WORKLOADS
     element_rate = ops_rate if nonlinear and not nonlinear_issues and count_alignment_exact and ops_rate and ops_rate > 0 else None
     width = benchmark.get("row_width") if record.get("workload") in ROW_WORKLOADS else None
@@ -924,7 +992,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
                   counted_measure_elements=counted_operations if element_rate else None,
                   element_count_convention="one output element of the complete FP32 function, including reductions/gamma and input/output; not FLOPs or SFU instructions" if nonlinear else None,
                   row_operation_convention="one complete row function application; pJ/row = row_width * pJ/element" if width else None,
-                  numerical_validation=benchmark.get("numerical_validation") if nonlinear else None)
+                  numerical_validation=benchmark.get("numerical_validation") if nonlinear or sfu else None)
     if nonlinear and element_rate is None:
         result["pj_per_op"] = result["total_pj_per_op"] = None
     for prefix, power in (("total_", board_power), ("operational_idle_increment_", incremental_power),
@@ -948,6 +1016,9 @@ _METRICS = ("board_power_w", "idle_power_w", "incremental_power_w", "throughput_
 _METRICS += ("throughput_elements_s", "throughput_rows_s", "total_pj_per_element", "total_pj_per_row",
              "operational_idle_increment_pj_per_element", "operational_idle_increment_pj_per_row",
              "paired_active_reference_pj_per_element", "paired_active_reference_pj_per_row")
+_METRICS += ("throughput_sfu_instructions_s", "total_pj_per_instruction", "operational_idle_increment_pj_per_instruction",
+             "paired_active_reference_pj_per_instruction", "sfu_reference_delta_pj_per_instruction", "sfu_reference_delta_power_w",
+             "active_reference_duration_s", "active_reference_counted_loop_slots", "active_reference_loop_slots_s")
 _REPEAT_KEYS = {"repeat", "repeat_id", "repeat_index", "trial_id", "output_dir", "output_path"}
 
 
@@ -962,6 +1033,7 @@ def _group_key(trial: Mapping[str, Any]) -> str:
                        "benchmark_sha256": trial.get("benchmark_sha256"),
                        "measurement_stratum": trial.get("measurement_stratum"),
                        "nonlinear_contract": trial.get("nonlinear_contract"),
+                       "sfu_contract": trial.get("sfu_contract"),
                        "treatment_design_stratum": trial.get("treatment_design_stratum"),
                        "resource_geometry": trial.get("resource_geometry")}, sort_keys=True, separators=(",", ":"))
 
@@ -982,6 +1054,8 @@ def _clock_stratum(group: Mapping[str, Any], cross_clock: bool) -> dict[str, Any
            "access": group["config"].get("access", "read") if group["workload"] in _MEMORY_WORKLOADS else None}
     if group["workload"] in NONLINEAR_WORKLOADS:
         key["nonlinear_contract"] = group.get("nonlinear_contract")
+    if group["workload"] in SFU_WORKLOADS:
+        key["sfu_contract"] = group.get("sfu_contract")
     if not cross_clock:
         key.update(graphics_clock_mhz=group["config"].get("graphics_clock_mhz") or group.get("graphics_clock_mhz"),
                    memory_clock_mhz=group["config"].get("memory_clock_mhz") or group.get("memory_clock_mhz"),
@@ -995,14 +1069,17 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
     for group in groups:
         if group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats:
             continue
+        sfu = group["workload"] in SFU_WORKLOADS
+        if sfu and (total_energy or not group.get("sfu_reference_delta_positive_optimum_eligible")):
+            continue
         if exploratory_only == group["clock_comparison_controlled"]:
             continue
         if verified_only and not group["verified_selection_eligible"]:
             continue
-        if not total_energy and not group.get("operational_idle_increment_eligible"):
+        if not total_energy and not sfu and not group.get("operational_idle_increment_eligible"):
             continue
         tensor = group["workload"] in _TENSOR_WORKLOADS
-        metric = ("total_" if total_energy else "") + ("pj_per_element" if group["workload"] in NONLINEAR_WORKLOADS else "pj_per_op" if tensor else "pj_per_logical_byte")
+        metric = "sfu_reference_delta_pj_per_instruction" if sfu else ("total_" if total_energy else "") + ("pj_per_element" if group["workload"] in NONLINEAR_WORKLOADS else "pj_per_op" if tensor else "pj_per_logical_byte")
         throughput = _throughput_metric(group["workload"])
         if group.get(metric) is None or group.get(throughput) is None:
             continue
@@ -1011,7 +1088,7 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
     selections = []
     for key, candidates in sorted(buckets.items()):
         tensor = candidates[0]["workload"] in _TENSOR_WORKLOADS
-        metric = ("total_" if total_energy else "") + ("pj_per_element" if candidates[0]["workload"] in NONLINEAR_WORKLOADS else "pj_per_op" if tensor else "pj_per_logical_byte")
+        metric = "sfu_reference_delta_pj_per_instruction" if candidates[0]["workload"] in SFU_WORKLOADS else ("total_" if total_energy else "") + ("pj_per_element" if candidates[0]["workload"] in NONLINEAR_WORKLOADS else "pj_per_op" if tensor else "pj_per_logical_byte")
         throughput = _throughput_metric(candidates[0]["workload"])
         candidate_max = max(g[throughput] for g in candidates)
         all_observed = [g[throughput] for g in groups if g["workload"] == candidates[0]["workload"]
@@ -1089,6 +1166,8 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_g
             continue
         tensor = group["workload"] in _TENSOR_WORKLOADS
         for objective, prefix, eligibility in objectives:
+            if group["workload"] in SFU_WORKLOADS and (objective != "paired_active_reference" or not group.get("sfu_reference_delta_positive_optimum_eligible")):
+                continue
             if eligibility and not group.get(eligibility):
                 continue
             metric = _energy_metric(group["workload"], prefix)
@@ -1273,6 +1352,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
         group = {"group_id": digest, "gpu_uuid": repeats[0]["gpu_uuid"], "workload": repeats[0]["workload"],
                  "experiment_contract": repeats[0].get("experiment_contract"),
                  "nonlinear_contract": repeats[0].get("nonlinear_contract"),
+                 "sfu_contract": repeats[0].get("sfu_contract"),
                  "config": {k: v for k, v in repeats[0]["config"].items() if k not in _REPEAT_KEYS},
                  "benchmark_sha256": repeats[0]["benchmark_sha256"], "measurement_stratum": repeats[0]["measurement_stratum"],
                  "kernel_resources": repeats[0].get("kernel_resources"),
@@ -1305,12 +1385,34 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
                                                        and group["paired_reference_order_counts"]["AB"] == group["paired_reference_order_counts"]["BA"])
         group["paired_reference_order_count_imbalance"] = group["paired_reference_order_counts"]["AB"] - group["paired_reference_order_counts"]["BA"]
         group["paired_active_reference_eligible"] = group["paired_active_reference_eligible"] and group["paired_reference_counterbalanced"]
+        if group["workload"] in SFU_WORKLOADS:
+            group["sfu_reference_delta_measurement_valid"] = (bool(valid)
+                and all(trial.get("sfu_reference_delta_measurement_valid") is True for trial in valid)
+                and group["paired_reference_counterbalanced"])
+            interval = group["ci95"].get("sfu_reference_delta_pj_per_instruction")
+            # These names expose one estimator and one repeat sample, rather
+            # than independent observations with independently sampled CIs.
+            group["ci95"]["paired_active_reference_pj_per_instruction"] = interval
+            group["sfu_reference_delta_ci_crosses_zero"] = interval[0] <= 0 <= interval[1] if interval else None
+            group["sfu_reference_delta_positive_optimum_eligible"] = (group["sfu_reference_delta_measurement_valid"]
+                and group["verified_selection_eligible"] and len(valid) >= min_repeats and bool(interval) and interval[0] > 0)
+            group["sfu_hardware_attribution_proven"] = False
+            group["sfu_reference_delta_estimator"] = "mean_power_contrast_normalized_by_treatment_instruction_rate"
+            group["sfu_reference_delta_issues"] = sorted({issue for trial in valid for issue in trial.get("sfu_reference_delta_issues", [])}
+                | ({"paired_orders_not_counterbalanced"} if not group["paired_reference_counterbalanced"] else set()))
+            group["sfu_reference_delta_uncertainty"] = {
+                "ci95_pj_per_instruction": interval, "ci_crosses_zero": group["sfu_reference_delta_ci_crosses_zero"],
+                "method": "percentile bootstrap of repeat paired-contrast medians",
+                "scope": "repeat uncertainty only; telemetry bias, comparator model error and physical attribution uncertainty are not bounded",
+                "signed_observation_retained": True}
         arm_medians = {order: _median(trial.get("paired_active_reference_power_w") for trial in valid if trial.get("paired_active_reference_protocol", {}).get("order") == order) for order in ("AB", "BA")}
         group["paired_reference_order_medians_power_w"] = arm_medians
         group["paired_reference_order_effect_power_w"] = arm_medians["AB"] - arm_medians["BA"] if None not in arm_medians.values() else None
         group["ncu_target_suitability"] = group["target_verified"]
         group["ncu_utilization_status"] = "diagnostic_only" if valid and all(trial["ncu_utilization_status"] == "diagnostic_only" for trial in valid) else "inconclusive"
         group["measurement_diagnostics"] = _group_measurement_diagnostics(valid, group)
+        if group["workload"] in SFU_WORKLOADS:
+            group["sfu_reference_delta_diagnostics"] = (group["measurement_diagnostics"].get("execution") or {}).get("sfu_reference_delta")
         groups.append(group)
     summary = {"schema_version": 2, "trials": trials, "groups": groups, "duplicate_trial_ids_ignored": duplicate_ids,
             "within_clock_best": _selections(groups, throughput_fraction, min_repeats, False),
@@ -1357,7 +1459,10 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
     csv_path = destination / "trials.csv"
     fields = ["trial_id", "gpu_uuid", "gpu_name", "workload", "valid", "target_verified", "ncu_status", "ncu_target_suitability", "ncu_utilization_status", "profiler_suitability_status",
               "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "baseline_state_matched", "baseline_state_issues", "baseline_state_domains_compared", "resource_geometry", "row_width", "nonlinear_contract", "counted_measure_elements", "element_count_convention", "row_operation_convention", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
-              "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source"]
+              "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source",
+              "sfu_contract", "counted_measure_sfu_instructions", "sfu_instruction_count_convention",
+              "sfu_reference_delta_measurement_valid", "sfu_reference_delta_positive_optimum_eligible",
+              "sfu_reference_delta_estimator", "sfu_reference_delta_diagnostics", "sfu_reference_delta_issues", "sfu_hardware_attribution_proven"]
     with csv_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()

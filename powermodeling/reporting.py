@@ -5,6 +5,7 @@ from pathlib import Path
 import statistics
 
 from .evaluation import OBJECTIVES
+from .sfu import SFU_WORKLOADS
 
 STYLES = {"pass": ("#177c54", "o"), "fail": ("#bf4343", "x"),
           "inconclusive": ("#b48425", "s"), "unprofiled": ("#3e77b5", "^")}
@@ -35,7 +36,8 @@ def write_plots(summary, output_dir):
                     _input_size_figure(c, curve, objective, summary["selection_policy"]["min_repeats"], output, files, plt)
         for objective in OBJECTIVES:
             points = [p for p in c["points"] if p["valid_repeats"] >= summary["selection_policy"]["min_repeats"]
-                      and p["rate"] is not None and p["energies"][objective] is not None and p["objective_eligible"][objective]]
+                      and p["rate"] is not None and p["energies"][objective] is not None
+                      and (p["objective_eligible"][objective] or workload in SFU_WORKLOADS and objective == "paired_active_reference")]
             if points:
                 domains = sorted({p["requested_memory_mhz"] for p in points if p["requested_memory_mhz"] is not None})
                 if len(domains) <= 1:
@@ -77,6 +79,7 @@ def _input_size_figure(component, curve, objective, minimum_repeats, output, fil
     """Export one matched Q curve, without pooling energies across input sizes."""
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.2), layout="constrained")
     units = component["units"]
+    sfu = component["stratum"]["workload"] in SFU_WORKLOADS
     points = [{**p, "anchor_tags": []} for p in curve["rows"]]
     x = lambda p: p["input_elements"] / 1e6
     rate = lambda p: p["rate"] / units["rate_scale"] if p["rate"] is not None else None
@@ -85,6 +88,8 @@ def _input_size_figure(component, curve, objective, minimum_repeats, output, fil
     eci = lambda p: p["energy_ci95"][objective]
     _scatter(axes[0], points, x, rate, rci)
     _scatter(axes[1], points, x, energy, eci)
+    if sfu and objective == "paired_active_reference":
+        axes[1].axhline(0, color="#68758c", linewidth=.8, label="zero contrast")
     observed = [p["rate"] for p in points if p["valid_repeats"] >= minimum_repeats and p["rate"] is not None and p["rate"] > 0]
     if observed:
         axes[0].axhline(max(observed) / units["rate_scale"], linestyle=":", linewidth=1,
@@ -102,17 +107,20 @@ def _input_size_figure(component, curve, objective, minimum_repeats, output, fil
                     ax.annotate(point["group_id"][:8] + f" / B={point['blocks']}", (x(point), y(point)),
                                 xytext=(0, 8), textcoords="offset points", fontsize=7,
                                 ha="left" if point["input_elements"] == q_min else "right" if point["input_elements"] == q_max else "center")
-        ax.set(xlabel="Input Q (million elements)", ylabel=ylabel, title=title)
+        ax.set(xlabel="Q (million active SFU register lanes)" if sfu else "Input Q (million elements)", ylabel=ylabel, title=title)
         if ax.collections:
             ax.legend(fontsize=7)
     first = points[0]
     signature = curve["signature"]
-    width = signature["nonlinear_contract"].get("row_width")
+    contract = signature.get("sfu_contract" if sfu else "nonlinear_contract") or {}
+    width = contract.get("row_width")
     iterations = signature["config"].get("iterations")
-    fig.suptitle(f"{component['stratum']['workload']} Q curve {curve['curve_id']}: {objective.replace('_', ' ')}\n"
+    details = f"chains={contract.get('sfu_chains')}; primitive={contract.get('sfu_primitive')}" if sfu else f"row_width={width}" + (" (pointwise)" if width == 0 else "")
+    objective_label = ("signed SFU/control contrast" if objective == "paired_active_reference" else "board diagnostic: " + objective.replace("_", " ")) if sfu else objective.replace("_", " ")
+    fig.suptitle(f"{component['stratum']['workload']} Q curve {curve['curve_id']}: {objective_label}\n"
                  f"{component.get('gpu_name')} / {component['stratum']['gpu_uuid']}; "
                  f"SM/memory={first['requested_graphics_mhz']}/{first['requested_memory_mhz']} MHz\n"
-                 f"threads={first['threads']}; iterations={iterations}; row_width={width}" + (" (pointwise)" if width == 0 else "") + "; grid=auto\n"
+                 f"threads={first['threads']}; iterations={iterations}; {details}; grid=auto\n"
                  "Repeat medians / bootstrap 95% intervals; matched definition and iterations. Size stability does not prove hardware saturation.", fontsize=9)
     _save(fig, component["stratum"]["workload"] + "-q-curve-" + curve["curve_id"] + "-" + objective + "-input-scaling", output, files, plt)
 
@@ -127,6 +135,10 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
     _scatter(axes[0, 0], points, clock, rate, rci)
     _scatter(axes[0, 1], points, clock, energy, eci)
     _scatter(axes[0, 2], points, rate, energy, eci)
+    sfu = c["stratum"]["workload"] in SFU_WORKLOADS
+    if sfu and objective == "paired_active_reference":
+        axes[0, 1].axhline(0, color="#68758c", linewidth=.8)
+        axes[0, 2].axhline(0, color="#68758c", linewidth=.8)
     clock_pairs = sorted({(p["requested_graphics_mhz"], p["requested_memory_mhz"]) for p in points if p["requested_graphics_mhz"] is not None})
     for index, pair in enumerate(clock_pairs):
         color = plt.cm.viridis(index / max(1, len(clock_pairs) - 1))
@@ -176,7 +188,8 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
     axes[1, 2].set(title="Trial quality by NCU status", ylabel="Trial count")
     axes[1, 2].legend(fontsize=8)
     contract = str(c["stratum"]["experiment_contract"])
-    fig.suptitle(f"{name}: {objective.replace('_', ' ')} — {c['stratum']['gpu_uuid']}\n{contract[:180]}\n"
+    objective_label = ("signed SFU/control contrast; unqualified values are diagnostic" if objective == "paired_active_reference" else "board diagnostic: " + objective.replace("_", " ")) if sfu else objective.replace("_", " ")
+    fig.suptitle(f"{name}: {objective_label} — {c['stratum']['gpu_uuid']}\n{contract[:180]}\n"
                  f"Repeat medians / bootstrap 95% intervals. Factory default: purple ring; exact 1110: black ring. {rec['status']}.", fontsize=10)
     _save(fig, name + "-" + objective + "-energy-throughput", output, files, plt)
     files[name + "_" + objective + "_plot"] = files[name + "-" + objective + "-energy-throughput_png"]

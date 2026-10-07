@@ -1,0 +1,93 @@
+{
+  "target_form_factor": "SXM",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "paired_reference": true,
+  "randomization_seed": 2026,
+  "description": "Native register SFU correctness, sensor and paired-control smoke. Six operations on A100/H100, five on V100 (native TANH unsupported). No controlled-clock energy optimum is established.",
+  "study_design": "diagnostic",
+  "clock_pairs": [
+    {
+      "graphics_mhz": null,
+      "memory_mhz": null
+    }
+  ],
+  "experiments": [
+    {
+      "workload": "sfu_ex2",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "iterations": 16384,
+        "batch_launches": 1
+      }
+    },
+    {
+      "workload": "sfu_lg2",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "iterations": 16384,
+        "batch_launches": 1
+      }
+    },
+    {
+      "workload": "sfu_rcp",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "iterations": 16384,
+        "batch_launches": 1
+      }
+    },
+    {
+      "workload": "sfu_rsqrt",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "iterations": 16384,
+        "batch_launches": 1
+      }
+    },
+    {
+      "workload": "sfu_sqrt",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "iterations": 16384,
+        "batch_launches": 1
+      }
+    },
+    {
+      "workload": "sfu_tanh",
+      "stage": "sfu",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "iterations": 16384,
+        "batch_launches": 1
+      },
+      "skip_if_unsupported": true
+    }
+  ]
+}

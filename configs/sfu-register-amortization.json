@@ -1,0 +1,135 @@
+{
+  "target_form_factor": "SXM",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 4,
+  "sample_interval_s": 0.05,
+  "paired_reference": true,
+  "randomization_seed": 2026,
+  "description": "Register SFU loop-length diagnostic: compare 4096/8192/16384/32768 iterations with fixed Q/chains/threads; one final sink store is amortized over loop work. Set a supported fixed graphics/memory clock pair before interpreting energy differences. This diagnostic plan alone does not qualify a full energy optimum.",
+  "study_design": "diagnostic",
+  "clock_pairs": [
+    {
+      "graphics_mhz": null,
+      "memory_mhz": null
+    }
+  ],
+  "experiments": [
+    {
+      "workload": "sfu_ex2",
+      "stage": "amortization",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "batch_launches": 1
+      },
+      "grid": {
+        "iterations": [
+          4096,
+          8192,
+          16384,
+          32768
+        ]
+      }
+    },
+    {
+      "workload": "sfu_lg2",
+      "stage": "amortization",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "batch_launches": 1
+      },
+      "grid": {
+        "iterations": [
+          4096,
+          8192,
+          16384,
+          32768
+        ]
+      }
+    },
+    {
+      "workload": "sfu_rcp",
+      "stage": "amortization",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "batch_launches": 1
+      },
+      "grid": {
+        "iterations": [
+          4096,
+          8192,
+          16384,
+          32768
+        ]
+      }
+    },
+    {
+      "workload": "sfu_rsqrt",
+      "stage": "amortization",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "batch_launches": 1
+      },
+      "grid": {
+        "iterations": [
+          4096,
+          8192,
+          16384,
+          32768
+        ]
+      }
+    },
+    {
+      "workload": "sfu_sqrt",
+      "stage": "amortization",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "batch_launches": 1
+      },
+      "grid": {
+        "iterations": [
+          4096,
+          8192,
+          16384,
+          32768
+        ]
+      }
+    },
+    {
+      "workload": "sfu_tanh",
+      "stage": "amortization",
+      "parameters": {
+        "grid_mode": "auto",
+        "sfu_lanes": 262144,
+        "sfu_chains": 4,
+        "threads": 256,
+        "batch_launches": 1
+      },
+      "skip_if_unsupported": true,
+      "grid": {
+        "iterations": [
+          4096,
+          8192,
+          16384,
+          32768
+        ]
+      }
+    }
+  ]
+}

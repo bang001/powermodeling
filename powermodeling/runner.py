@@ -16,6 +16,7 @@ import signal
 import time
 
 from .planner import benchmark_command
+from .sfu import SFU_WORKLOADS, REFERENCE_KIND as SFU_REFERENCE_KIND
 
 
 def atomic_json(path, value):
@@ -439,10 +440,13 @@ def capture_trial(executable, trial, device, cuda_device, sample_interval_s=0.05
                 if actual_protocol.get(key) is not True:
                     raise ValueError(f"Paired protocol missing {key} assurance")
             reference = record["active_reference"]
-            if reference.get("workload") != "control" or reference.get("reference_kind") != "issue_loop":
-                raise ValueError("Paired reference must be the declared issue-loop control")
+            expected_reference = SFU_REFERENCE_KIND if trial["workload"] in SFU_WORKLOADS else "issue_loop"
+            if reference.get("workload") != "control" or reference.get("reference_kind") != expected_reference:
+                raise ValueError("Paired reference must be the declared workload-specific control")
             if any(reference.get(key) != record["benchmark"].get(key) for key in ("blocks", "threads", "batch_launches", "iterations_per_launch")):
                 raise ValueError("Paired reference launch geometry/batching/iterations differ from treatment")
+            if trial["workload"] in SFU_WORKLOADS and any(reference.get(key) != record["benchmark"].get(key) for key in ("sfu_lanes", "sfu_chains", "sfu_primitive", "sfu_input_policy", "grid_mode")):
+                raise ValueError("SFU paired reference register-loop definition differs from treatment")
             if reference.get("sanity", {}).get("requested_sm_coverage_complete") is not True:
                 raise ValueError("Paired reference did not cover every requested SM")
             if actual_protocol.get("launch_geometry_matched") is not (trial["workload"] != "gemm"):

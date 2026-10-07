@@ -13,7 +13,8 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 | Tensor | FP16 입력·FP32 누산 WMMA 반복, 독립 accumulator sweep, cuBLAS dense GEMM 비교 |
 | L1·L2·HBM | `.ca`/`.cg` load, working set·grid·thread·stride·주소 offset·read/copy sweep |
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
-| 비선형 함수 | FP32 EXP·TANH·RMSNorm·Softmax·SiLU의 완전한 함수 적용, CPU 기준 표본 검증, pJ/element·행 연산의 pJ/row |
+| Register SFU | EX2·LG2·RCP·RSQ·SQRT·native TANH의 register 반복, SFU를 뺀 control 대비 차분 pJ/scalar instruction |
+| 전체 비선형 함수 | FP32 EXP·TANH·RMSNorm·Softmax·SiLU의 global 입출력을 포함한 함수 적용, pJ/element·pJ/row; SFU 자체의 단가와 별도 |
 | 전력 측정 | capability 기반 NVML 평균/현재/누적에너지, 지원되는 memory scope, raw timestamps·오류 |
 | 시간·기준 | 같은 context·버퍼·clock policy의 전후 idle 및 AB/BA paired active reference, arm별 warmup·완료 epoch의 정렬 적분 |
 | 클럭·DVFS | 900 MHz 이상 지원 pair의 60/90/120 등 가변 간격 graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
@@ -76,7 +77,38 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 
 완료된 실험을 이어 실행하려면 같은 plan/output에 `--resume`을 추가한다. 실패한 측정은 raw 로그를 남기며 성공한 결과로 처리되지 않는다. `--limit 3`은 일부 trial의 실행 점검에 사용할 수 있지만 repeat나 sweep가 불완전하면 효율 최적값을 확정할 수 없다.
 
-## 비선형 함수 실험: EXP·TANH·RMSNorm·Softmax·SiLU
+## Register-resident SFU 기본 명령 실험
+
+**SFU 연산의 차분 에너지를 보려면 `configs/sfu-register*.json`을 사용한다.** 반복 루프에서 global/shared/local load/store를 제거하고, 동일한 bounded register loop에서 SFU 명령을 뺀 control과 AB/BA로 비교한다. 주 결과 `sfu_reference_delta_pj_per_instruction`은 `(P_treatment − P_control) / treatment의 scalar SFU 명령 처리율`이다. 전체 GPU 단가와 idle 증가분은 별도 진단값으로 보존한다. Register/issue/실행 시간 차이의 영향까지 완전히 제거한 물리 SFU rail 에너지로 해석하지 않는다.
+
+| 연산 | 의미 | V100 | A100/H100 |
+|---|---|---|---|
+| EX2 / `sfu_ex2` | 2ˣ | 지원 | 지원 |
+| LG2 / `sfu_lg2` | log₂x | 지원 | 지원 |
+| RCP / `sfu_rcp` | 1/x | 지원 | 지원 |
+| RSQ / `sfu_rsqrt` | 1/√x | 지원 | 지원 |
+| SQRT / `sfu_sqrt` | √x | 지원 | 지원 |
+| TANH / `sfu_tanh` | native tanh(x) | 미지원, 명시적으로 skip | 지원 |
+
+모두 FP32 **근사 명령**이다. EXP(eˣ), RMSNorm, Softmax, SiLU 전체의 단가가 아니다. Q=`sfu_lanes`와 independent chains를 바꿔 처리량을 검사하며, 최종 결과 검증용 lane당 4B store 한 번은 반복이 끝난 뒤 수행한다. 그 비용의 amortization도 별도로 점검한다. 음수·0을 포함하는 CI는 숨기지 않고 진단으로 표시한다.
+
+```bash
+export POWERBENCH=build/powerbench  # A100/CUDA13: build-a100-cuda13/powerbench
+python tools/check_sfu_sass.py --binary "$POWERBENCH" --output results/sfu-sass.json
+python -m powermodeling plan --config configs/sfu-register-smoke.json \
+  --bench "$POWERBENCH" --device 0 --sfu-sass-evidence results/sfu-sass.json \
+  --output results/sfu-smoke-plan.json
+python -m powermodeling run --plan results/sfu-smoke-plan.json \
+  --bench "$POWERBENCH" --device 0 --output results/sfu-smoke
+python -m powermodeling analyze --input results/sfu-smoke \
+  --output results/sfu-smoke-report --plots
+```
+
+Smoke는 V100 20 trials/최소15분, A100/H100 24 trials/최소18분이다. 고정 clock 최적점을 확정하는 실험은 아니다. 전체 `sfu-register.json`은 Q 3개 × threads 2개 × chains 3개를 비교하며 clock 조건 하나당 V100 최소4.5시간, A100/H100 최소5.4시간이다. NCU 검증·준비·overrun은 추가된다. [SFU register 실험 지침](docs/sfu-register-experiments.ko.md)에 전체 sweep, SASS 증거, 차분 식, loop 길이 진단과 해석 한계를 설명한다.
+
+## 전체 비선형 함수 실험: EXP·TANH·RMSNorm·Softmax·SiLU
+
+아래 `nonlinear*.json`은 **global 입출력을 포함한 전체 함수 실험**이다. Register SFU 명령 단가는 위 실험으로 측정한다.
 
 5개 함수를 독립 workload로 실행하고 **FP32 입력·출력, CUDA 표준 math, global load/store를 포함한 전체 함수 적용의 pJ/element**를 측정한다. `--use_fast_math`는 사용하지 않는다. 측정 전후에 CPU double 기준값으로 출력 표본을 검사하며, 수치 검증이나 완료 원소 수가 잘못된 결과는 에너지 후보에서 제외한다.
 
@@ -160,6 +192,9 @@ Q scaling 그림·표는 같은 clock·함수·행 너비·threads에서 Q에 �
 | [configs/dvfs.json](configs/dvfs.json) | memory×SM clock 도메인의 bandwidth plateau와 효율 탐색 |
 | [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
 | [configs/nonlinear-smoke.json](configs/nonlinear-smoke.json) | FP32 비선형 함수 5종의 실행·수치·센서 점검 |
+| [configs/sfu-register-smoke.json](configs/sfu-register-smoke.json) | Native SFU register loop와 대응 control의 실행·수치·센서 점검 |
+| [configs/sfu-register.json](configs/sfu-register.json) | SFU 기본 명령의 Q·threads·chains·clock별 차분 pJ/instruction |
+| [configs/sfu-register-amortization.json](configs/sfu-register-amortization.json) | SFU loop 길이에 따른 초기화·최종 store·launch 비용 영향 점검 |
 | [configs/nonlinear.json](configs/nonlinear.json) | 비선형 함수의 footprint·geometry·행 너비·clock별 pJ/element sweep |
 | [configs/component-diagnostics.json](configs/component-diagnostics.json) | Tensor·L1·L2·HBM 단가가 높을 때 iterations/batching·Tensor dependency·L1 footprint를 분리하는 추가 진단 |
 
@@ -333,6 +368,7 @@ CPU 테스트는 데이터 분석·모델 식별·plan·NVML mock·클럭 복원
 
 - [실험 설계: static/dynamic 기준, DVFS, hierarchy, near/far, fairness](docs/experiment-design.ko.md)
 - [비선형 함수: EXP·TANH·RMSNorm·Softmax·SiLU의 정의·실행·에너지 단위](docs/nonlinear-experiments.ko.md)
+- [Register-resident SFU 기본 명령: 차분 pJ/instruction·control·SASS 검증](docs/sfu-register-experiments.ko.md)
 - [컴포넌트별 평가·시각화: coverage·반복 정밀도·plateau·에너지 후보](docs/evaluation-design.ko.md)
 - [높은 Tensor·L1·L2·HBM 단가: 기준·계산·처리량 점검과 추가 진단](docs/high-energy-investigation.ko.md)
 - [전체 구현 자가점검: 발견 사항·수정·검증·남은 실측](docs/self-audit.ko.md)

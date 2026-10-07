@@ -9,11 +9,12 @@ import random
 
 from .profiles import declare_sxm
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS
+from .sfu import SFU_WORKLOADS, REFERENCE_KIND as SFU_REFERENCE_KIND
 
-WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS
+WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS
 PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "iterations",
               "tensor_accumulators", "access", "sm_ids", "seed", "offset_bytes",
-              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode"}
+              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode", "sfu_lanes", "sfu_chains"}
 
 
 def numeric_expression(value, names):
@@ -336,7 +337,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
              "total_memory_bytes": int(device["total_memory_bytes"])}
     if any(value <= 0 for value in names.values()):
         raise ValueError("Discovered device capacities and SM count must be positive")
-    trials = []
+    trials, unsupported_experiments = [], []
     conditions = set()
     geometry_keys = {}
     paired_default = config.get("paired_reference", True)
@@ -346,10 +347,27 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
         if stage and spec.get("stage", "saturation") != stage: continue
         workload = spec["workload"]
         if workload not in WORKLOADS: raise ValueError(f"Unknown workload {workload}")
-        paired = spec.get("paired_reference", paired_default if workload in {"tensor", "l1", "l2", "hbm"} | NONLINEAR_WORKLOADS else False)
+        skip_unsupported = spec.get("skip_if_unsupported", False)
+        if type(skip_unsupported) is not bool:
+            raise ValueError("skip_if_unsupported must be boolean")
+        if workload in SFU_WORKLOADS:
+            major, minor = device.get("compute_capability_major"), device.get("compute_capability_minor", 0)
+            if type(major) is not int or type(minor) is not int:
+                raise ValueError("SFU native instruction support requires discovered compute capability")
+            required_cc = 75 if workload == "sfu_tanh" else 70
+            if major * 10 + minor < required_cc:
+                reason = f"{workload} requires native instruction support at sm_{required_cc} or newer; no emulation"
+                if not skip_unsupported:
+                    raise ValueError(reason)
+                unsupported_experiments.append({"workload": workload, "stage": spec.get("stage", "saturation"),
+                    "reason": reason, "compute_capability": major * 10 + minor})
+                continue
+        paired = spec.get("paired_reference", paired_default if workload in {"tensor", "l1", "l2", "hbm"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS else False)
         if type(paired) is not bool:
             raise ValueError("Experiment paired_reference must be boolean")
-        if paired and workload not in {"tensor", "l1", "l2", "hbm", "gemm"} | NONLINEAR_WORKLOADS:
+        if workload in SFU_WORKLOADS and not paired:
+            raise ValueError("SFU energy plans require the paired register-loop control; unpaired CLI runs are diagnostics only")
+        if paired and workload not in {"tensor", "l1", "l2", "hbm", "gemm"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS:
             raise ValueError("Paired issue-loop reference is available only for treatment workloads; latency/control remain diagnostic")
         grid = spec.get("grid", {})
         if set(grid) - PARAMETERS: raise ValueError(f"Unknown parameters: {set(grid)-PARAMETERS}")
@@ -375,11 +393,13 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 raise ValueError("blocks>=1 and threads must be a multiple of warp size32 within32..1024")
             if blocks > 1000000 or blocks > 2**31-1:
                 raise ValueError("blocks exceeds the benchmark practical limit of1000000")
-            if "grid_mode" in resolved and workload not in NONLINEAR_WORKLOADS:
-                raise ValueError("grid_mode applies only to nonlinear workloads")
+            if "grid_mode" in resolved and workload not in NONLINEAR_WORKLOADS | SFU_WORKLOADS:
+                raise ValueError("grid_mode applies only to nonlinear/SFU workloads")
             grid_mode = resolved.get("grid_mode", "auto")
-            if workload in NONLINEAR_WORKLOADS and grid_mode not in ("auto", "fixed"):
+            if workload in NONLINEAR_WORKLOADS | SFU_WORKLOADS and grid_mode not in ("auto", "fixed"):
                 raise ValueError("nonlinear grid_mode must be auto or fixed")
+            if workload not in SFU_WORKLOADS and {"sfu_lanes", "sfu_chains"} & resolved.keys():
+                raise ValueError("sfu_lanes and sfu_chains apply only to native SFU workloads")
             access = resolved.get("access", "read")
             if access not in ("read", "write", "copy"):
                 raise ValueError("access must be read, write or copy")
@@ -399,8 +419,8 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 ids = resolved["sm_ids"]
                 if not isinstance(ids, list) or not ids or any(type(i) is not int or not 0 <= i < 4096 for i in ids) or len(set(ids)) != len(ids):
                     raise ValueError("sm_ids must be a nonempty unique list of integers within0..4095")
-                if workload == "gemm" or workload in NONLINEAR_WORKLOADS:
-                    raise ValueError("GEMM/nonlinear full-output workloads cannot honor sm_ids")
+                if workload == "gemm" or workload in NONLINEAR_WORKLOADS | SFU_WORKLOADS:
+                    raise ValueError("GEMM/nonlinear/SFU full-output workloads cannot honor sm_ids")
                 # SM IDs are sparse hardware identifiers on some SKUs. They
                 # cannot be inferred merely from the enabled SM count.
                 known_ids = device.get("discovered_sm_ids")
@@ -419,6 +439,29 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             offset = resolved.get("offset_bytes", 0)
             if ws < 4 or ws % 4 or offset % 4:
                 raise ValueError("working_set_bytes and offset_bytes must be word-aligned (4bytes), with a nonempty working set")
+            if workload in SFU_WORKLOADS:
+                if {"working_set_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k"} & resolved.keys():
+                    raise ValueError("Register SFU kernels take sfu_lanes, not global working sets or Tensor/GEMM parameters")
+                if access != "read" or offset != 0 or resolved.get("stride_elements", 1) != 1:
+                    raise ValueError("Register SFU kernels do not support memory access/offset/stride modes")
+                q, chains = resolved.get("sfu_lanes", 262144), resolved.get("sfu_chains", 4)
+                if not 1 <= q <= 2**32 or chains not in (1, 4, 8):
+                    raise ValueError("sfu_lanes must be 1..2^32 and sfu_chains must be 1,4,8")
+                if grid_mode == "auto":
+                    derived_blocks = (q + threads - 1) // threads
+                    if "blocks" in resolved and blocks != derived_blocks:
+                        raise ValueError("SFU auto blocks must equal ceil(sfu_lanes/threads); use grid_mode=fixed for explicit grid")
+                    blocks = derived_blocks
+                elif "blocks" not in resolved:
+                    raise ValueError("SFU fixed grid requires explicit blocks")
+                if not 1 <= blocks <= 1000000:
+                    raise ValueError("SFU grid exceeds practical block limit of1000000")
+                if q * 8 + 256 * 1024 > names["total_memory_bytes"] * 0.7:
+                    raise ValueError("SFU treatment/control epilogue sinks exceed70% of device memory")
+                resolved.update(blocks=blocks, threads=threads, grid_mode=grid_mode,
+                                sfu_lanes=q, sfu_chains=chains,
+                                iterations=resolved.get("iterations", 16384),
+                                batch_launches=resolved.get("batch_launches", 1))
             if workload in NONLINEAR_WORKLOADS:
                 if access != "read" or offset != 0 or resolved.get("stride_elements", 1) != 1:
                     raise ValueError("Nonlinear kernels require access=read, offset_bytes=0 and stride_elements=1; input and output are distinct")
@@ -479,7 +522,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 if paired:
                     condition["treatment_protocol"] = {
                         "kind": "paired_active_reference", "reference_workload": "control",
-                        "reference_kind": "issue_loop",
+                        "reference_kind": SFU_REFERENCE_KIND if workload in SFU_WORKLOADS else "issue_loop",
                         "reference_matching": "coarse_unmatched_geometry" if workload == "gemm" else "launch_geometry_matched",
                         "order_strategy": "condition_seeded_alternation_by_repeat",
                         "note": "Reference is an operational treatment comparator, not an isolated static-power or component-energy measurement.",
@@ -510,6 +553,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                     "repeats": repeats, "trials": len(keys)*len(clocks)*repeats}
                    for workload, keys in sorted(geometry_keys.items())]
     return {"schema_version":1, "device":device, "trials":trials,
+            "unsupported_experiments": unsupported_experiments,
             "study_design": _study_design(config), "execution_allowed": clock_coverage["execution_allowed"],
             "clock_sweep_coverage": clock_coverage,
             "clock_sweep_policy": {"graphics_step_mhz": clock_coverage.get("requested_step_mhz"),

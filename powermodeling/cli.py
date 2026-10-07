@@ -30,6 +30,7 @@ def parser():
     plan.add_argument("--device-json",help="Offline discovery JSON or CUDA device JSON")
     plan.add_argument("--clocks-json",help="Offline supported clock discovery JSON")
     plan.add_argument("--stage")
+    plan.add_argument("--sfu-sass-evidence",help="Register SFU SASS certificate from tools/check_sfu_sass.py; retained for binary-bound validation")
     plan.add_argument("--output",required=True)
     run=commands.add_parser("run",help="Run a saved plan; raw telemetry is written after every trial")
     hardware(run)
@@ -122,11 +123,17 @@ def main(argv=None):
                 cuda,clocks=info["cuda_device"],info["clocks"]
             architecture(cuda)
             result=expand_plan(read_json(args.config),cuda,clocks,args.stage)
+            if args.sfu_sass_evidence:
+                certificate = read_json(args.sfu_sass_evidence)
+                if certificate.get("kind") != "sfu_register_sass" or certificate.get("benchmark_sha256") != cuda.get("benchmark_sha256"):
+                    raise ValueError("SFU SASS certificate must bind to this discovered benchmark binary")
+                result["sfu_sass_evidence"] = certificate
             atomic_json(args.output,result)
             result={"output":str(Path(args.output).resolve()),"trials":len(result["trials"]),
                     "estimated_minimum_hours":result["estimated_minimum_seconds"]/3600,
                     "study_design": result["study_design"], "execution_allowed": result["execution_allowed"],
                     "requirements_status": result["clock_sweep_coverage"]["requirements_status"],
+                    "unsupported_experiments": result["unsupported_experiments"],
                     "requirement_reasons": result["clock_sweep_coverage"]["requirement_reasons"],
                     "sweep_dimensions": result["sweep_dimensions"]}
         elif args.command=="run":

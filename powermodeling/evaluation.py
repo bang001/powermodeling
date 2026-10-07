@@ -12,6 +12,7 @@ import math
 import statistics
 
 from .nonlinear import NONLINEAR_WORKLOADS
+from .sfu import CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, SFU_WORKLOADS
 
 TENSOR = {"tensor", "gemm", "fp16_tensor", "tensor_fp16"}
 MEMORY = {"l1", "l2", "hbm"}
@@ -48,6 +49,8 @@ def experiment_contract(workload, benchmark, config):
                                           "rms_epsilon", "affine_gamma", "nonlinear_input_distribution",
                                           "input_elements", "grid_mode", "kernel_implementation_version",
                                           "block_completion_count_source")}
+    if workload in SFU_WORKLOADS:
+        return {key: get(key) for key in SFU_CONTRACT_FIELDS}
     return {"definition": "dense FP16 input / FP32 accumulation", "implementation": workload} if workload in TENSOR else {"definition": "active integer issue control"}
 
 
@@ -57,6 +60,9 @@ def component_stratum(group):
 
 
 def units(workload):
+    if workload in SFU_WORKLOADS:
+        return {"rate": "throughput_sfu_instructions_s", "rate_unit": "G scalar SFU instructions/s", "rate_scale": 1e9,
+                "energy_suffix": "pj_per_instruction", "energy_unit": "pJ/scalar SFU instruction"}
     if workload in NONLINEAR_WORKLOADS:
         return {"rate": "throughput_elements_s", "rate_unit": "Gelement/s", "rate_scale": 1e9,
                 "energy_suffix": "pj_per_element", "energy_unit": "pJ/element"}
@@ -104,7 +110,12 @@ def _capacity(group):
 def _qualified(group, metric, rate, minimum_repeats, policy):
     width = _ci_width(group, metric)
     rate_width = _ci_width(group, rate)
-    return (group.get("valid_repeats", 0) >= minimum_repeats and group.get("verified_selection_eligible") is True
+    sfu_positive = (group.get("workload") not in SFU_WORKLOADS or
+                    (metric == "paired_active_reference_pj_per_instruction"
+                     and group.get("sfu_reference_delta_positive_optimum_eligible") is True
+                     and isinstance(group.get("ci95", {}).get(metric), list)
+                     and len(group["ci95"][metric]) == 2 and (number(group["ci95"][metric][0]) or 0) > 0))
+    return (sfu_positive and group.get("valid_repeats", 0) >= minimum_repeats and group.get("verified_selection_eligible") is True
             and number(group.get(metric)) is not None and group[metric] >= 0
             and width is not None and width <= policy.maximum_relative_ci_width
             and rate_width is not None and rate_width <= policy.maximum_relative_ci_width)
@@ -123,6 +134,13 @@ def _eligibility_reasons(group, objective, metric, rate, minimum_repeats, policy
     if number(group.get(metric)) is None: reasons.append("Energy value is unavailable")
     elif group[metric] < 0: reasons.append("Negative operational contrast is diagnostic only")
     if objective != "total" and group.get(objective + "_eligible") is not True: reasons.append("Matched baseline or balanced paired reference is unqualified")
+    if group.get("workload") in SFU_WORKLOADS:
+        if objective != "paired_active_reference":
+            reasons.append("Board total and idle increment are diagnostics; direct SFU results use the paired register-loop contrast")
+        elif group.get("sfu_reference_delta_positive_optimum_eligible") is not True:
+            reasons.append("SFU contrast needs a qualified matched reference and a repeat interval strictly above zero to qualify as an energy candidate")
+        elif not isinstance(group.get("ci95", {}).get(metric), list) or len(group["ci95"][metric]) != 2 or (number(group["ci95"][metric][0]) or 0) <= 0:
+            reasons.append("A signed contrast whose interval reaches zero is diagnostic only")
     return reasons
 
 
@@ -152,29 +170,40 @@ def _plateau(groups, rate, fraction, minimum_repeats, policy):
 
 
 def _nonlinear_launch(group):
-    contract = group.get("nonlinear_contract") or {}
+    contract = _input_contract(group)
     geometry = group.get("resource_geometry") or {}
-    return {"input_elements": contract.get("input_elements"),
+    return {"input_elements": _input_q(group),
+            **({"sfu_lanes": contract.get("sfu_lanes"), "sfu_chains": contract.get("sfu_chains"),
+                "q_scope": "active scalar register lanes, not function output elements"} if group.get("workload") in SFU_WORKLOADS else {}),
             "grid_mode": contract.get("grid_mode"),
             "blocks": geometry.get("blocks"), "threads": geometry.get("threads"),
             "block_completion_count_source": contract.get("block_completion_count_source")}
 
 
+def _input_contract(group):
+    return group.get("sfu_contract" if group.get("workload") in SFU_WORKLOADS else "nonlinear_contract") or {}
+
+
+def _input_q(group):
+    return _input_contract(group).get("sfu_lanes" if group.get("workload") in SFU_WORKLOADS else "input_elements")
+
+
 def _input_curve_signature(group):
     """Compare Q only; never use this signature for energy aggregation."""
-    contract = group.get("nonlinear_contract") or {}
-    if (group.get("workload") not in NONLINEAR_WORKLOADS or contract.get("grid_mode") != "auto"
-            or contract.get("math_implementation") != "cuda_fp32_q_grid_v2"
+    sfu = group.get("workload") in SFU_WORKLOADS
+    contract = _input_contract(group)
+    if (group.get("workload") not in NONLINEAR_WORKLOADS | SFU_WORKLOADS or contract.get("grid_mode") != "auto"
+            or contract.get("math_implementation") != ("ptx_approx_register_v1" if sfu else "cuda_fp32_q_grid_v2")
             or not group.get("clock_comparison_controlled")):
         return None
-    q = number(contract.get("input_elements"))
+    q = number(_input_q(group))
     if q is None or q <= 0 or q != int(q):
         return None
-    variable = {"input_elements", "working_set_bytes", "blocks"}
+    variable = {"input_elements", "sfu_lanes", "working_set_bytes", "blocks"}
     stratum = component_stratum(group)
     stratum["experiment_contract"] = {k: v for k, v in (group.get("experiment_contract") or {}).items() if k not in variable}
     return canonical({**stratum,
-        "nonlinear_contract": {k: v for k, v in contract.items() if k not in variable},
+        "sfu_contract" if sfu else "nonlinear_contract": {k: v for k, v in contract.items() if k not in variable},
         "config": {k: v for k, v in group.get("config", {}).items() if k not in variable | {
             "clock_selection_policy", "clock_selection_reasons"}},
         "resource_geometry": {k: v for k, v in (group.get("resource_geometry") or {}).items() if k != "blocks"}})
@@ -188,16 +217,16 @@ def _input_size_plateau(candidate, peers, objective, metric, rate, fraction, min
     """
     observed = [g for g in peers if g.get("valid_repeats", 0) >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
     peak = max((g[rate] for g in observed), default=None)
-    top = sorted({g["nonlinear_contract"]["input_elements"] for g in observed})[-policy.minimum_resource_levels:]
+    top = sorted({_input_q(g) for g in observed})[-policy.minimum_resource_levels:]
     selected = []
     for q in top:
-        accepted = [g for g in observed if g["nonlinear_contract"]["input_elements"] == q
+        accepted = [g for g in observed if _input_q(g) == q
                     and _qualified(g, metric, rate, minimum_repeats, policy)
                     and not _eligibility_reasons(g, objective, metric, rate, minimum_repeats, policy)]
         if accepted:
             selected.append(max(accepted, key=lambda g: (g[rate], g["group_id"])))
     rates = [g[rate] for g in selected]
-    selected_q = (candidate.get("nonlinear_contract") or {}).get("input_elements")
+    selected_q = _input_q(candidate)
     spread = (max(rates) - min(rates)) / max(rates) if rates else None
     stable = (len(top) >= policy.minimum_resource_levels and len(selected) == len(top) and selected_q in top
               and peak is not None and min(rates) >= fraction * peak and spread <= policy.plateau_tolerance_fraction)
@@ -205,8 +234,10 @@ def _input_size_plateau(candidate, peers, objective, metric, rate, fraction, min
             "curve_id": hashlib.sha256(_input_curve_signature(candidate).encode()).hexdigest()[:12],
             "reason": "The selected Q lies in the largest tested Q levels with precise, verified near-peak throughput" if stable else
                       f"The selected Q must belong to the {policy.minimum_resource_levels} largest observed Q levels, each qualified and stable near the complete matching-curve peak",
-            "resource_axis": "input elements Q at fixed threads, clocks, iterations and function definition",
+            "resource_axis": "active register lanes Q at fixed threads, chains, clocks, iterations and SFU primitive" if candidate.get("workload") in SFU_WORKLOADS else
+                             "input elements Q at fixed threads, clocks, iterations and function definition",
             "input_elements_levels": top, "selected_input_elements": selected_q,
+            **({"sfu_lanes_levels": top, "selected_sfu_lanes": selected_q} if candidate.get("workload") in SFU_WORKLOADS else {}),
             "group_ids": [g["group_id"] for g in selected], "throughputs": rates,
             "observed_peak": peak, "relative_throughput_spread": spread,
             "hardware_saturation_proven": False,
@@ -218,7 +249,7 @@ def _input_scaling_rows(groups, curves, rate, suffix, minimum_repeats, policy):
     result = []
     for signature in signatures:
         rows = []
-        for group in sorted(curves[signature], key=lambda g: (g["nonlinear_contract"]["input_elements"], g["group_id"])):
+        for group in sorted(curves[signature], key=lambda g: (_input_q(g), g["group_id"])):
             reasons = {o: _eligibility_reasons(group, o, o + "_" + suffix, rate, minimum_repeats, policy) for o in OBJECTIVES}
             rows.append({"group_id": group["group_id"], **_nonlinear_launch(group),
                 "requested_graphics_mhz": group["config"].get("graphics_clock_mhz"),
@@ -232,7 +263,7 @@ def _input_scaling_rows(groups, curves, rate, suffix, minimum_repeats, policy):
         result.append({"curve_id": hashlib.sha256(signature.encode()).hexdigest()[:12],
                        "signature": json.loads(signature), "rows": rows})
     return {"curves": result,
-            "scope": "Each curve holds GPU, binary, measurement/input definition, requested fixed clocks, threads and iterations constant; only Q changes. Energies and recommendations remain separate per Q. Stable throughput is not proof of hardware saturation."}
+            "scope": "Each curve holds GPU, binary, measurement/input definition, requested fixed clocks, threads, chains and iterations constant; only Q changes. Q is active register lanes for direct SFU and input elements for complete functions. Energies and recommendations remain separate per Q. Stable throughput is not proof of hardware saturation."}
 
 
 def _plan_coverage(summary, plan):
@@ -379,6 +410,15 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "tensor_dense_peak_fraction": group.get("tensor_utilization_vs_dense_clock_peak"),
                 "measurement_diagnostics": group.get("measurement_diagnostics"),
                 "nonlinear_launch": _nonlinear_launch(group) if workload in NONLINEAR_WORKLOADS else None,
+                "sfu_launch": _nonlinear_launch(group) if workload in SFU_WORKLOADS else None,
+                "sfu_reference_delta": {"measurement_valid": group.get("sfu_reference_delta_measurement_valid"),
+                    "positive_optimum_eligible": group.get("sfu_reference_delta_positive_optimum_eligible"),
+                    "ci_crosses_zero": group.get("sfu_reference_delta_ci_crosses_zero"),
+                    "signed_pj_per_instruction": group.get("sfu_reference_delta_pj_per_instruction"),
+                    "issues": group.get("sfu_reference_delta_issues"),
+                    "uncertainty": group.get("sfu_reference_delta_uncertainty"),
+                    "hardware_attribution_proven": False} if workload in SFU_WORKLOADS else None,
+                "sfu_reference_diagnostics": group.get("sfu_reference_delta_diagnostics"),
                 "row_width": (group.get("nonlinear_contract") or {}).get("row_width"),
                 "pj_per_row": {o: group.get(o + "_pj_per_row") for o in OBJECTIVES},
                 "config": cfg})
@@ -431,6 +471,10 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
         tagged = [g for rows in clock_buckets.values() for g in rows]
         for objective in OBJECTIVES:
             metric = objective + "_" + u["energy_suffix"]
+            if workload in SFU_WORKLOADS and objective != "paired_active_reference":
+                recommendations.append({"objective": objective, "status": "diagnostic_only", "group_id": None,
+                    "reason": "Board total and idle increment are not direct SFU energy results; the primary estimator is the signed matched register-loop contrast"})
+                continue
             eligible = [g for g in candidates[objective] if observed_peak is not None and g[rate] >= fraction * observed_peak]
             if not eligible:
                 recommendations.append({"objective": objective, "status": "no_qualified_candidate", "group_id": None,
@@ -442,6 +486,8 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             if coverage["status"] != "complete" or wc.get("status") not in ("complete", "complete_with_rejections"):
                 reasons.append("planned coverage is incomplete or unknown")
             if coverage.get("study_design") != "energy_sweep": reasons.append("a complete energy-sweep plan is required")
+            if workload in SFU_WORKLOADS and _input_contract(winner).get("grid_mode") != "auto":
+                reasons.append("a Q-derived automatic grid is required; fixed-grid SFU results remain diagnostic or provisional")
             curve = _input_curve_signature(winner)
             plateau = (_input_size_plateau(winner, input_curves[curve], objective, metric, rate, fraction, minimum_repeats, policy)
                        if curve is not None else clock["plateau"])
@@ -470,17 +516,21 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "reason": "The lowest own-clock candidate falls below the full-sweep throughput threshold" if own and observed_peak and own[rate] < fraction * observed_peak else "The lowest own-clock candidate meets the full-sweep throughput threshold" if own else "No qualified own-clock candidate",
                 "scope": "Same count/profile/repeat/CI/geometry gates and own-clock throughput bar; comparing the added full-sweep throughput constraint, not correcting energy or proving saturation"})
         components.append({"component_id": component_id, "stratum": stratum, "gpu_name": groups[0].get("gpu_name"), "units": u,
+            "primary_objective": "paired_active_reference" if workload in SFU_WORKLOADS else "total",
+            "primary_estimator": "(treatment mean power - matched register-loop control mean power) / treatment scalar SFU instruction rate" if workload in SFU_WORKLOADS else None,
             "trial_counts": dict(Counter("valid" if analyzed[i].get("valid") else "invalid" for g in groups for i in g["trial_ids"] if i in analyzed)),
             "points": point_rows, "clocks": clocks, "observed_peak": observed_peak, "recommendations": recommendations,
             "energy_selection_diagnostics": selection_diagnostics,
             "input_scaling": _input_scaling_rows(groups, input_curves, rate, u["energy_suffix"], minimum_repeats, policy),
             "profiler_evidence": evidence, "latency_points": latency,
-            "correctness_scope": "distributed CPU-double output samples before/after measurement; not exhaustive" if workload in NONLINEAR_WORKLOADS else
+            "correctness_scope": "native scalar SFU instruction retention and target-path evidence; register-loop contrast is not isolated physical SFU rail energy" if workload in SFU_WORKLOADS else
+                                 "distributed CPU-double output samples before/after measurement; not exhaustive" if workload in NONLINEAR_WORKLOADS else
                                  "finite output samples and issued-operation accounting; full mathematical reference not established" if workload in TENSOR else
                                  "issued addresses/counts and path evidence; no physical partition identity or exhaustive bytewise output proof",
             "measurement_example": _representative_trace(groups, analyzed, raw),
             "interpretation": "dependent-load latency map; no near/far or energy optimum" if workload == "l2_latency" else
                               "active issue-control reference; no component energy optimum" if workload == "control" else
+                              "signed treatment/control contrast per scalar SFU instruction; negative or zero-crossing contrasts remain diagnostics, and board total/idle are separate diagnostics" if workload in SFU_WORKLOADS else
                               "measured whole-device energy of the stated implementation; component rail energy is not isolated"})
     return {"schema_version": 1, "policy": {**asdict(policy), "throughput_fraction": fraction, "minimum_repeats": minimum_repeats,
               "minimum_geometries": minimum_geometries}, "coverage": coverage, "components": components,
@@ -491,4 +541,5 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                        "Compare the same energy objective and denominator. Total/idle ratios and replay traffic amplification diagnose differences; they do not rescale the measured energy.",
                        "A resource plateau is empirical evidence; it does not prove hardware saturation or pure component energy.",
                        "Nonlinear auto-grid candidates use matching Q-scaling evidence; input-size stability does not prove SFU or GPU saturation, and energy is never pooled across Q.",
+                       "Direct SFU results use a signed matched register-loop power contrast per scalar instruction. Different execution durations or register use limit physical attribution; total and idle estimates are board diagnostics.",
                        "Factory default means the advertised fixed clock pair; incoming driver policy is a separate reference."]}

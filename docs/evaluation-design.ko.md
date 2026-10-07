@@ -75,6 +75,7 @@ blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 �
 | HBM | pJ/logical bit, logical GB/s | read/write 방향의 DRAM/logical ratio·L2 hit·sector inflation·finite footprint | memory별 SM clock 공급능력 plateau, replay DRAM rate는 별도 진단 | memory×SM energy matrix, bandwidth/energy, 조건·품질 표 |
 | L2 locality | dependent cycles/access | admitted SM·offset·loads/cycles, L2/fabric counter는 별도 근거 필요 | concurrent blocks·loop overhead·온도/clock; energy optimum으로 선택하지 않음 | clock/geometry별 SM×offset 지도; near/far label 없음 |
 | EXP/TANH/SiLU | pJ/element, Gelement/s | 전후 분산 CPU double sample, complete output element/epoch, 표준 math·SFU activity·spill | auto grid의 Q scaling과 Q별 geometry/clock 비교, 메모리 비용 포함 | 함수·Q별 독립 그림, Q-scaling 그림·표, 수치 검증 표 |
+| Native register SFU | 주 결과는 SFU 없는 register-loop control 대비 pJ/scalar instruction | Native opcode·warp/scalar count 구분, SHA/architecture/chain에 연결한 raw SASS 재검사, hot-loop memory·spill 부재, one-step 수치 검증 | Q·threads·chains·iterations, 양 arm resource/rate 차이, loop 길이 amortization; 물리 SFU rail 분리는 주장하지 않음 | Signed 차분·CI·Q scaling; 음수/zero-crossing은 표시하되 최적값 선정 제외, 전체/idle은 진단만 |
 | RMSNorm/Softmax | pJ/element와 pJ/row | 위 조건 + row count/width, RMS epsilon/gamma, stable max/sum 및 Softmax 행 합 | 행 너비별 성능·에너지; `pJ/row = width × pJ/element` | 행 너비별 독립 그림과 row 단가 표 |
 | Control / paired arm | active reference 전력과 signed contrast | 같은 process/context·geometry·clock·온도·cap, AB/BA 균형·완료 epoch | matching 실패 시 contrast 선택 제외 | 전력/온도 trace와 order/quality; component 단가로 선택하지 않음 |
 
@@ -134,6 +135,13 @@ write/copy residency 판정이 미확정이면 해당 에너지는 보존하지�
 전체 에너지, 승인된 idle operational increment, paired active-reference
 contrast를 별도로 평가한다. 차감 결과로 전체 에너지를 대체하지 않는다.
 음의 contrast는 그래프/표에 남기지만 에너지 최소 후보에서는 제외한다.
+
+Register SFU 실험의 주 결과는 `sfu_reference_delta_pj_per_instruction`이다.
+`register_loop_without_sfu` control과의 `ΔP / treatment instruction rate`를 사용하며
+idle만 뺀 값을 주 결과로 삼지 않는다. 측정 가능한 signed 차분과 양의 효율 후보
+자격을 구분한다. 95% CI의 하한이 0 이하이면 양의 SFU 단가를 확인한 후보로
+선정하지 않는다. 전체 GPU/idle objective는 진단으로만 제공하며 SFU 추천값을
+생성하지 않는다. 자세한 계약은 [SFU register 실험](sfu-register-experiments.ko.md)에 있다.
 
 Factory default와 exact 1110은 같은 input·seed·geometry·환경의 reference와
 비교한다. 1110은 후보와 같은 memory domain을 사용한다. reference가 유일하지

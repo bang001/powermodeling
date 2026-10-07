@@ -1,5 +1,9 @@
 # 비선형 함수의 에너지 실험
 
+이 문서는 global 입출력을 포함한 **전체 함수 비용**을 다룬다. SFU 기본 명령의
+register-resident 반복과 대응 control의 차분은 별도
+[SFU register 실험](sfu-register-experiments.ko.md)을 사용한다.
+
 EXP, TANH, SiLU, RMSNorm, Softmax를 `powerbench`의 독립 workload로 측정한다.
 현재 구현은 **FP32 입력·출력, CUDA 표준 math, 실제 global load/store를 포함한
 완전한 함수 적용**이다. `--use_fast_math`는 사용하지 않는다. FP16/BF16,

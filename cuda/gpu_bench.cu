@@ -36,6 +36,10 @@ constexpr int kMaxAccumulators = 8;
 bool nonlinear_workload(const std::string& name) {
   return name == "exp" || name == "tanh" || name == "silu" || name == "rmsnorm" || name == "softmax";
 }
+bool sfu_workload(const std::string& name) {
+  return name == "sfu_ex2" || name == "sfu_lg2" || name == "sfu_rcp" ||
+    name == "sfu_rsqrt" || name == "sfu_sqrt" || name == "sfu_tanh";
+}
 
 void check_cuda(cudaError_t code, const char* where) {
   if (code != cudaSuccess)
@@ -81,9 +85,12 @@ struct Options {
   uint64_t offset_bytes = 0, seed = 1;
   std::string workload = "tensor", access = "read", reference_order = "AB";
   std::string grid_mode = "auto";
+  uint64_t sfu_lanes = 262144;
+  int sfu_chains = 4;
   std::vector<unsigned> sm_ids;
   bool describe = false, profile_region = false, paired_reference = false;
   bool blocks_explicit = false, grid_mode_explicit = false;
+  bool sfu_options_explicit = false;
 };
 
 uint64_t parse_u64(const std::string& value, const char* flag) {
@@ -106,18 +113,21 @@ double parse_time(const std::string& value, const char* flag) {
 }
 void usage() {
   std::cout << "powerbench --describe [--device N]\n"
-    "powerbench --workload tensor|gemm|l1|l2|l2_latency|hbm|control|exp|tanh|silu|rmsnorm|softmax [options]\n"
+    "powerbench --workload tensor|gemm|l1|l2|l2_latency|hbm|control|exp|tanh|silu|rmsnorm|softmax|sfu_ex2|sfu_lg2|sfu_rcp|sfu_rsqrt|sfu_sqrt|sfu_tanh [options]\n"
     "  --device N --seconds 10 --warmup-seconds 3 --idle-seconds 6\n"
     "  --blocks N --threads 256 --iterations N --tensor-accumulators 1..8\n"
     "  --batch-launches N (default 16 microkernels, 1 GEMM)\n"
     "  --fixed-batches N --warmup-batches N (profiler mode; override timed loops)\n"
     "  --profile-region (cudaProfilerStart/Stop bracket measure only; suppresses paired reference)\n"
-    "  --paired-reference --reference-order AB|BA (A=issue-loop reference, B=treatment)\n"
+    "  --paired-reference --reference-order AB|BA (A=active reference, B=treatment)\n"
     "  --working-set-bytes N --stride-elements N --offset-bytes N\n"
     "  --access read|write|copy --sm-ids 0,1,... --seed N\n"
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
     "  --row-width 1024 (RMSNorm/Softmax, FP32 full row operations)\n"
-    "  --grid-mode auto|fixed (nonlinear; default auto, Q=working-set-bytes/4)\n"
+    "  --grid-mode auto|fixed (nonlinear/SFU; default auto)\n"
+    "  --sfu-lanes 262144 --sfu-chains 1|4|8 (register SFU; iterations=16384, batch-launches=1)\n"
+    "Register SFU hot loops have no global/shared/local load/store instructions; one final hash store/lane.\n"
+    "Native SFU TANH requires compute capability >=7.5; EX2/LG2 use base2.\n"
     "Memory stride is in 32-bit words; footprint is total input bytes.\n"
     "L1/L2/HBM read issues one scalar load per thread/iteration with one sum32; default iterations=4096.\n"
     "Write/copy keeps four accesses per thread/iteration; default iterations=1024.\n"
@@ -139,6 +149,8 @@ Options parse_options(int argc, char** argv) {
     if (flag == "--device") o.device = parse_int(value, flag.c_str());
     else if (flag == "--blocks") { o.blocks = parse_int(value, flag.c_str()); o.blocks_explicit = true; }
     else if (flag == "--grid-mode") { o.grid_mode = value; o.grid_mode_explicit = true; }
+    else if (flag == "--sfu-lanes") { o.sfu_lanes = parse_u64(value, flag.c_str()); o.sfu_options_explicit = true; }
+    else if (flag == "--sfu-chains") { o.sfu_chains = parse_int(value, flag.c_str()); o.sfu_options_explicit = true; }
     else if (flag == "--threads") o.threads = parse_int(value, flag.c_str());
     else if (flag == "--row-width") {
       o.row_width = parse_int(value, flag.c_str());
@@ -184,7 +196,7 @@ Options parse_options(int argc, char** argv) {
   if (o.offset_bytes % 4 || o.working_set_bytes % 4) throw std::runtime_error("memory offset/footprint must be multiples of 4 bytes");
   if (o.iterations > (1ULL << 32)) throw std::runtime_error("--iterations must be <= 2^32");
   if (o.batch_launches > 65536) throw std::runtime_error("--batch-launches must be <= 65536");
-  if (o.workload != "tensor" && o.workload != "gemm" && o.workload != "l1" && o.workload != "l2" && o.workload != "l2_latency" && o.workload != "hbm" && o.workload != "control" && !nonlinear_workload(o.workload))
+  if (o.workload != "tensor" && o.workload != "gemm" && o.workload != "l1" && o.workload != "l2" && o.workload != "l2_latency" && o.workload != "hbm" && o.workload != "control" && !nonlinear_workload(o.workload) && !sfu_workload(o.workload))
     throw std::runtime_error("unknown workload " + o.workload);
   if (o.access != "read" && o.access != "write" && o.access != "copy") throw std::runtime_error("unknown memory access " + o.access);
   if (o.workload == "l1" && o.access != "read") throw std::runtime_error("L1 global-store/copy attribution is unsupported; use L1 read");
@@ -199,9 +211,14 @@ Options parse_options(int argc, char** argv) {
   if (nonlinear_workload(o.workload) && (!o.sm_ids.empty() || o.offset_bytes || o.stride_elements != 1 || o.access != "read"))
     throw std::runtime_error("nonlinear workloads require a full grid, offset=0, stride=1 and access=read");
   if (o.grid_mode != "auto" && o.grid_mode != "fixed") throw std::runtime_error("--grid-mode must be auto or fixed");
-  if (o.grid_mode_explicit && !nonlinear_workload(o.workload)) throw std::runtime_error("--grid-mode applies only to nonlinear workloads");
-  if (nonlinear_workload(o.workload) && o.grid_mode == "fixed" && (!o.blocks_explicit || o.blocks <= 0))
-    throw std::runtime_error("fixed nonlinear grid requires explicit positive --blocks");
+  if (o.grid_mode_explicit && !nonlinear_workload(o.workload) && !sfu_workload(o.workload)) throw std::runtime_error("--grid-mode applies only to nonlinear/SFU workloads");
+  if ((nonlinear_workload(o.workload) || sfu_workload(o.workload)) && o.grid_mode == "fixed" && (!o.blocks_explicit || o.blocks <= 0))
+    throw std::runtime_error("fixed nonlinear/SFU grid requires explicit positive --blocks");
+  if (!o.sfu_lanes || (o.sfu_chains != 1 && o.sfu_chains != 4 && o.sfu_chains != 8))
+    throw std::runtime_error("--sfu-lanes must be positive and --sfu-chains must be 1, 4 or 8");
+  if (o.sfu_options_explicit && !sfu_workload(o.workload)) throw std::runtime_error("--sfu-lanes/--sfu-chains apply only to register SFU workloads");
+  if (sfu_workload(o.workload) && (!o.sm_ids.empty() || o.working_set_bytes || o.offset_bytes || o.stride_elements != 1 || o.access != "read"))
+    throw std::runtime_error("register SFU uses --sfu-lanes, no global input buffer, SM filter, offset, stride or memory access mode");
   return o;
 }
 
@@ -531,7 +548,10 @@ size_t checked_size(uint64_t n, uint64_t unit, const char* name) {
   return size_t(n);
 }
 
+#include "sfu.cuh"
+
 void experiment(Options o, const cudaDeviceProp& p) {
+  if (sfu_workload(o.workload)) { experiment_sfu(o, p); return; }
   if (o.threads > p.maxThreadsPerBlock) throw std::runtime_error("thread count exceeds this device limit");
   if (p.major < 7) throw std::runtime_error("benchmark requires compute capability >= 7.0");
   const bool nonlinear = nonlinear_workload(o.workload);

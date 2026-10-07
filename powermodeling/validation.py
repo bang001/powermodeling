@@ -6,8 +6,10 @@ Missing/unsupported counters are unknown. Profiler replay is never energy data.
 from dataclasses import asdict, dataclass
 import math
 import statistics
+import re
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, Q_GRID_MATH_IMPLEMENTATION, Q_GRID_IMPLEMENTATION_VERSION, count_issues
 from .memory import VERSIONS as MEMORY_IMPLEMENTATION_VERSIONS, count_issues as memory_count_issues
+from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, count_issues as sfu_count_issues
 
 
 @dataclass(frozen=True)
@@ -117,7 +119,7 @@ def _metrics(rows):
             errors.append(f"duplicate_counter:{metric}")
             values[metric] = None
             continue
-        expected = "sector" if metric in (L1_SECTORS, L1_HITS, L1_MISSES, L2_READ, L2_READ_HITS, L2_WRITE, LOCAL_LOAD, LOCAL_STORE) else "request" if metric == L1_REQUESTS else "inst" if metric in TENSOR_INSTRUCTIONS else "second" if metric == DURATION else "cycle/second" if metric == SM_HZ else "byte" if metric in (DRAM_READ, DRAM_WRITE) else "%" if str(metric).endswith((".pct", "pct_of_peak_sustained_active", "pct_of_peak_sustained_elapsed")) else None
+        expected = "sector" if metric in (L1_SECTORS, L1_HITS, L1_MISSES, L2_READ, L2_READ_HITS, L2_WRITE, LOCAL_LOAD, LOCAL_STORE) else "request" if metric == L1_REQUESTS else "inst" if metric in TENSOR_INSTRUCTIONS + SFU_INSTRUCTIONS else "second" if metric == DURATION else "cycle/second" if metric == SM_HZ else "byte" if metric in (DRAM_READ, DRAM_WRITE) else "%" if str(metric).endswith((".pct", "pct_of_peak_sustained_active", "pct_of_peak_sustained_elapsed")) else None
         if expected and unit != expected:
             errors.append(f"counter_unit_mismatch:{metric}:{unit}")
             value = None
@@ -152,6 +154,54 @@ def _kernel_assessment(rows, evidence, policy):
         derived.update(tensor_instructions=inst, tensor_active_pct=activity,
                        tensor_utilization_scope="elapsed" if metrics.get(TENSOR_ACTIVITY[0]) is not None else "active" if activity is not None else "unknown")
         if workload == "gemm": derived["component_scope"] = "GEMM includes memory and auxiliary work; tensor path verified, pure tensor energy not isolated"
+    elif workload in SFU_WORKLOADS:
+        from .sfu_sass import validate_certificate
+        result = evidence.get("profile_benchmark") or {}
+        count_problems = sfu_count_issues(result, workload)
+        _check(checks, "sfu_profile_count_contract", count_problems, lambda v: not v,
+               "exact completed scalar-lane SFU instruction counts and one-step primitive correctness")
+        _check(checks, "single_sfu_profile_launch", _number(result.get("kernel_launches")), lambda v: v == 1,
+               "exactly one measured register SFU target kernel")
+        kernel_name = rows[0].get("kernel") or ""
+        specialization = re.search(r"sfu_register_kernel\s*<\s*(\d+)\s*,\s*(false|true|0|1)\s*,\s*(\d+)\s*>", kernel_name)
+        if not specialization:
+            specialization = re.search(r"sfu_register_kernelILi(\d+)ELb([01])ELi(\d+)E", kernel_name)
+        op_index = {"sfu_ex2": 0, "sfu_tanh": 1, "sfu_rsqrt": 2, "sfu_rcp": 3, "sfu_lg2": 4, "sfu_sqrt": 5}[workload]
+        identity = [int(specialization[1]), specialization[2] in ("true", "1"), int(specialization[3])] if specialization else None
+        _check(checks, "sfu_kernel_specialization", identity,
+               lambda v: v == [op_index, False, result.get("sfu_chains")],
+               "native opcode, treatment specialization and independent chain count match")
+        expected_warp_instructions = None
+        if not count_problems:
+            expected_warp_instructions = (result["kernel_launches"] * math.ceil(result["sfu_lanes"] / 32)
+                                          * result["iterations_per_launch"] * result["sfu_chains"])
+        instruction_counts = [metrics[name] for name in SFU_INSTRUCTIONS if metrics.get(name) is not None]
+        _check(checks, "sfu_warp_instruction_count", instruction_counts if instruction_counts and expected_warp_instructions is not None else None,
+               lambda values: all(math.isclose(v, expected_warp_instructions, rel_tol=1e-6, abs_tol=1e-6) for v in values),
+               "SFU warp instructions equal launches × ceil(active lanes/32) × iterations × chains; never use this warp count as the scalar energy denominator")
+        provenance = evidence.get("profile_provenance") or {}
+        devices = provenance.get("observed_device_records") or []
+        capabilities = []
+        for device in devices:
+            cc = device.get("cc")
+            if cc is None and type(device.get("compute_capability_major")) is int and type(device.get("compute_capability_minor", 0)) is int:
+                cc = str(device["compute_capability_major"]) + "." + str(device.get("compute_capability_minor", 0))
+            capabilities.append(cc)
+        certificate = evidence.get("sfu_sass_evidence")
+        certificate_issues = None
+        if certificate is not None and capabilities and all(cc is not None for cc in capabilities):
+            certificate_issues = sorted({issue for cc in capabilities for issue in validate_certificate(
+                certificate, provenance.get("benchmark_sha256"), cc, workload, result.get("sfu_chains"))})
+        _check(checks, "sfu_register_sass_contract", certificate_issues, lambda v: not v,
+               "recomputed binary/architecture/opcode/chain-bound SASS proves retained native instructions, zero hot-loop memory, no spills and target-free control")
+        activity_counter = next((name for name in SFU_ACTIVITY if metrics.get(name) is not None), None)
+        derived.update(sfu_instructions=instruction_counts[0] if instruction_counts else None,
+                       sfu_instruction_counter_unit="warp instructions, not scalar lane operations",
+                       expected_sfu_warp_instructions=expected_warp_instructions,
+                       scalar_sfu_instructions=result.get("sfu_instructions"),
+                       sfu_active_pct=metrics.get(activity_counter), sfu_activity_counter=activity_counter,
+                       sfu_activity_scope="elapsed" if activity_counter and activity_counter.endswith("_elapsed") else "active" if activity_counter else "unknown",
+                       component_scope="register-resident native SFU primitive; paired board-power contrast is not isolated physical SFU rail energy")
     elif workload in NONLINEAR_WORKLOADS:
         result = evidence.get("profile_benchmark") or {}
         inst = next((metrics.get(m) for m in SFU_INSTRUCTIONS if metrics.get(m) is not None), None)
@@ -254,12 +304,12 @@ def assess_profile(evidence, policy=None):
         if isinstance(row, dict): groups.setdefault((row.get("id"), row.get("kernel")), []).append(row)
     kernels = [_kernel_assessment(rows, evidence, policy) for rows in groups.values()]
     checks = [check for kernel in kernels for check in kernel["checks"]]
-    if evidence.get("workload") in {"l1", "l2", "l2_latency", "hbm"} | NONLINEAR_WORKLOADS:
+    if evidence.get("workload") in {"l1", "l2", "l2_latency", "hbm"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS:
         # Raw launch IDs bind the one profiled custom launch to its payload.
         # An extra otherwise-valid kernel must not silently reuse that payload.
         ids = [int(str(kernel["id"])) for kernel in kernels if str(kernel.get("id")).isdecimal()]
         ids_known = bool(kernels) and len(ids) == len(kernels)
-        prefix = "nonlinear" if evidence.get("workload") in NONLINEAR_WORKLOADS else "memory"
+        prefix = "sfu" if evidence.get("workload") in SFU_WORKLOADS else "nonlinear" if evidence.get("workload") in NONLINEAR_WORKLOADS else "memory"
         _check(checks, prefix + "_profile_launch_id_unique_mapping",
                len(ids) == len(set(ids)) if ids_known else None, bool,
                "each numeric profile launch ID maps to exactly one kernel name")
@@ -362,7 +412,13 @@ def validate_evidence(record, evidence, policy=None):
         effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution",
                             "grid_mode", "input_elements", "block_completion_count_source")
         if record.get("workload") == "rmsnorm": effective_names += ("rms_epsilon", "affine_gamma")
+    if record.get("workload") in SFU_WORKLOADS:
+        effective_names += SFU_CONTRACT_FIELDS
     for name in effective_names:
+        if record.get("workload") in SFU_WORKLOADS and name == "sfu_exponent_base" and name in benchmark and name in measured_benchmark and benchmark[name] is None and measured_benchmark[name] is None:
+            # Non-exponential native primitives explicitly have no exponent base;
+            # the SFU count/math contract independently checks this definition.
+            continue
         if name in ("kernel_implementation_version", "memory_accesses_per_thread_iteration") and benchmark.get(name) is None and measured_benchmark.get(name) is None:
             continue
         if name in benchmark or name in measured_benchmark:
@@ -370,6 +426,8 @@ def validate_evidence(record, evidence, policy=None):
     clocks = provenance.get("requested_clocks") or {}
     actual_clocks = {}
     required_effective = ("blocks", "threads", "iterations_per_launch", "tensor_accumulators") if record.get("workload") == "tensor" else ("gemm_m", "gemm_n", "gemm_k", "iterations_per_launch") if record.get("workload") == "gemm" else ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "access")
+    if record.get("workload") in SFU_WORKLOADS:
+        required_effective = ("blocks", "threads", "paired_reference_context_allocated", *SFU_CONTRACT_FIELDS)
     if record.get("workload") in NONLINEAR_WORKLOADS:
         required_effective += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
         if (measured_benchmark.get("math_implementation") == Q_GRID_MATH_IMPLEMENTATION

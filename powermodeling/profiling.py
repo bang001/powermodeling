@@ -13,6 +13,7 @@ import subprocess
 
 from .planner import benchmark_command
 from .runner import atomic_json
+from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS
 from .validation import (DURATION, DRAM_READ, DRAM_WRITE, L1_HITS, L1_MISSES,
                          L1_REQUESTS, L1_SECTORS, L2_READ, L2_READ_HITS, L2_WRITE,
                          LOCAL_LOAD, LOCAL_STORE, SM_HZ, TENSOR_ACTIVITY,
@@ -73,7 +74,7 @@ def profile_command(ncu, executable, trial, device_index=0, available=None, log_
     if log_file is not None: command += ["--log-file", str(log_file)]
     if report_path is not None: command += ["--export", str(report_path), "--force-overwrite"]
     if trial["workload"] != "gemm":
-        command += ["--kernel-name", "regex:.*(memory_kernel|tensor_kernel|latency_kernel|control_kernel|pointwise_nonlinear_kernel|row_nonlinear_kernel).*", "--launch-count", "1"]
+        command += ["--kernel-name", "regex:.*(memory_kernel|tensor_kernel|latency_kernel|control_kernel|pointwise_nonlinear_kernel|row_nonlinear_kernel|sfu_register_kernel).*", "--launch-count", "1"]
     return command + benchmark_command(executable, trial, device_index, profiling=True)
 
 
@@ -315,6 +316,8 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
     # Application replay emits one result per pass. Require exact deterministic
     # counter-relevant metadata/payload, allowing elapsed timing to differ.
     determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated", "row_width", "elements", "row_evaluations", "math_implementation", "input_precision", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution", "kernel_implementation_version", "memory_accesses_per_thread_iteration", "grid_mode", "input_elements", "block_completion_count_source")
+    if trial["workload"] in SFU_WORKLOADS:
+        determinism_fields += (*SFU_CONTRACT_FIELDS, "sfu_instructions")
     deterministic = bool(benchmarks) and all(all(item.get(k) == benchmarks[0].get(k) for k in determinism_fields) for item in benchmarks)
     context = _profile_context(profile_context, events)
     evidence = {"schema_version": 2, "condition_id": trial["condition_id"], "trial_id": trial_id,
@@ -336,6 +339,22 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
                           "Admission thresholds are configurable project policies, not architecture guarantees.",
                           "Broad aggregate hit rates do not prove operation-specific cache residency.",
                           "Locality requires independent empirical SM/address maps and validated fabric counters."]}
+    if trial["workload"] in SFU_WORKLOADS:
+        certificate = plan.get("sfu_sass_evidence")
+        evidence["sfu_sass_evidence"] = certificate
+        if certificate is not None and devices and benchmarks:
+            from .sfu_sass import select_certificate
+            device = devices[0]
+            cc = device.get("cc")
+            if cc is None and type(device.get("compute_capability_major")) is int:
+                cc = str(device["compute_capability_major"]) + "." + str(device.get("compute_capability_minor", 0))
+            try:
+                # Keep only the raw target/control proof needed by this profile;
+                # a full multi-architecture certificate need not be copied per repeat.
+                evidence["sfu_sass_evidence"] = select_certificate(certificate, cc, trial["workload"], benchmarks[0].get("sfu_chains"))
+            except ValueError as error:
+                # Preserve invalid evidence for an explicit failed assessment.
+                evidence["sfu_sass_selection_error"] = str(error)
     evidence["assessment"] = assess_profile(evidence, policy)
     evidence["validation_policy"] = evidence["assessment"]["policy"]
     path = output / (trial_id + ".evidence.json")
@@ -363,6 +382,7 @@ def attach_verification(record, evidence, policy=None):
     updated = dict(record)
     updated["validation"] = {"memory_target_verified": verified and record["workload"] in ("l1", "l2", "l2_latency", "hbm"),
                              "tensor_instructions_verified": verified and record["workload"] in ("tensor", "gemm"),
+                             "sfu_instructions_verified": verified and record["workload"] in SFU_WORKLOADS,
                              "suitable_verified": verified, "status": assessment["status"], "assessment": assessment,
                              "locality": locality if verified else "unclassified", "profiler_evidence": evidence}
     override = evidence.get("manual_override")

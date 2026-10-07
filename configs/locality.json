@@ -1,5 +1,5 @@
 {
-  "description": "SXM energy sweep from 900 MHz with configurable advertised-clock intervals (default 90 MHz), factory default fixed pair, incoming-policy reference and exact 1110 MHz wherever supported. Inspect plan runtime and evaluation coverage.",
+  "description": "Fixed-clock stride/locality diagnostics with full clock coverage; all experiments are diagnostic and excluded from energy optimum selection. Stride is in 32-bit words, not bytes. SXM energy sweep from 900 MHz with configurable advertised-clock intervals (default 90 MHz), factory default fixed pair, incoming-policy reference and exact 1110 MHz wherever supported. Inspect plan runtime and evaluation coverage.",
   "seconds": 12,
   "warmup_seconds": 3,
   "idle_seconds": 6,
@@ -22,21 +22,23 @@
       "parameters": {
         "blocks": "sm_count*4",
         "threads": 256,
-        "working_set_bytes": "l2_bytes*0.5"
+        "working_set_bytes": "l2_bytes*0.5",
+        "access": "read"
       },
       "grid": {
-        "stride_elements": [
-          1,
-          2,
-          8,
-          32
-        ],
         "offset_bytes": [
           0,
           4096,
           2097152
+        ],
+        "stride_words": [
+          1,
+          2,
+          8,
+          32
         ]
-      }
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l2",
@@ -44,7 +46,9 @@
       "parameters": {
         "blocks": "sm_count*8",
         "threads": 128,
-        "working_set_bytes": "l2_bytes*0.125"
+        "working_set_bytes": "l2_bytes*0.125",
+        "stride_words": 1,
+        "access": "read"
       },
       "grid": {
         "sm_ids": [
@@ -66,7 +70,8 @@
           2097152,
           4194304
         ]
-      }
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l2_latency",
@@ -100,7 +105,8 @@
           2026,
           2027
         ]
-      }
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "hbm",
@@ -108,16 +114,19 @@
       "parameters": {
         "blocks": "sm_count*4",
         "threads": 256,
-        "working_set_bytes": "max(l2_bytes*max(8,stride_elements/2),268435456)"
+        "working_set_bytes": "max(l2_bytes*max(8,stride_elements/2),268435456)",
+        "offset_bytes": 0,
+        "access": "read"
       },
       "grid": {
-        "stride_elements": [
+        "stride_words": [
           1,
           2,
           8,
           32
         ]
-      }
+      },
+      "experiment_role": "diagnostic"
     }
   ],
   "target_form_factor": "SXM",

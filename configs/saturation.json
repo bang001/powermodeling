@@ -1,5 +1,5 @@
 {
-  "description": "SXM energy sweep from 900 MHz with configurable advertised-clock intervals (default 90 MHz), factory default fixed pair, incoming-policy reference and exact 1110 MHz wherever supported. Inspect plan runtime and evaluation coverage.",
+  "description": "SXM energy sweep from 900 MHz with configurable advertised-clock intervals (default 90 MHz), factory default fixed pair, incoming-policy reference and exact 1110 MHz wherever supported. Inspect plan runtime and evaluation coverage. Memory energy candidates use explicit stride_words=1 (4-byte lane spacing) and sector-aligned regions; strided accesses belong to diagnostic plans.",
   "seconds": 12,
   "warmup_seconds": 3,
   "idle_seconds": 6,
@@ -81,7 +81,13 @@
           "blocks*32768",
           "blocks*65536"
         ]
-      }
+      },
+      "parameters": {
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "experiment_role": "energy_characterization"
     },
     {
       "workload": "l2",
@@ -100,13 +106,21 @@
           "l2_bytes*0.75",
           "l2_bytes*1.25"
         ]
-      }
+      },
+      "parameters": {
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "experiment_role": "energy_characterization"
     },
     {
       "workload": "hbm",
       "parameters": {
         "working_set_bytes": "max(l2_bytes*8,268435456)",
-        "seed": 2026
+        "seed": 2026,
+        "stride_words": 1,
+        "offset_bytes": 0
       },
       "grid": {
         "blocks": [
@@ -122,7 +136,8 @@
           "read",
           "copy"
         ]
-      }
+      },
+      "experiment_role": "energy_characterization"
     }
   ],
   "target_form_factor": "SXM",

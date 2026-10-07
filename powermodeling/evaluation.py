@@ -13,6 +13,7 @@ import statistics
 
 from .nonlinear import NONLINEAR_WORKLOADS
 from .sfu import CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, SFU_WORKLOADS
+from .memory import coalesced_read_geometry
 
 TENSOR = {"tensor", "gemm", "fp16_tensor", "tensor_fp16"}
 MEMORY = {"l1", "l2", "hbm"}
@@ -55,8 +56,43 @@ def experiment_contract(workload, benchmark, config):
 
 
 def component_stratum(group):
-    return {key: group.get(key) for key in ("gpu_uuid", "workload", "benchmark_sha256", "measurement_stratum",
-                                            "treatment_design_stratum", "experiment_contract")}
+    return {**{key: group.get(key) for key in ("gpu_uuid", "workload", "benchmark_sha256", "measurement_stratum",
+                                            "treatment_design_stratum", "experiment_contract")},
+            "experiment_role": group.get("experiment_role", "legacy_unspecified")}
+
+
+def energy_role_eligible(group):
+    return group.get("experiment_role", "legacy_unspecified") in ("energy_characterization", "legacy_unspecified")
+
+
+def _memory_read(group):
+    return (group.get("workload") in MEMORY and
+            (group.get("experiment_contract") or {}).get("access", group.get("config", {}).get("access", "read")) == "read")
+
+
+def energy_coalescing_eligible(group):
+    return not _memory_read(group) or group.get("memory_coalescing_energy_eligible") is True
+
+
+def energy_peak_population_eligible(group):
+    """Do not let diagnostic/strided probes define a coalesced energy peak.
+
+    Missing or failed target proof for a structurally coalesced run does not
+    remove its valid rate from the bar. A separately bound sector-ratio failure
+    does establish that the observed traffic is outside this energy population.
+    """
+    if not energy_role_eligible(group):
+        return False
+    if not _memory_read(group):
+        return True
+    geometry = group.get("memory_access_geometry")
+    if not isinstance(geometry, dict):
+        geometry = coalesced_read_geometry({**group.get("config", {}), **(group.get("experiment_contract") or {}),
+                                             **(group.get("resource_geometry") or {})}, group.get("workload"))
+    coalescing = group.get("memory_coalescing") or {}
+    return (geometry.get("energy_eligible") is True and not
+            (coalescing.get("bound_sector_ratio_failure") is True or
+             coalescing.get("status") == "fail" and coalescing.get("profile_binding_verified") is True))
 
 
 def units(workload):
@@ -115,7 +151,8 @@ def _qualified(group, metric, rate, minimum_repeats, policy):
                      and group.get("sfu_reference_delta_positive_optimum_eligible") is True
                      and isinstance(group.get("ci95", {}).get(metric), list)
                      and len(group["ci95"][metric]) == 2 and (number(group["ci95"][metric][0]) or 0) > 0))
-    return (sfu_positive and group.get("valid_repeats", 0) >= minimum_repeats and group.get("verified_selection_eligible") is True
+    return (energy_role_eligible(group) and energy_coalescing_eligible(group) and sfu_positive
+            and group.get("valid_repeats", 0) >= minimum_repeats and group.get("verified_selection_eligible") is True
             and number(group.get(metric)) is not None and group[metric] >= 0
             and width is not None and width <= policy.maximum_relative_ci_width
             and rate_width is not None and rate_width <= policy.maximum_relative_ci_width)
@@ -123,6 +160,10 @@ def _qualified(group, metric, rate, minimum_repeats, policy):
 
 def _eligibility_reasons(group, objective, metric, rate, minimum_repeats, policy):
     reasons = []
+    if not energy_role_eligible(group): reasons.append("Diagnostic experiment role is excluded from energy characterization")
+    if not energy_coalescing_eligible(group):
+        reasons.append("Coalesced memory-read energy evidence is unqualified")
+        reasons.extend((group.get("memory_coalescing") or {}).get("reasons", []))
     if group.get("valid_repeats", 0) < minimum_repeats: reasons.append("Insufficient valid repeats")
     if group.get("target_verified") is not True: reasons.append("Target evidence: " + group.get("ncu_status", "unprofiled"))
     if group.get("count_energy_time_alignment_exact") is not True: reasons.append("Work and energy windows are not exactly aligned")
@@ -145,7 +186,7 @@ def _eligibility_reasons(group, objective, metric, rate, minimum_repeats, policy
 
 
 def _plateau(groups, rate, fraction, minimum_repeats, policy):
-    observed = [g for g in groups if g.get("valid_repeats", 0) >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
+    observed = [g for g in groups if energy_peak_population_eligible(g) and g.get("valid_repeats", 0) >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
     peak = max((g[rate] for g in observed), default=None)
     levels = {}
     for g in observed:
@@ -192,7 +233,7 @@ def _input_curve_signature(group):
     """Compare Q only; never use this signature for energy aggregation."""
     sfu = group.get("workload") in SFU_WORKLOADS
     contract = _input_contract(group)
-    if (group.get("workload") not in NONLINEAR_WORKLOADS | SFU_WORKLOADS or contract.get("grid_mode") != "auto"
+    if (not energy_role_eligible(group) or group.get("workload") not in NONLINEAR_WORKLOADS | SFU_WORKLOADS or contract.get("grid_mode") != "auto"
             or contract.get("math_implementation") != ("ptx_approx_register_v1" if sfu else "cuda_fp32_q_grid_v2")
             or not group.get("clock_comparison_controlled")):
         return None
@@ -215,7 +256,7 @@ def _input_size_plateau(candidate, peers, objective, metric, rate, fraction, min
     Keep unverified or imprecise valid rates in the observed peak and Q levels,
     so dropping a failed high-Q point cannot fabricate a lower stable plateau.
     """
-    observed = [g for g in peers if g.get("valid_repeats", 0) >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
+    observed = [g for g in peers if energy_peak_population_eligible(g) and g.get("valid_repeats", 0) >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
     peak = max((g[rate] for g in observed), default=None)
     top = sorted({_input_q(g) for g in observed})[-policy.minimum_resource_levels:]
     selected = []
@@ -244,6 +285,15 @@ def _input_size_plateau(candidate, peers, objective, metric, rate, fraction, min
             "scope": "Observed input-size stability only; Q-dependent energy values remain separate and SFU or GPU saturation is not established"}
 
 
+def _objective_measurement_valid(group, objective):
+    """Display valid observations independently of energy-winner qualification."""
+    if objective == "total":
+        return group.get("valid_repeats", 0) > 0
+    if group.get("workload") in SFU_WORKLOADS and objective == "paired_active_reference":
+        return group.get("sfu_reference_delta_measurement_valid") is True
+    return group.get(objective + "_eligible") is True
+
+
 def _input_scaling_rows(groups, curves, rate, suffix, minimum_repeats, policy):
     signatures = sorted({key for group in groups if (key := _input_curve_signature(group)) is not None})
     result = []
@@ -256,6 +306,7 @@ def _input_scaling_rows(groups, curves, rate, suffix, minimum_repeats, policy):
                 "requested_memory_mhz": group["config"].get("memory_clock_mhz"),
                 "rate": group.get(rate), "rate_ci95": group.get("ci95", {}).get(rate),
                 "energies": {o: group.get(o + "_" + suffix) for o in OBJECTIVES},
+                "objective_measurement_valid": {o: _objective_measurement_valid(group, o) for o in OBJECTIVES},
                 "energy_ci95": {o: group.get("ci95", {}).get(o + "_" + suffix) for o in OBJECTIVES},
                 "valid_repeats": group.get("valid_repeats", 0), "ncu_status": group.get("ncu_status"),
                 "eligible": {o: not reasons[o] and _qualified(group, o + "_" + suffix, rate, minimum_repeats, policy) for o in OBJECTIVES},
@@ -294,6 +345,7 @@ def _plan_coverage(summary, plan):
             expected_order = (row.get("treatment_protocol") or {}).get("order")
             expected_binary = (plan.get("device") or {}).get("benchmark_sha256")
             bound = (t.get("workload") == workload and (uuid is None or t.get("gpu_uuid") == uuid)
+                     and t.get("experiment_role", "legacy_unspecified") == row.get("experiment_role", "legacy_unspecified")
                      and t.get("repeat_index") == row.get("repeat")
                      and (expected_binary is None or t.get("benchmark_sha256") == expected_binary)
                      and t.get("condition_id") == row.get("condition_id")
@@ -396,7 +448,16 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             # Copy tags into local groups for matched anchor comparisons only.
             group = {**group, "config": {**cfg, "clock_selection_reasons": sorted(set(flags))}}
             widths = {m: _ci_width(group, m) for m in [rate, *(o + "_" + u["energy_suffix"] for o in OBJECTIVES)]}
+            memory_geometry = group.get("memory_access_geometry") or {}
+            coalescing = group.get("memory_coalescing") or {}
             point_rows.append({"group_id": group["group_id"], "requested_graphics_mhz": cfg.get("graphics_clock_mhz"),
+                "experiment_role": group.get("experiment_role", "legacy_unspecified"),
+                "memory_access_geometry": group.get("memory_access_geometry"), "memory_coalescing": group.get("memory_coalescing"),
+                "memory_stride_words": memory_geometry.get("stride_words"),
+                "memory_lane_stride_bytes": memory_geometry.get("lane_stride_bytes"),
+                "memory_observed_sector_efficiency_pct": coalescing.get("observed_sector_efficiency_pct"),
+                "memory_coalescing_energy_eligible": group.get("memory_coalescing_energy_eligible"),
+                "energy_peak_population_eligible": energy_peak_population_eligible(group),
                 "requested_memory_mhz": cfg.get("memory_clock_mhz"), "achieved_graphics_mhz": group.get("graphics_clock_mhz"),
                 "achieved_sm_mhz": group.get("sm_clock_mhz"), "achieved_memory_mhz": group.get("memory_clock_mhz"),
                 "resource_capacity": _capacity(group), "geometry": group.get("resource_geometry"), "anchor_tags": sorted(set(flags)),
@@ -406,6 +467,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "energies": {o: group.get(o + "_" + u["energy_suffix"]) for o in OBJECTIVES},
                 "energy_ci95": {o: group.get("ci95", {}).get(o + "_" + u["energy_suffix"]) for o in OBJECTIVES},
                 "objective_eligible": {o: o == "total" or group.get(o + "_eligible") is True for o in OBJECTIVES},
+                "objective_measurement_valid": {o: _objective_measurement_valid(group, o) for o in OBJECTIVES},
                 "eligibility_reasons": {o: _eligibility_reasons(group, o, o + "_" + u["energy_suffix"], rate, minimum_repeats, policy) for o in OBJECTIVES},
                 "tensor_dense_peak_fraction": group.get("tensor_utilization_vs_dense_clock_peak"),
                 "measurement_diagnostics": group.get("measurement_diagnostics"),
@@ -441,7 +503,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "profile_rates": [t["profile_rates_summary"] for t in ts if t.get("profile_rates_summary")]})
         clocks, candidates = [], defaultdict(list)
         for (gfx, mem), rows in sorted(clock_buckets.items()):
-            observed = [g for g in rows if g["valid_repeats"] >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
+            observed = [g for g in rows if energy_peak_population_eligible(g) and g["valid_repeats"] >= minimum_repeats and (number(g.get(rate)) or 0) > 0]
             peak = max((g[rate] for g in observed), default=None)
             verified = [g for g in observed if g.get("verified_selection_eligible")]
             count = len({canonical(g["resource_geometry"]) for g in verified})
@@ -471,6 +533,10 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
         tagged = [g for rows in clock_buckets.values() for g in rows]
         for objective in OBJECTIVES:
             metric = objective + "_" + u["energy_suffix"]
+            if not energy_role_eligible(groups[0]):
+                recommendations.append({"objective": objective, "status": "diagnostic_only", "group_id": None,
+                    "reason": "Explicit diagnostic experiments are excluded from energy characterization and its observed peak"})
+                continue
             if workload in SFU_WORKLOADS and objective != "paired_active_reference":
                 recommendations.append({"objective": objective, "status": "diagnostic_only", "group_id": None,
                     "reason": "Board total and idle increment are not direct SFU energy results; the primary estimator is the signed matched register-loop contrast"})
@@ -539,6 +605,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                        "Bootstrap intervals measure repeat variation, not sensor calibration accuracy.",
                        "Profiler counter rates use replay busy time and are never energy-run sustained throughput.",
                        "Compare the same energy objective and denominator. Total/idle ratios and replay traffic amplification diagnose differences; they do not rescale the measured energy.",
+                       "Diagnostic experiments and known noncoalesced memory reads cannot define energy optima or their peak. Unknown counter proof for a structurally coalesced run does not lower the observed throughput bar.",
                        "A resource plateau is empirical evidence; it does not prove hardware saturation or pure component energy.",
                        "Nonlinear auto-grid candidates use matching Q-scaling evidence; input-size stability does not prove SFU or GPU saturation, and energy is never pooled across Q.",
                        "Direct SFU results use a signed matched register-loop power contrast per scalar instruction. Different execution durations or register use limit physical attribution; total and idle estimates are board diagnostics.",

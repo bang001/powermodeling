@@ -7,7 +7,10 @@
   "sample_interval_s": 0.05,
   "randomization_seed": 2026,
   "clock_pairs": [
-    {"graphics_mhz": null, "memory_mhz": null}
+    {
+      "graphics_mhz": null,
+      "memory_mhz": null
+    }
   ],
   "target_form_factor": "SXM",
   "paired_reference": true,
@@ -16,44 +19,162 @@
     {
       "workload": "tensor",
       "stage": "launch_overhead",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "tensor_accumulators": 4},
-      "grid": {"iterations": [1024, 8192, 65536], "batch_launches": [1, 16]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "tensor_accumulators": 4
+      },
+      "grid": {
+        "iterations": [
+          1024,
+          8192,
+          65536
+        ],
+        "batch_launches": [
+          1,
+          16
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l1",
       "stage": "launch_overhead",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "blocks*2048"},
-      "grid": {"iterations": [256, 2048, 16384], "batch_launches": [1, 16]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "working_set_bytes": "blocks*2048",
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {
+        "iterations": [
+          256,
+          2048,
+          16384
+        ],
+        "batch_launches": [
+          1,
+          16
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l2",
       "stage": "launch_overhead",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "l2_bytes*0.5"},
-      "grid": {"iterations": [256, 2048, 16384], "batch_launches": [1, 16]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "working_set_bytes": "l2_bytes*0.5",
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {
+        "iterations": [
+          256,
+          2048,
+          16384
+        ],
+        "batch_launches": [
+          1,
+          16
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "hbm",
       "stage": "launch_overhead",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "working_set_bytes": "max(l2_bytes*8,268435456)", "seed": 2026},
-      "grid": {"iterations": [256, 2048, 16384], "batch_launches": [1, 16]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "working_set_bytes": "max(l2_bytes*8,268435456)",
+        "seed": 2026,
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {
+        "iterations": [
+          256,
+          2048,
+          16384
+        ],
+        "batch_launches": [
+          1,
+          16
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "tensor",
       "stage": "tensor_dependency",
-      "parameters": {"threads": 256, "iterations": 8192, "batch_launches": 16},
-      "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4", "sm_count*8"], "tensor_accumulators": [1, 4, 8]}
+      "parameters": {
+        "threads": 256,
+        "iterations": 8192,
+        "batch_launches": 16
+      },
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "tensor_accumulators": [
+          1,
+          4,
+          8
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l1",
       "stage": "l1_residency",
-      "parameters": {"threads": 256, "iterations": 2048, "batch_launches": 16},
-      "grid": {"blocks": ["sm_count", "sm_count*2", "sm_count*4", "sm_count*8"], "working_set_bytes": ["blocks*2048", "blocks*16384"]}
+      "parameters": {
+        "threads": 256,
+        "iterations": 2048,
+        "batch_launches": 16,
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {
+        "blocks": [
+          "sm_count",
+          "sm_count*2",
+          "sm_count*4",
+          "sm_count*8"
+        ],
+        "working_set_bytes": [
+          "blocks*2048",
+          "blocks*16384"
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "gemm",
       "stage": "tensor_reference",
-      "parameters": {"gemm_n": 4096, "gemm_k": 4096, "iterations": 1, "batch_launches": 1},
-      "grid": {"gemm_m": [2048, 4096, 8192]}
+      "parameters": {
+        "gemm_n": 4096,
+        "gemm_k": 4096,
+        "iterations": 1,
+        "batch_launches": 1
+      },
+      "grid": {
+        "gemm_m": [
+          2048,
+          4096,
+          8192
+        ]
+      },
+      "experiment_role": "diagnostic"
     }
   ]
 }

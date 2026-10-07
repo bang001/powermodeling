@@ -74,13 +74,20 @@ epsilon/gamma, grid mode와 구현 버전을 분리한다. locality는
 blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 지도 축으로
 남긴다. 같은 pJ 단위여도 이 정의가 다르면 평균하거나 같은 곡선으로 연결하지 않는다.
 
+메모리 이동 에너지 read의 본 실험은 `stride_words=1`(4 B 간격), 기본 offset 0,
+32 B 정렬된 effective region과 최소 128 B region을 사용한다. 기존
+`stride_elements`는 같은 4 B word 단위의 호환 이름이다. Stride·sector·locality
+진단은 `experiment_role`로 구분해 고정 clock에서도 최적값 후보로 쓰지 않는다.
+기존 raw의 stride 4 조건은 분석 가능하지만 25% sector 효율의 측정을 100% 효율
+기준의 이동 에너지 후보로 인정하지 않는다.
+
 | 컴포넌트 | 주 결과 | 경로·정확성 평가 | 성능과 추가 진단 | 시각화 |
 |---|---|---|---|---|
 | Tensor WMMA | pJ/FLOP, TFLOP/s, FMA=2 | FP16 입력·FP32 누산, Tensor activity, count/epoch, spill; 현재 output 검사는 finite sample이며 완전한 수학 reference는 아님 | blocks/threads/accumulators별 plateau, actual SM MHz 기반 dense ceiling 비율 | clock–성능·에너지, geometry, energy/throughput, dense peak 비율 표 |
 | cuBLAS GEMM | 전체 dense GEMM pJ/FLOP, TFLOP/s | input/output·지원 연산 정의, 실제 Tensor kernel과 보조 kernel/spill, count; finite sample 한계 표시 | m×n×k 증가의 problem-size plateau; vendor 알고리즘 변경 가능, issue-resource plateau와 구분 | shape 정보·clock 곡선·energy/throughput·problem-size 축 |
-| L1 | pJ/logical bit, logical GB/s | global L1 hit·하위 L2/DRAM 이동·carveout·slice·spill | 같은 CTA slice에서 geometry별 성능, actual clock, requested/physical traffic 차이 | memory domain별 clock·energy·resource·NCU admission |
-| L2 | pJ/logical bit, logical GB/s | L2 hit·DRAM 유입·L1 bypass·finite 주소 footprint·spill | footprint/stride/access별 성능; write/copy의 현재 residency 판정 한계 | footprint/stride/access 분리 그림; 누락/미확정 cell 표시 |
-| HBM | pJ/logical bit, logical GB/s | read/write 방향의 DRAM/logical ratio·L2 hit·sector inflation·finite footprint | memory별 SM clock 공급능력 plateau, replay DRAM rate는 별도 진단 | memory×SM energy matrix, bandwidth/energy, 조건·품질 표 |
+| L1 | pJ/logical bit, logical GB/s | global L1 hit·L1 read coalescing·하위 L2/DRAM 이동·carveout·slice·spill | 같은 CTA slice에서 geometry별 성능, actual clock, requested/physical traffic 차이 | memory domain별 clock·energy·resource·NCU admission |
+| L2 | pJ/logical bit, logical GB/s | L2 hit·L2 read coalescing·DRAM 유입·L1 bypass·finite 주소 footprint·spill | footprint/access별 성능과 stride 진단; write/copy의 현재 residency 판정 한계 | footprint/stride/access 분리 그림; 누락/미확정 cell 표시 |
+| HBM | pJ/logical bit, logical GB/s | read/write 방향의 DRAM/logical ratio·L2 hit·L2 read coalescing·finite footprint | memory별 SM clock 공급능력 plateau, replay DRAM rate는 별도 진단 | memory×SM energy matrix, bandwidth/energy, 조건·품질 표 |
 | L2 locality | dependent cycles/access | admitted SM·offset·loads/cycles, L2/fabric counter는 별도 근거 필요 | concurrent blocks·loop overhead·온도/clock; energy optimum으로 선택하지 않음 | clock/geometry별 SM×offset 지도; near/far label 없음 |
 | Native register SFU — 기본 nonlinear | 주 결과는 SFU 없는 register-loop control 대비 pJ/scalar SFU instruction | Native opcode·warp/scalar count 구분, SHA/architecture/chain에 연결한 raw SASS 재검사, hot-loop 데이터 load/store·spill 부재, one-step 수치 검증 | Q·threads·chains·iterations, 양 arm resource/rate 차이, 초기화·최종 store·launch 비용 amortization; 물리 SFU rail 분리는 주장하지 않음 | Signed 차분·CI·Q scaling; 음수/zero-crossing은 표시하되 최적값 선정 제외, 전체/idle은 진단만 |
 | Legacy streaming EXP/TANH/SiLU | pJ/element, Gelement/s | 전후 분산 CPU double sample, complete output element/epoch, 표준 math·SFU activity·spill | 명시적 streaming 모드; auto grid의 Q scaling과 Q별 geometry/clock 비교, 메모리 비용 포함 | 함수·Q별 독립 그림, Q-scaling 그림·표, 수치 검증 표 |
@@ -91,6 +98,15 @@ blocks/threads/iterations와 SM filter 크기도 분리하고 SM ID·offset을 �
 양의 Tensor/SFU activity는 경로 근거이며 성능 포화 증명이 아니다. 자동 L2
 write/copy residency 판정이 미확정이면 해당 에너지는 보존하지만 검증 후보에서
 제외한다. nonlinear CPU 비교도 대표 표본이며 전체 입력 범위의 증명이 아니다.
+
+Read의 `memory_coalescing`은 경로 판정과 별도다. 해당 replay의 L1 global-read
+sector bytes(L1) 또는 L2 TEX-origin read-sector bytes(L2/HBM)를 logical read
+bytes로 나눠 예상 1.0과 대조하고, 기본 정책 0.95–1.05를 통과해야 verified
+에너지 후보가 된다. 넓은 sector-inflation 범위 0.90–8.25에서 경로가 `pass`여도
+stride 4의 비율 4.0은 이 판정을 통과하지 못한다. Counter 미지원은 미확정이다.
+설계 목표 100% sector 효율, 관측 최고 처리량의 95% 선택 규칙, 사양상 peak
+bandwidth 대비 비율은 각각 다른 값이다. [주소별 예시](cache-sector-review.ko.md)를
+참고한다.
 
 ## 3. 다섯 단계의 판단
 
@@ -103,6 +119,7 @@ write/copy residency 판정이 미확정이면 해당 에너지는 보존하지�
    4회다. 제외된 반복과 이유도 남긴다.
 3. **컴포넌트 근거:** NCU identity/parameter/clock binding과 수치 counter를
    재검사한다. `pass`/`fail`/`inconclusive`/`unprofiled`를 구분한다.
+   메모리 read는 경로 적절성과 `memory_coalescing`을 모두 통과해야 한다.
    미검증·실패한 빠른 조건도 유효 측정이면 성능 peak 분모에서 빼지 않는다.
 4. **Plateau:** 같은 clock pair·입력 정의에서 검증된 증가 자원 level의 상위
    3개가 모두 전체 유효 관측 peak의 95% 이상이고, 그 처리량 폭이 5% 이내인지
@@ -198,6 +215,12 @@ python -m powermodeling analyze --input results/validated \
   locality는 주파수별 SM×offset 지도, control은 실제 전력/온도 trace를 낸다.
   기본 SFU는 signed paired contrast를 먼저 표시하고, Q–처리량·Q–차분 그림에는
   primitive·chains·iterations와 register lane 단위를 명시한다. 음수 값도 남긴다.
+
+메모리 비교에서는 energy 구간의 **logical GB/s**, NCU replay의 **L1/L2 read-sector
+GB/s**, **DRAM read GB/s**를 단위·계층·측정 구간과 함께 구분해 읽는다. Sector
+효율과 예상/관측 sector inflation을 확인하고 stride/sector 진단의 pJ는 최적값
+곡선과 섞지 않는다. NCU replay의 byte count로 energy 구간 분모를 바꾸거나
+25% 효율을 이유로 기존 pJ를 4로 나누는 보정을 하지 않는다.
 
 Factory default는 보라 ring, exact 1110은 검은 ring, 후보는 큰 marker로 표시한다.
 counter 상태는 색·marker로 구분한다. 없는 값/미승인 에너지 cell은 공백이고,

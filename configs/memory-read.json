@@ -1,5 +1,5 @@
 {
-  "description": "SXM energy sweep from 900 MHz with configurable advertised-clock intervals (default 90 MHz), factory default fixed pair, incoming-policy reference and exact 1110 MHz wherever supported. Inspect plan runtime and evaluation coverage. Memory energy candidates use explicit stride_words=1 (4-byte lane spacing) and sector-aligned regions; strided accesses belong to diagnostic plans.",
+  "description": "Coalesced scalar-read energy sweep for L1, L2 and HBM only: stride_words=1 gives adjacent 4-byte lane addresses and expected 100% requested-sector efficiency with aligned full warps. Require separate counter-backed coalescing and target-path evidence before energy selection. Stride/offset diagnostics are separate. Graphics clocks start near 900 MHz, default90 MHz intervals, exact1110 and advertised factory default anchors.",
   "seconds": 12,
   "warmup_seconds": 3,
   "idle_seconds": 6,
@@ -17,62 +17,15 @@
   },
   "experiments": [
     {
-      "workload": "control",
-      "stage": "dvfs",
-      "parameters": {},
-      "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4",
-          "sm_count*8"
-        ],
-        "threads": [
-          128,
-          256
-        ]
-      }
-    },
-    {
-      "workload": "tensor",
-      "stage": "dvfs",
-      "parameters": {
-        "tensor_accumulators": 4
-      },
-      "grid": {
-        "blocks": [
-          "sm_count*2",
-          "sm_count*4",
-          "sm_count*8"
-        ],
-        "threads": [
-          128,
-          256
-        ]
-      }
-    },
-    {
-      "workload": "gemm",
-      "stage": "dvfs",
-      "parameters": {
-        "gemm_n": 4096,
-        "gemm_k": 4096
-      },
-      "grid": {
-        "gemm_m": [
-          2048,
-          4096,
-          8192
-        ]
-      }
-    },
-    {
       "workload": "l1",
-      "stage": "dvfs",
+      "stage": "memory_read",
       "parameters": {
         "working_set_bytes": "blocks*16384",
         "stride_words": 1,
         "offset_bytes": 0,
-        "access": "read"
+        "access": "read",
+        "iterations": 4096,
+        "batch_launches": 16
       },
       "grid": {
         "blocks": [
@@ -89,12 +42,14 @@
     },
     {
       "workload": "l2",
-      "stage": "dvfs",
+      "stage": "memory_read",
       "parameters": {
         "working_set_bytes": "l2_bytes*0.5",
         "stride_words": 1,
         "offset_bytes": 0,
-        "access": "read"
+        "access": "read",
+        "iterations": 4096,
+        "batch_launches": 16
       },
       "grid": {
         "blocks": [
@@ -111,13 +66,15 @@
     },
     {
       "workload": "hbm",
-      "stage": "dvfs",
+      "stage": "memory_read",
       "parameters": {
         "working_set_bytes": "max(l2_bytes*8,268435456)",
         "seed": 2026,
         "stride_words": 1,
         "offset_bytes": 0,
-        "access": "read"
+        "access": "read",
+        "iterations": 4096,
+        "batch_launches": 16
       },
       "grid": {
         "blocks": [

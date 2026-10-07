@@ -7,7 +7,10 @@
   "sample_interval_s": 0.05,
   "randomization_seed": 2026,
   "clock_pairs": [
-    {"graphics_mhz": null, "memory_mhz": null}
+    {
+      "graphics_mhz": null,
+      "memory_mhz": null
+    }
   ],
   "target_form_factor": "SXM",
   "paired_reference": true,
@@ -16,26 +19,92 @@
     {
       "workload": "l1",
       "stage": "sector_alignment",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "blocks*8192", "stride_elements": 1},
-      "grid": {"offset_bytes": [0, 4, 32, 128]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "iterations": 2048,
+        "batch_launches": 16,
+        "working_set_bytes": "blocks*8192",
+        "stride_words": 1,
+        "access": "read"
+      },
+      "grid": {
+        "offset_bytes": [
+          0,
+          4,
+          32,
+          128
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l2",
       "stage": "sector_alignment",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "l2_bytes*0.5", "stride_elements": 1},
-      "grid": {"offset_bytes": [0, 4, 32, 128]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "iterations": 2048,
+        "batch_launches": 16,
+        "working_set_bytes": "l2_bytes*0.5",
+        "stride_words": 1,
+        "access": "read"
+      },
+      "grid": {
+        "offset_bytes": [
+          0,
+          4,
+          32,
+          128
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l1",
       "stage": "sector_stride",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "blocks*8192", "offset_bytes": 0},
-      "grid": {"stride_elements": [1, 2, 4, 8, 32]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "iterations": 2048,
+        "batch_launches": 16,
+        "working_set_bytes": "blocks*8192",
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {
+        "stride_words": [
+          1,
+          2,
+          4,
+          8,
+          32
+        ]
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l2",
       "stage": "sector_stride",
-      "parameters": {"blocks": "sm_count*4", "threads": 256, "iterations": 2048, "batch_launches": 16, "working_set_bytes": "l2_bytes*0.5", "offset_bytes": 0},
-      "grid": {"stride_elements": [1, 2, 4, 8, 32]}
+      "parameters": {
+        "blocks": "sm_count*4",
+        "threads": 256,
+        "iterations": 2048,
+        "batch_launches": 16,
+        "working_set_bytes": "l2_bytes*0.5",
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {
+        "stride_words": [
+          1,
+          2,
+          4,
+          8,
+          32
+        ]
+      },
+      "experiment_role": "diagnostic"
     }
   ]
 }

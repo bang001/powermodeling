@@ -34,7 +34,7 @@ CUDA 13 removed the clock fields from `cudaDeviceProp`.
 ```sh
 build/powerbench --device 0 --workload hbm --seconds 10 \
   --warmup-seconds 3 --idle-seconds 6 --blocks 216 --threads 256 \
-  --working-set-bytes 536870912 --stride-elements 1 --access read
+  --working-set-bytes 536870912 --stride-words 1 --access read
 ```
 
 Use the Python runner for power measurements and clock policy. This executable
@@ -119,8 +119,28 @@ to confirm that launch gaps and address generation do not cap throughput.
 
 `--working-set-bytes` is total input footprint, not per-SM footprint. L1 rounds
 it down to an integer number of 32-bit words per block; the effective size is
-reported. `--stride-elements` is in 32-bit words. Neighboring lanes are adjacent
-at stride 1. Offset wrapping uses precomputed normalized offsets and subtraction
+reported. `--stride-words` is the explicit unit name for `--stride-elements`:
+both flags count 32-bit words, not bytes. Use one flag; supplying both is rejected.
+The default is one word, so neighboring lanes request adjacent 4B values.
+Four words means a 16B lane gap, not four contiguous bytes. For a full 32-lane
+warp with aligned, nonaliasing scalar addresses, the ideal sector request shape is:
+
+| Stride words | Lane gap | 32B sectors per scalar warp instruction | Ideal requested payload fraction |
+| ---: | ---: | ---: | ---: |
+| 1 | 4B | 4 | 100% |
+| 2 | 8B | 8 | 50% |
+| 4 | 16B | 16 | 25% |
+| 8 | 32B | 32 | 12.5% |
+
+These are address-level fractions, not observed bandwidth or physical DRAM
+traffic. Unaligned offsets, L1 slice bases, wrapping, small aliased footprints,
+cache hits and scheduling can change measured behavior. Use stride one and
+aligned offsets/slices for the coalesced throughput geometry; retain larger
+strides as explicit diagnostics. Memory results expose `memory_word_bytes=4`,
+`stride_words`, and `lane_stride_bytes=4*stride_words`, while preserving the
+historical `stride_elements` field. The lane gap describes the requested strided
+loop; dependent-latency probes instead follow randomized links.
+Offset wrapping uses precomputed normalized offsets and subtraction
 inside the loop, avoiding hot 64-bit division even for 20/25 MiB footprints.
 `--offset-bytes` shifts the allocation base and must be 4-byte aligned.
 

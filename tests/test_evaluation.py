@@ -28,7 +28,7 @@ def study_fixture(step=90):
         gfx = trial["clocks"]["graphics_mhz"]
         r = empirical_record("GPU-evaluation-synthetic", gfx or 1200, power={900: 110, 1110: 120, 1200: 150}.get(gfx, 150),
                              repeat=trial["repeat"], blocks=trial["parameters"]["blocks"])
-        r.update(trial_id=trial["trial_id"], condition_id=trial["condition_id"])
+        r.update(trial_id=trial["trial_id"], condition_id=trial["condition_id"], experiment_role=trial["experiment_role"])
         r["config"].update(trial["parameters"], graphics_clock_mhz=gfx, memory_clock_mhz=trial["clocks"]["memory_mhz"],
                             clock_selection_reasons=trial["clock_selection_reasons"], clock_selection_policy=trial["clock_policy"])
         r["validation"]["profiler_evidence"]["condition_id"] = trial["condition_id"]

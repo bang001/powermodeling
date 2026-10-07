@@ -40,16 +40,24 @@
       "parameters": {
         "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "sm_count*2*16384"
-      }
+        "working_set_bytes": "sm_count*2*16384",
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "l2",
       "parameters": {
         "blocks": "sm_count*2",
         "threads": 256,
-        "working_set_bytes": "l2_bytes*0.5"
-      }
+        "working_set_bytes": "l2_bytes*0.5",
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "experiment_role": "diagnostic"
     },
     {
       "workload": "hbm",
@@ -57,8 +65,12 @@
         "blocks": "sm_count*4",
         "threads": 256,
         "working_set_bytes": "max(l2_bytes*8,268435456)",
-        "seed": 2026
-      }
+        "seed": 2026,
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "experiment_role": "diagnostic"
     }
   ],
   "target_form_factor": "SXM",

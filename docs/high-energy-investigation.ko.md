@@ -1,9 +1,32 @@
 # Tensor·L1·L2·HBM 에너지 차이의 원인 점검
 
-검토 기준: 2026-10-06 (Asia/Seoul). 대상은 이미 실행한 Tensor·L1·L2·HBM 실험이다.
+최종 보완: 2026-10-07 (Asia/Seoul). 대상은 이미 실행한 Tensor·L1·L2·HBM 실험이다.
 비선형 함수/SFU 실험의 결과를 가정하지 않는다. H100에서 기존 15 pJ와 새 23 pJ라는
 차이를 전달받았지만, 컴포넌트·분모·에너지 기준·raw 자료는 아직 확정되지 않았다.
 따라서 아래 코드 점검과 합성 반례는 이 실측 차이의 원인을 확정한 결과가 아니다.
+
+## Stride 4에서 25% sector 효율이 된다는 지적
+
+`stride_elements=4`는 4 B 원소 네 개의 간격, 즉 레인 간 16 B다. Full warp의
+32개 lane이 scalar 4 B씩 서로 다른 주소를 읽고 충분한 정렬·footprint가 있으면
+logical 요청 128 B에 32 B sector 16개가 필요하므로 sector 효율은 **25%**다.
+이동 에너지 본 실험은 `stride_words=1`로 연속 접근하여 4 sectors/128 B,
+**100% 효율**을 목표로 해야 한다.
+
+현재 커널의 기존 기본 stride는 이미 1이었다. 확인된 설계 누락은 stride
+진단의 sector inflation이 최대 8.25여도 경로 검증을 통과하고, 이를 본 실험의
+효율 후보에서 따로 배제하지 않았다는 점이다. 이제 본 실험 계획은 stride 1과
+sector 정렬·region 크기를 요구하고, 별도 `memory_coalescing` NCU 판정도 요구한다.
+Stride·sector·locality 진단은 역할을 구분하여 고정 clock에서도 최적값 선정에서
+제외한다. 기존 raw는 보존하고 새 기준으로 재평가한다.
+
+보고된 BW 21%가 logical BW이고 비교 기준이 **동일 계층·동일 구간의 sector BW**라면
+`21% / 25% = 84%`의 sector 공급률과 양립한다. 이는 조건부 산술 관계이며
+실제 HBM 공급률을 측정한 결과가 아니다. Warp 간 재사용·병합·cache hit 때문에
+L2 sectors와 DRAM bytes는 다른 비율을 보일 수 있다. Logical BW, L1/L2 read-sector
+BW, DRAM read BW를 구분하고 원래 raw·plan·NCU counter로 확인해야 한다.
+같은 전력에 logical 처리량만 낮아져도 pJ/logical bit는 커질 수 있지만,
+기존 단가를 4로 나누어 stride 1의 단가를 추정하지 않는다.
 
 ## 먼저 기존 raw를 재분석한다
 
@@ -77,6 +100,8 @@ NVML의 전력 mW→W, 누적 에너지 mJ→J, logical byte→bit 계산에서�
    에너지와 work가 같은 시간 범위를 쓰면 계산 오류는 아니지만 busy-kernel 단가와 다르다.
 5. 경로 검증 `pass`는 포화가 아니다. 기존 sector inflation 허용 범위는 stride 실험을
    위해 최대 8.25배이며, 실제 8배 traffic에서도 `pass`가 가능한 합성 반례를 확인했다.
+   현재는 이 경로 상태와 별도로 read coalescing을 검증하고, 효율 미달/미확정
+   조건과 진단 역할을 verified 에너지 최적값에서 제외한다.
 6. 전체 sweep 최고 처리량의 95%를 유지하는 추천은 느린 clock의 더 낮은 pJ 후보를
    제외할 수 있다. `energy_selection_diagnostics`에서 같은 clock의 성능 기준을 통과한
    최소 에너지와 전체 최고 성능 기준을 적용한 후보를 나란히 확인한다. 기존 실험이

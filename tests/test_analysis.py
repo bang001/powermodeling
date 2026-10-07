@@ -77,6 +77,10 @@ def empirical_record(uuid, gfx, memory=1593, workload="hbm", access="read", powe
     evidence["profile_provenance"]["requested_clocks"] = {"graphics_mhz": gfx, "memory_mhz": memory}
     evidence["profile_provenance"]["parameters"]["blocks"] = blocks
     evidence["profile_benchmark"]["blocks"] = blocks
+    if workload == "l1":
+        # Geometry changes preserve an aligned per-CTA slice in this fixture.
+        for benchmark in (record["benchmark"], evidence["profile_benchmark"]):
+            benchmark["working_set_bytes"] = blocks * 8192
     change(evidence, SM_HZ, gfx * 1e6)
     record["validation"] = {"profiler_evidence": evidence}
     return record

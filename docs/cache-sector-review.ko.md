@@ -1,12 +1,41 @@
 # L1/L2의 128-byte cache line과 32-byte sector 검토
 
-검토일: 2026-10-06 UTC. 대상은 V100/A100/H100에서 현재 worker가 실행하는
+최종 보완: 2026-10-07 (Asia/Seoul). 대상은 V100/A100/H100에서 현재 worker가 실행하는
 scalar global read이다. 아래 주소 예시는 실측 에너지 결과가 아니다.
 
 후속 변경으로 현재 read는 [single-stream v2](memory-read-v2.ko.md)를 사용한다.
 한 thread/iteration당 4 B 한 번을 읽고 uint32 합계에 더하며, 기본 iterations는
 4096이다. Sector 표는 scalar load 하나 기준이므로 그대로 유효하다. 아래의
 four-stream 관련 내용은 `8892f8c`까지의 이전 구현을 검토한 기록이다.
+
+## 이동 에너지 본 실험은 100% sector 효율을 요구한다
+
+L1/L2/HBM read의 본 실험은 **`stride_words=1`, `offset_bytes=0`**으로 시작한다.
+`word`는 4 B인 uint32 한 개다. 이전 이름 `stride_elements`도 같은 단위이며
+호환을 위해 읽지만, 새 config와 CLI는 `stride_words` / `--stride-words`로 단위를
+드러낸다. 두 이름은 동시에 지정할 수 없다.
+
+현재 read 커널의 기존 기본 stride도 1이었다. 문제는 stride 2/4/8 등을 포함한
+진단 조건이 넓은 sector-inflation 경로 기준을 통과하면 에너지 후보로 들어갈 수
+있었다는 점이다. 기본값이 항상 4였다고 해석하지 않는다. 새 energy read 계획은
+stride 1, 32 B 정렬 offset 및 effective region, 최소 128 B region을 요구한다.
+Stride·sector·locality 진단은 `experiment_role`로 분리하며 고정 clock에서도
+에너지 최적 후보로 승격하지 않는다.
+
+설정 검사 외에 NCU의 **`memory_coalescing`** 판정을 따로 적용한다. Full warp의
+scalar 4 B read에서 예상 sector bytes/logical-read bytes는 1.0이고, 실측 정책은
+0.95–1.05다. 이는 프로젝트의 관측값 판정 허용폭이며, 95% sector
+효율을 목표로 설계한다는 뜻이 아니다. L1은 L1 global-read sectors, L2/HBM은
+L2 TEX-origin **read** sectors를 해당 replay의 logical read 양과 비교한다.
+`.cg`의 L1 bypass 수치나 L2 write sectors를 read coalescing 근거로 섞지 않는다.
+L2 counter는 `.cg` 하위 경로에서 관측한 sector 비율이며 frontend 요청 효율이나
+실제 HBM 전송량을 직접 측정한 값은 아니다. 요청 geometry 검사와 함께 해석한다.
+Counter가 없거나 binding이 불충분하면 미확정으로 남기고 verified 에너지 후보에서
+제외한다. 기존 0.90–8.25 경로 기준은 진단용 경로 판정으로 유지하지만
+이 별도 coalescing 요건을 대신하지 못한다.
+
+따라서 경로의 hit/하위 traffic, coalescing, 처리량 plateau는 각각 확인해야 한다.
+100% sector 효율만으로 하드웨어 최고 bandwidth의 100%를 보장하지는 않는다.
 
 ## 128 B를 모든 연산의 고정 전송량으로 해석하지 않는다
 
@@ -24,15 +53,15 @@ NVIDIA Nsight Compute 2025.2.1의 Metrics Reference는 **L1과 L2 모두
 들어가는 조건이며, 4 sectors를 요구하는 데 반드시 필요한 조건은 아니다.
 cache hit라면 그 요청량 전체가 L2나 HBM으로 내려가지 않는다.
 
-| 한 warp의 scalar load 조건 | Logical bytes | 서로 다른 32 B sectors | Sector bytes / logical bytes |
-|---|---:|---:|---:|
-| stride 1, offset 0 B | 128 | 4 | 1.00 |
-| stride 1, offset 4 B | 128 | 5 | 1.25 |
-| stride 1, offset 32 B | 128 | 4 | 1.00 |
-| stride 1, offset 128 B | 128 | 4 | 1.00 |
-| stride 2, offset 0 B | 128 | 8 | 2.00 |
-| stride 4, offset 0 B | 128 | 16 | 4.00 |
-| stride 8 또는 32, offset 0 B | 128 | 32 | 8.00 |
+| 한 warp의 scalar load 조건 | 레인 간격 | Logical bytes | 서로 다른 32 B sectors | Sector bytes / logical bytes | Sector 효율 |
+|---|---:|---:|---:|---:|---:|
+| stride 1, offset 0 B | 4 B | 128 | 4 | 1.00 | 100% |
+| stride 1, offset 4 B | 4 B | 128 | 5 | 1.25 | 80% |
+| stride 1, offset 32 B | 4 B | 128 | 4 | 1.00 | 100% |
+| stride 1, offset 128 B | 4 B | 128 | 4 | 1.00 | 100% |
+| stride 2, offset 0 B | 8 B | 128 | 8 | 2.00 | 50% |
+| stride 4, offset 0 B | 16 B | 128 | 16 | 4.00 | 25% |
+| stride 8 또는 32, offset 0 B | 32 B 또는 128 B | 128 | 32 | 8.00 | 12.5% |
 
 표는 128 B 정렬된 기준 주소, full warp, thread당 4 B, 서로 겹치지 않는
 thread 주소, 충분한 footprint를 가정한다. stride는 4 B 원소 단위다.
@@ -42,6 +71,15 @@ sector 수를 구할 수 있다. Offset 32 B는 두 128 B 주소 구간에 걸�
 유한 buffer의 wrap이나 broadcast로 주소가 겹치면 표를 그대로
 적용하지 않는다. 이 수는 요청 주소가 덮는 sectors이며, 실제 L2/DRAM
 traffic이나 에너지가 같은 배율로 증가한다는 뜻이 아니다.
+
+`stride_elements=4`이면 레인 간격은 16 B이며 위 조건에서 sector 효율이 25%라는
+지적이 맞다. 보고된 logical bandwidth가 기준의 21%였다면, **같은 계층·같은 시간
+범위의 sector bandwidth 기준과 비교한 경우에만** `21% / 25% = 84%`라는 관계로
+설명할 수 있다. 이를 HBM 실측 효율 84%로 단정하지 않는다. 인접 warp의 재사용,
+cache hit, 요청 병합에 따라 L2/DRAM traffic은 달라지므로 DRAM byte counter를
+별도로 확인해야 한다. 기존 에너지를 4로 나누거나 bandwidth를 4배로 보정해
+stride 1 실험 결과로 만들지 않는다. 같은 clock·geometry·working set·전력 범위로
+stride 1을 다시 측정하고 전력과 logical 처리량을 함께 비교한다.
 
 ## 이전 four-stream 구현에서 확인한 것과 부족했던 점
 
@@ -97,7 +135,8 @@ Incoming policy 실행은 counter 관찰에 사용할 수 있지만 controlled-c
 
 1. 생성된 plan과 raw에서 offset, stride, effective/finite footprint, 실제 클럭을 확인한다.
 2. NCU에서 L1의 sectors/request와 L1 read-sector bytes/logical-read bytes,
-   L2의 TEX-origin read-sector bytes/logical-read bytes를 조건별로 비교한다.
+   L2의 TEX-origin read-sector bytes/logical-read bytes를 조건별로 비교하고
+   `memory_coalescing`의 예상값·관측값·상태를 확인한다.
    L2 requests를 SM의 warp load 수와 같다고 가정하지 않는다.
 3. L1/L2 hit 및 하위 traffic으로 목표 계층의 공급 여부를 확인한다. Offset 4 B에서
    sector 요청이 늘어도 인접 warp의 재사용/병합 때문에 DRAM bytes는 같은 비율로
@@ -108,6 +147,10 @@ Incoming policy 실행은 counter 관찰에 사용할 수 있지만 controlled-c
 5. 별도 NCU replay의 sector count로 energy run의 분모를 교체하지 않는다.
    논문의 pJ/access와 비교할 때는 access가 thread load, warp request, sector,
    cache-line lookup 중 무엇인지와 측정 전력의 범위를 먼저 맞춘다.
+6. 보고서에서는 energy 구간의 logical GB/s, NCU replay의 L1/L2 read-sector
+   GB/s, DRAM read GB/s를 구분한다. Replay duration과 energy 구간은 서로
+   다르므로 같은 throughput 값으로 교체하지 않는다. 이전 raw도 이 기준으로
+   재분석하며 비효율 조건의 원시 값과 진단은 보존하고 verified 최적값에서 제외한다.
 
 ## 근거와 문헌 검토 범위
 

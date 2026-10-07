@@ -76,6 +76,40 @@ python -m powermodeling analyze --input results/saturation --output results/satu
 
 완료된 실험을 이어 실행하려면 같은 plan/output에 `--resume`을 추가한다. 실패한 측정은 raw 로그를 남기며 성공한 결과로 처리되지 않는다. `--limit 3`은 일부 trial의 실행 점검에 사용할 수 있지만 repeat나 sweep가 불완전하면 효율 최적값을 확정할 수 없다.
 
+## L1·L2·HBM 이동에너지: coalesced read
+
+기본 이동에너지 실험은 [configs/memory-read.json](configs/memory-read.json)을 사용한다. L1·L2·HBM read만 실행하며 **`stride_words: 1`, `offset_bytes: 0`**을 명시한다. `saturation.json`·`dvfs.json`도 memory 기본값을 명시한다. 기존 CUDA 기본 stride 역시 1이었지만, 이전 검증은 stride가 큰 접근을 coalesced 에너지 후보에서 별도로 제외하지 못했다.
+
+Stride는 **4-byte word 개수**다. 새 config 이름 `stride_words`와 CLI `--stride-words`가 단위를 드러낸다. 기존 `stride_elements`·`--stride-elements`도 같은 word 단위로 지원하며, 두 이름을 동시에 지정하면 오류다. 호환성을 위해 plan의 정규화된 parameter와 raw의 `stride_elements`는 유지하고 raw에 `memory_word_bytes`, `stride_words`, `lane_stride_bytes`도 기록한다.
+
+| Word stride | 인접 lane 주소 간격 | Full warp의 요청 sectors | 유효 payload / sector bytes |
+|---:|---:|---:|---:|
+| 1 | 4 B | 4 × 32 B | 100% |
+| 2 | 8 B | 8 × 32 B | 50% |
+| 4 | 16 B | 16 × 32 B | 25% |
+| 8 | 32 B | 32 × 32 B | 12.5% |
+
+표는 정렬된 full warp가 서로 다른 주소의 4 B를 하나씩 읽는 경우다. Stride 1이어도 offset 4 B나 잘못 정렬된 L1 slice는 sector 낭비를 만든다. Energy read plan은 stride 1·32 B 정렬된 offset/region·최소 128 B region을 검사한다. L1은 CTA별 slice와 시작 주소도 확인한다. 128 B cache line이 4 sectors라는 사실이 매 접근을 항상 128 B 전송으로 만드는 것은 아니다.
+
+```bash
+export POWERBENCH=build/powerbench  # A100/CUDA13: build-a100-cuda13/powerbench
+python -m powermodeling plan --config configs/memory-read.json \
+  --bench "$POWERBENCH" --device 0 --output results/memory-read-plan.json
+python -m powermodeling run --plan results/memory-read-plan.json \
+  --bench "$POWERBENCH" --device 0 --output results/memory-read \
+  --apply-clocks --clock-method applications
+python -m powermodeling validate-run --plan results/memory-read-plan.json \
+  --input results/memory-read --output results/memory-read-validated \
+  --profiles-dir results/memory-read-profiles --bench "$POWERBENCH" --device 0 \
+  --apply-clocks --clock-method applications
+python -m powermodeling analyze --input results/memory-read-validated \
+  --plan results/memory-read-plan.json --output results/memory-read-report --plots
+```
+
+**목표 계층 경로와 coalescing을 따로 검증한다.** 기존 sector inflation 상한 8.25는 의도적인 stride 진단의 경로 검사에 남긴다. 에너지 후보에는 별도로 정렬된 연속 접근과 해당 replay의 read-sector/logical-read 비율이 기대값 1에 가까운지 확인한다. 기본 허용 오차는 ±5%이며 기대 효율은 100%다. L1은 L1 read sectors, L2/HBM은 L2 read sectors를 사용한다. 이 L2 관측을 DRAM 전송 효율이라고 부르지 않는다. 근거가 없으면 미확정으로 남기고 검증된 에너지 후보에서 제외한다.
+
+`cache-sector-diagnostics.json`·`locality.json`의 stride/offset/SM 실험은 `experiment_role: "diagnostic"`으로 유지하며 최적 에너지 후보에서 제외한다. Raw 단가·logical bandwidth·NCU sector/DRAM traffic은 그대로 보존한다. 기존 stride 4 결과에 4를 곱해 BW를 실측치로 만들거나 pJ를 4로 나누어 보정하지 않는다. 기존 결과는 최신 분석기로 다시 평가하고, coalesced 비교값은 새 binary·plan으로 재측정한다. [Sector 효율 검토와 비교 방법](docs/cache-sector-review.ko.md)
+
 ## 비선형 실험: SFU 마이크로벤치
 
 **`configs/nonlinear*.json`은 register-resident SFU 실험이다.** 반복 루프에서 global/shared/local load/store를 제거하고, 동일한 bounded register loop에서 SFU 명령을 뺀 control과 AB/BA로 비교한다. L1·L2·HBM working set·stride·행 너비는 sweep하지 않는다. 기존 `sfu-register*.json`도 같은 설정으로 유지한다.
@@ -148,7 +182,10 @@ SFU 차분 pJ/instruction = (P_treatment − P_control) / (N / treatment 시간)
 | [configs/smoke.json](configs/smoke.json) | 센서·CUDA·기본 실행을 확인하는 작은 DVFS sweep |
 | [configs/saturation.json](configs/saturation.json) | warp/block·working set·accumulator·GEMM 크기와 고정 클럭 탐색 |
 | [configs/dvfs.json](configs/dvfs.json) | memory×SM clock 도메인의 bandwidth plateau와 효율 탐색 |
-| [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 물리 near/far labels는 자동 부여하지 않음 |
+| [configs/memory-read.json](configs/memory-read.json) | L1·L2·HBM의 stride 1 coalesced read 에너지·clock sweep |
+| [configs/memory-read-smoke.json](configs/memory-read-smoke.json) | 같은 read 경로의 실행·센서 점검 |
+| [configs/cache-sector-diagnostics.json](configs/cache-sector-diagnostics.json) | Sector 정렬·stride 효율 진단; 에너지 최적점에서 제외 |
+| [configs/locality.json](configs/locality.json) | L2 latency/stride/주소 offset/실행 SM 진단; 에너지 최적점에서 제외하고 물리 near/far labels는 자동 부여하지 않음 |
 | [configs/nonlinear-smoke.json](configs/nonlinear-smoke.json) | Native SFU 5/6종과 대응 register control의 실행·수치·센서 점검 |
 | [configs/nonlinear.json](configs/nonlinear.json) | SFU 기본 명령의 Q·threads·chains·clock별 차분 pJ/instruction |
 | [configs/nonlinear-amortization.json](configs/nonlinear-amortization.json) | SFU 반복 길이에 따른 초기화·최종 store·launch 비용 영향 점검 |

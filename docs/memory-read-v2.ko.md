@@ -6,6 +6,16 @@ L1·L2·HBM의 `access=read`는 `scalar_single_stream_read_v2`를 사용한다.
 L1은 `.ca`, L2/HBM은 `.cg`를 유지한다. Stride·offset·L1 CTA별 slice·SM filter도
 그대로 적용하며, 주소는 읽은 데이터에 의존하지 않는다.
 
+이동 에너지 본 실험은 **`stride_words=1`, `offset_bytes=0`**으로 시작한다.
+Word는 4 B이며 호환 이름 `stride_elements=4`를 사용하면 레인 간격은 16 B다.
+Full warp·정렬된 충분한 region에서 이는 sector 효율 25%가 된다. 연속 read는
+32 lanes × 4 B = 128 B를 32 B sector 4개로 요청해 100% 효율을 목표로 한다.
+본 실험 계획은 stride 1과 32 B 정렬 offset/region 및 최소 128 B region을
+요구한다. NCU의 별도 `memory_coalescing` 판정에서 L1 또는 L2 read-sector
+bytes/logical-read bytes의 예상 1.0과 관측값을 대조한다. 경로 hit 검증과
+coalescing 검증을 모두 통과해야 verified 에너지 후보로 사용한다.
+[주소별 효율과 21% BW의 해석](cache-sector-review.ko.md)을 참고한다.
+
 ## 무엇이 달라지는가
 
 | 항목 | 이전 read | 새 read |
@@ -90,8 +100,11 @@ Incoming policy에서는 controlled-clock 검증이 미확정으로 남을 수 �
 
 HBM은 유한 launch의 실제 footprint와 DRAM read bytes를 확인하고, L1/L2는
 hit와 하위 traffic을 확인한다. 작은 footprint가 cache에 남는 결과를 HBM 개선으로
-해석하지 않는다. 여러 geometry와 clock의 본 실험은 기존 saturation/DVFS 설정으로
-새 plan을 만들어 진행한다.
+해석하지 않는다. Smoke·stride·sector 진단은 `experiment_role=diagnostic`으로
+표시하므로 고정 clock으로 바꾸어도 최적점 후보가 되지 않는다. 여러 geometry와
+clock의 본 실험은 [memory-read.json](../configs/memory-read.json)으로 새 plan을
+만들어 진행한다. 기본 stride도 이미 1이었으며, 이 변경은 단위를 명시하고 진단
+조건이 100% sector 효율의 본 실험 후보로 섞이지 않도록 계획·검증을 강화한다.
 
 ## Load 보존과 실제 GPU 검사
 

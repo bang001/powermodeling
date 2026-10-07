@@ -24,10 +24,10 @@ def pass_fixture(workload="l1", access="read"):
     logical = 100000.0
     result = {"workload": workload, "access": access, "logical_bytes": logical,
               "kernel_launches": 1, "blocks": 80, "threads": 256,
-              "iterations_per_launch": 1024, "working_set_bytes": 65536,
+              "iterations_per_launch": 1024, "working_set_bytes": 80 * 8192 if workload == "l1" else 65536,
               "stride_elements": 1, "offset_bytes": 0, "tensor_accumulators": 4,
               "gemm_m": 1024, "gemm_n": 1024, "gemm_k": 1024,
-              "l1_bytes_per_block": 819, "profile_region": True}
+              "l1_bytes_per_block": 8192 if workload == "l1" else 819, "profile_region": True}
     params = {"blocks": 80, "threads": 256, "iterations": 1024, "access": access}
     samples = [{"t_s": .5, "graphics_clock_mhz": 1200, "memory_clock_mhz": 1593, "compute_processes": [{"pid": 42}], "graphics_processes": [], "mps_compute_processes": []}]
     record = {"condition_id": "test-condition", "workload": workload,

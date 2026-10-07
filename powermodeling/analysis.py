@@ -16,9 +16,10 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
-from .memory import count_issues as memory_count_issues
+from .memory import count_issues as memory_count_issues, coalesced_read_geometry
 from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, REFERENCE_KIND as SFU_REFERENCE_KIND, count_issues as sfu_count_issues
-from .evaluation import experiment_contract, evaluate
+from .evaluation import (experiment_contract, evaluate, energy_role_eligible,
+                         energy_coalescing_eligible, energy_peak_population_eligible)
 
 _TENSOR_WORKLOADS = {"tensor", "fp16_tensor", "tensor_fp16", "gemm"}
 _MEMORY_WORKLOADS = {"l1", "l2", "hbm"}
@@ -833,8 +834,39 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
     if not baseline_temperature_matched:
         warnings.append("idle_active_temperature_mismatch_or_unavailable; leakage/thermal drift can confound subtraction")
     target_verified = assessment["status"] == "pass" and assessment.get("suitable_verified") is True
+    experiment_role = record.get("experiment_role", "legacy_unspecified")
+    memory_geometry = coalesced_read_geometry(benchmark, record.get("workload"), config)
+    read_coalescing_required = memory_geometry.get("applicable") is True
+    memory_coalescing = assessment.get("memory_coalescing") or {
+        "applicable": read_coalescing_required, "status": "inconclusive", "energy_eligible": False,
+        "reasons": list(memory_geometry.get("reasons", [])) + (["missing_bound_sector_counter_evidence"] if read_coalescing_required else []),
+        "geometry": memory_geometry, "profile_binding_verified": False,
+        "expected_sector_bytes_per_logical_read_byte": 1.0 if read_coalescing_required else None,
+        "expected_sector_efficiency_fraction": 1.0 if read_coalescing_required else None,
+        "requested_sector_efficiency_fraction": memory_geometry.get("requested_sector_efficiency_fraction"),
+        "observed_sector_bytes_per_logical_read_byte": None, "observed_sector_efficiency_fraction": None,
+        "observed_sector_efficiency_pct": None, "counter_name": None, "counter_scope": None,
+        "energy_denominator_use": "forbidden_separate_profiler_run"}
+    if read_coalescing_required:
+        # Replay admission cannot override contradictory geometry in the energy run.
+        memory_coalescing = {**memory_coalescing,
+            "profile_geometry": memory_coalescing.get("geometry"), "geometry": memory_geometry,
+            "requested_sector_efficiency_fraction": memory_geometry.get("requested_sector_efficiency_fraction"),
+            "energy_eligible": (memory_geometry.get("energy_eligible") is True
+                                and memory_coalescing.get("energy_eligible") is True),
+            "reasons": sorted(set(memory_coalescing.get("reasons", [])) | set(memory_geometry.get("reasons", [])))}
+        if memory_geometry.get("status") == "fail":
+            memory_coalescing["status"] = "fail"
+        elif memory_geometry.get("status") != "pass" and memory_coalescing.get("status") == "pass":
+            memory_coalescing["status"] = "inconclusive"
+    coalescing_eligible = not read_coalescing_required or memory_coalescing.get("energy_eligible") is True
+    role_eligible = experiment_role in ("energy_characterization", "legacy_unspecified")
     result: dict[str, Any] = {
         "trial_id": record.get("trial_id"), "condition_id": record.get("condition_id"), "workload": record.get("workload"), "gpu_uuid": gpu_uuid,
+        "experiment_role": experiment_role,
+        "memory_access_geometry": memory_geometry if record.get("workload") in _MEMORY_WORKLOADS else None,
+        "memory_coalescing": memory_coalescing if read_coalescing_required else None,
+        "memory_coalescing_energy_eligible": coalescing_eligible if read_coalescing_required else None,
         "experiment_contract": experiment_contract(record.get("workload"), benchmark, config),
         "numerical_validation": benchmark.get("numerical_validation"), "latency_probe": benchmark.get("latency_probe"),
         "repeat_index": record.get("repeat", config.get("repeat", config.get("repeat_index"))),
@@ -882,9 +914,9 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         "ncu_status": assessment["status"] if isinstance(evidence, dict) else "unprofiled",
         "ncu_assessment": assessment, "ncu_target_suitability": target_verified,
         "ncu_utilization_status": "diagnostic_only" if assessment.get("rates_summary", {}).get("kernel_duration_s") else "inconclusive",
-        "verified_selection_eligible": not issues and target_verified and count_alignment_exact,
+        "verified_selection_eligible": not issues and target_verified and count_alignment_exact and coalescing_eligible and role_eligible,
         "operation_unit": benchmark.get("operation_unit"),
-        "diagnostic_only": record.get("workload") not in _ENERGY_WORKLOADS,
+        "diagnostic_only": record.get("workload") not in _ENERGY_WORKLOADS or not role_eligible,
         "clock_comparison_controlled": all((_finite(config.get(field)) or 0) > 0 for field in ("graphics_clock_mhz", "memory_clock_mhz")),
         "throughput_ops_s": ops_rate, "throughput_bytes_s": byte_rate,
         "device_event_throughput_ops_s": operations / device_duration if operations is not None and device_duration and device_duration > 0 else None,
@@ -999,7 +1031,10 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
                           ("paired_active_reference_", result.get("paired_active_reference_power_w"))):
         result[prefix + "pj_per_element"] = power / element_rate * 1e12 if power is not None and element_rate else None
         result[prefix + "pj_per_row"] = power / row_rate * 1e12 if power is not None and row_rate else None
+    result["energy_peak_population_eligible"] = energy_peak_population_eligible(result)
     result["measurement_diagnostics"] = _measurement_diagnostics(result, benchmark, epochs)
+    result["measurement_diagnostics"]["memory_access_geometry"] = result["memory_access_geometry"]
+    result["measurement_diagnostics"]["memory_coalescing"] = result["memory_coalescing"]
     return result
 
 
@@ -1029,6 +1064,7 @@ def _group_key(trial: Mapping[str, Any]) -> str:
     achieved = None if trial.get("clock_comparison_controlled") else {
         field: trial.get(field) for field in ("graphics_clock_mhz", "memory_clock_mhz")}
     return json.dumps({"gpu_uuid": trial.get("gpu_uuid"), "workload": trial.get("workload"),
+                       "experiment_role": trial.get("experiment_role", "legacy_unspecified"),
                        "config": config, "uncontrolled_achieved_clocks": achieved,
                        "benchmark_sha256": trial.get("benchmark_sha256"),
                        "measurement_stratum": trial.get("measurement_stratum"),
@@ -1048,6 +1084,7 @@ def _median_ci(values: list[float], seed: int) -> list[float] | None:
 
 def _clock_stratum(group: Mapping[str, Any], cross_clock: bool) -> dict[str, Any]:
     key = {"gpu_uuid": group["gpu_uuid"], "workload": group["workload"],
+           "experiment_role": group.get("experiment_role", "legacy_unspecified"),
            "experiment_contract": group.get("experiment_contract"),
            "benchmark_sha256": group.get("benchmark_sha256"), "measurement_stratum": group.get("measurement_stratum"),
            "treatment_design_stratum": group.get("treatment_design_stratum"),
@@ -1067,7 +1104,8 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
                 verified_only: bool = False, total_energy: bool = False, exploratory_only: bool = False) -> list[dict[str, Any]]:
     buckets: dict[str, list[dict[str, Any]]] = {}
     for group in groups:
-        if group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats:
+        if (not energy_role_eligible(group) or not energy_coalescing_eligible(group)
+                or group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats):
             continue
         sfu = group["workload"] in SFU_WORKLOADS
         if sfu and (total_energy or not group.get("sfu_reference_delta_positive_optimum_eligible")):
@@ -1092,6 +1130,7 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
         throughput = _throughput_metric(candidates[0]["workload"])
         candidate_max = max(g[throughput] for g in candidates)
         all_observed = [g[throughput] for g in groups if g["workload"] == candidates[0]["workload"]
+                        and energy_peak_population_eligible(g)
                         and g["gpu_uuid"] == candidates[0]["gpu_uuid"] and g["valid_repeats"] >= min_repeats
                         and g["clock_comparison_controlled"] == candidates[0]["clock_comparison_controlled"]
                         and _clock_stratum(g, cross_clock) == json.loads(key) and g.get(throughput) is not None]
@@ -1129,6 +1168,7 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_g
     interpolation can establish an optimum at an untested clock.
     """
     populations = [group for group in groups if group["workload"] in _ENERGY_WORKLOADS
+                   and energy_peak_population_eligible(group)
                    and group["valid_repeats"] >= min_repeats and group["clock_comparison_controlled"]]
     peaks = {}
     geometries = {}
@@ -1241,7 +1281,7 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_g
 def _verification_coverage(groups, fraction, min_repeats, cross_clock):
     buckets = {}
     for group in groups:
-        if group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats or not group["clock_comparison_controlled"]:
+        if not energy_peak_population_eligible(group) or group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats or not group["clock_comparison_controlled"]:
             continue
         throughput = _throughput_metric(group["workload"])
         if (group.get(throughput) or 0) <= 0:
@@ -1268,7 +1308,7 @@ def _verification_coverage(groups, fraction, min_repeats, cross_clock):
 def _pareto_frontiers(groups: list[dict[str, Any]], min_repeats: int, cross_clock: bool) -> list[dict[str, Any]]:
     buckets: dict[str, list[dict[str, Any]]] = {}
     for group in groups:
-        if group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats or not group["clock_comparison_controlled"]:
+        if not energy_role_eligible(group) or not energy_coalescing_eligible(group) or group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats or not group["clock_comparison_controlled"]:
             continue
         throughput = _throughput_metric(group["workload"])
         if group.get("board_power_w") is None or group.get(throughput) is None:
@@ -1301,6 +1341,7 @@ def _associate_controls(groups: list[dict[str, Any]], min_repeats: int) -> list[
         if group["workload"] not in _ENERGY_WORKLOADS or group["valid_repeats"] < min_repeats:
             continue
         matches = [control for control in controls if control["gpu_uuid"] == group["gpu_uuid"]
+                   and control.get("experiment_role", "legacy_unspecified") == group.get("experiment_role", "legacy_unspecified")
                    and control.get("benchmark_sha256") == group.get("benchmark_sha256")
                    and control.get("measurement_stratum") == group.get("measurement_stratum")
                    and control.get("treatment_design_stratum") == group.get("treatment_design_stratum")
@@ -1309,9 +1350,30 @@ def _associate_controls(groups: list[dict[str, Any]], min_repeats: int) -> list[
             matched.append({"workload_group_id": group["group_id"], "control_groups": [
                 {"group_id": control["group_id"], "board_power_w": control["board_power_w"],
                  "incremental_activation_power_w": control["incremental_power_w"]} for control in matches],
-                "matching_fields": ["gpu_uuid", "benchmark_sha256", "measurement_stratum", "treatment_design_stratum", *match_fields],
+                "matching_fields": ["gpu_uuid", "experiment_role", "benchmark_sha256", "measurement_stratum", "treatment_design_stratum", *match_fields],
                 "note": "Descriptive activation controls only. Different instruction mixes prevent automatic component-energy subtraction."})
     return matched
+
+
+def _group_memory_coalescing(valid):
+    rows = [trial.get("memory_coalescing") for trial in valid if isinstance(trial.get("memory_coalescing"), dict)]
+    if not rows:
+        return None
+    result = dict(rows[0])
+    statuses = {row.get("status") for row in rows}
+    result.update(status="fail" if "fail" in statuses else "pass" if statuses == {"pass"} else "inconclusive",
+                  energy_eligible=len(rows) == len(valid) and all(row.get("energy_eligible") is True for row in rows),
+                  profile_binding_verified=len(rows) == len(valid) and all(row.get("profile_binding_verified") is True for row in rows),
+                  bound_sector_ratio_failure=any(row.get("status") == "fail" and row.get("profile_binding_verified") is True for row in rows),
+                  reasons=sorted({reason for row in rows for reason in row.get("reasons", [])}),
+                  aggregation="Median of valid repeat replay ratios/efficiencies; all repeats must pass for energy eligibility. These replay values never replace energy-run logical work.")
+    for field in ("requested_sector_efficiency_fraction", "observed_sector_bytes_per_logical_read_byte",
+                  "observed_sector_efficiency_fraction", "observed_sector_efficiency_pct"):
+        result[field] = _median(row.get(field) for row in rows)
+    for field in ("counter_name", "counter_scope"):
+        values = {row.get(field) for row in rows}
+        result[field] = next(iter(values)) if len(values) == 1 else None
+    return result
 
 
 def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float = 0.95,
@@ -1350,6 +1412,11 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             valid.append(trial)
         digest = hashlib.sha256(key.encode()).hexdigest()[:16]
         group = {"group_id": digest, "gpu_uuid": repeats[0]["gpu_uuid"], "workload": repeats[0]["workload"],
+                 "experiment_role": repeats[0].get("experiment_role", "legacy_unspecified"),
+                 "memory_access_geometry": repeats[0].get("memory_access_geometry"),
+                 "memory_coalescing": _group_memory_coalescing(valid),
+                 "memory_coalescing_energy_eligible": bool(valid) and all(t.get("memory_coalescing_energy_eligible") is True for t in valid)
+                    if repeats[0].get("memory_coalescing") is not None else None,
                  "experiment_contract": repeats[0].get("experiment_contract"),
                  "nonlinear_contract": repeats[0].get("nonlinear_contract"),
                  "sfu_contract": repeats[0].get("sfu_contract"),
@@ -1411,6 +1478,9 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
         group["ncu_target_suitability"] = group["target_verified"]
         group["ncu_utilization_status"] = "diagnostic_only" if valid and all(trial["ncu_utilization_status"] == "diagnostic_only" for trial in valid) else "inconclusive"
         group["measurement_diagnostics"] = _group_measurement_diagnostics(valid, group)
+        group["energy_peak_population_eligible"] = energy_peak_population_eligible(group)
+        group["measurement_diagnostics"]["memory_access_geometry"] = group["memory_access_geometry"]
+        group["measurement_diagnostics"]["memory_coalescing"] = group["memory_coalescing"]
         if group["workload"] in SFU_WORKLOADS:
             group["sfu_reference_delta_diagnostics"] = (group["measurement_diagnostics"].get("execution") or {}).get("sfu_reference_delta")
         groups.append(group)
@@ -1457,7 +1527,8 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
     json_path = destination / "summary.json"
     json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
     csv_path = destination / "trials.csv"
-    fields = ["trial_id", "gpu_uuid", "gpu_name", "workload", "valid", "target_verified", "ncu_status", "ncu_target_suitability", "ncu_utilization_status", "profiler_suitability_status",
+    fields = ["trial_id", "gpu_uuid", "gpu_name", "workload", "experiment_role", "valid", "target_verified", "ncu_status", "ncu_target_suitability", "ncu_utilization_status", "profiler_suitability_status",
+              "memory_access_geometry", "memory_coalescing", "memory_coalescing_energy_eligible", "energy_peak_population_eligible",
               "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "baseline_state_matched", "baseline_state_issues", "baseline_state_domains_compared", "resource_geometry", "row_width", "nonlinear_contract", "counted_measure_elements", "element_count_convention", "row_operation_convention", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
               "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source",
               "sfu_contract", "counted_measure_sfu_instructions", "sfu_instruction_count_convention",

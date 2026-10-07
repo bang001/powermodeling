@@ -135,6 +135,7 @@ class IntegrationReviewTests(unittest.TestCase):
 
         def capture(executable, trial, device, cuda_device, interval):
             return {"trial_id": trial["trial_id"], "condition_id": trial["condition_id"],
+                    "experiment_role": trial["experiment_role"],
                     "status": "complete", "workload": "tensor", "config": {},
                     "phases": {}, "benchmark": {}, "samples": [],
                     "quality": {"measurement_pid": 42, "runner_errors": [], "benchmark_stderr": ""}}

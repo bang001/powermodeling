@@ -37,7 +37,7 @@ def write_plots(summary, output_dir):
         for objective in OBJECTIVES:
             points = [p for p in c["points"] if p["valid_repeats"] >= summary["selection_policy"]["min_repeats"]
                       and p["rate"] is not None and p["energies"][objective] is not None
-                      and (p["objective_eligible"][objective] or workload in SFU_WORKLOADS and objective == "paired_active_reference")]
+                      and p["objective_measurement_valid"][objective]]
             if points:
                 domains = sorted({p["requested_memory_mhz"] for p in points if p["requested_memory_mhz"] is not None})
                 if len(domains) <= 1:
@@ -83,7 +83,7 @@ def _input_size_figure(component, curve, objective, minimum_repeats, output, fil
     points = [{**p, "anchor_tags": []} for p in curve["rows"]]
     x = lambda p: p["input_elements"] / 1e6
     rate = lambda p: p["rate"] / units["rate_scale"] if p["rate"] is not None else None
-    energy = lambda p: p["energies"][objective]
+    energy = lambda p: p["energies"][objective] if p["objective_measurement_valid"][objective] else None
     rci = lambda p: [v / units["rate_scale"] for v in p["rate_ci95"]] if p["rate_ci95"] else None
     eci = lambda p: p["energy_ci95"][objective]
     _scatter(axes[0], points, x, rate, rci)
@@ -154,7 +154,7 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
     if winner:
         axes[0, 2].scatter([rate(winner)], [energy(winner)], marker="*", s=220, color="#1c2840", label="candidate")
     if c["observed_peak"] is not None:
-        axes[0, 0].axhline(c["observed_peak"] / u["rate_scale"], color="#68758c", linestyle=":", linewidth=1, label="all-valid observed peak")
+        axes[0, 0].axhline(c["observed_peak"] / u["rate_scale"], color="#68758c", linestyle=":", linewidth=1, label="energy-population observed peak")
     for ax, xlabel, ylabel, title in (
         (axes[0, 0], "Requested SM / graphics MHz", u["rate_unit"], "Sustained throughput; every geometry"),
         (axes[0, 1], "Requested SM / graphics MHz", u["energy_unit"], "Energy and repeat uncertainty"),
@@ -189,8 +189,10 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
     axes[1, 2].legend(fontsize=8)
     contract = str(c["stratum"]["experiment_contract"])
     objective_label = ("signed SFU/control contrast; unqualified values are diagnostic" if objective == "paired_active_reference" else "board diagnostic: " + objective.replace("_", " ")) if sfu else objective.replace("_", " ")
+    role = c["stratum"].get("experiment_role", "legacy_unspecified")
+    admission_note = " NCU status is target-path evidence; coalescing eligibility is separate. Diagnostic observations do not establish energy winners." if any(p.get("memory_coalescing") for p in points) else ""
     fig.suptitle(f"{name}: {objective_label} — {c['stratum']['gpu_uuid']}\n{contract[:180]}\n"
-                 f"Repeat medians / bootstrap 95% intervals. Factory default: purple ring; exact 1110: black ring. {rec['status']}.", fontsize=10)
+                 f"Role: {role}. Repeat medians / bootstrap 95% intervals. Factory default: purple ring; exact 1110: black ring. {rec['status']}.\n{admission_note}", fontsize=10)
     _save(fig, name + "-" + objective + "-energy-throughput", output, files, plt)
     files[name + "_" + objective + "_plot"] = files[name + "-" + objective + "-energy-throughput_png"]
 

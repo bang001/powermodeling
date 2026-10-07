@@ -8,7 +8,8 @@ import math
 import statistics
 import re
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, Q_GRID_MATH_IMPLEMENTATION, Q_GRID_IMPLEMENTATION_VERSION, count_issues
-from .memory import VERSIONS as MEMORY_IMPLEMENTATION_VERSIONS, count_issues as memory_count_issues
+from .memory import (VERSIONS as MEMORY_IMPLEMENTATION_VERSIONS,
+                     coalesced_read_geometry, count_issues as memory_count_issues)
 from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, count_issues as sfu_count_issues
 
 
@@ -23,6 +24,7 @@ class ValidationPolicy:
     hbm_min_dram_bytes_per_l2_byte: float = 0.75
     max_sector_inflation: float = 8.25
     min_sector_bytes_per_logical_byte: float = 0.90
+    coalesced_read_counter_ratio_tolerance: float = 0.05
     max_dram_bytes_per_l2_byte: float = 1.25
     max_clock_error_fraction: float = 0.03
     max_clock_drift_fraction: float = 0.03
@@ -37,6 +39,8 @@ class ValidationPolicy:
                 raise ValueError(f"Percentage policy {name} must be in 0..100")
         if self.max_sector_inflation < self.min_sector_bytes_per_logical_byte:
             raise ValueError("Sector inflation maximum must exceed minimum")
+        if self.coalesced_read_counter_ratio_tolerance >= 1:
+            raise ValueError("Coalesced-read counter ratio tolerance must be below1")
 
 
 L1_SECTORS = "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"
@@ -106,6 +110,52 @@ def _traffic_amplification(derived):
         ("dram_bytes_per_logical_byte", "dram_bytes", "logical_bytes")):
         fields[key] = _ratio(fields[numerator], fields[denominator])
     return fields
+
+
+def _memory_coalescing(evidence, traffic, policy, target_path_status):
+    """Keep energy-read coalescing distinct from broad path admission.
+
+    L2 TEX-origin sectors are downstream of the .cg load path. Their byte ratio
+    is a qualified replay diagnostic, not a frontend coalescing or HBM bandwidth
+    measurement. No replay-derived efficiency changes an energy denominator.
+    """
+    workload = evidence.get("workload")
+    geometry = coalesced_read_geometry(evidence.get("profile_benchmark") or {}, workload,
+                                      (evidence.get("profile_provenance") or {}).get("parameters"))
+    applicable = geometry["applicable"]
+    counter = L1_SECTORS if workload == "l1" else L2_READ if workload in ("l2", "hbm") else None
+    ratio_key = "l1_read_sector_bytes_per_logical_read_byte" if workload == "l1" else "l2_read_sector_bytes_per_logical_read_byte"
+    bound = traffic.get("logical_payload_binding") == "one_observed_and_reported_microkernel"
+    ratio = _number(traffic.get(ratio_key)) if applicable and bound else None
+    efficiency = 1 / ratio if ratio is not None and ratio > 0 else None
+    tolerance = policy.coalesced_read_counter_ratio_tolerance
+    bounds = [1 - tolerance, 1 + tolerance]
+    failures = list(geometry["reasons"]) if geometry["status"] == "fail" else []
+    unknown = list(geometry["reasons"]) if geometry["status"] == "inconclusive" else []
+    if applicable:
+        if not bound:
+            unknown.append("coalescing_profile_payload_unbound")
+        if ratio is None:
+            unknown.append("coalescing_sector_ratio_unknown")
+        elif not bounds[0] <= ratio <= bounds[1]:
+            failures.append("coalescing_sector_ratio_outside_unit_tolerance")
+    status = "fail" if failures else "inconclusive" if unknown or not applicable else "pass"
+    return {"applicable": applicable, "status": status, "energy_eligible": False,
+            "reasons": sorted(set(failures + unknown)), "geometry": geometry,
+            "expected_sector_bytes_per_logical_read_byte": 1.0 if applicable else None,
+            "expected_sector_efficiency_fraction": 1.0 if applicable else None,
+            "requested_sector_efficiency_fraction": geometry["requested_sector_efficiency_fraction"],
+            "observed_sector_bytes_per_logical_read_byte": ratio,
+            "observed_sector_efficiency_fraction": efficiency,
+            "observed_sector_efficiency_pct": efficiency * 100 if efficiency is not None else None,
+            "counter_name": counter if applicable else None,
+            "counter_scope": "L1 global-read lookup sectors from one replay launch" if workload == "l1" else
+                             "TEX-origin L2 read sectors downstream of the .cg path; not frontend request efficiency or measured DRAM traffic" if workload in ("l2", "hbm") else "not_applicable",
+            "logical_payload_binding": traffic.get("logical_payload_binding"),
+            "relative_counter_ratio_tolerance": tolerance, "counter_ratio_bounds": bounds,
+            "target_path_status": target_path_status, "profile_binding_verified": None,
+            "energy_denominator_use": "forbidden_separate_profiler_run",
+            "interpretation": "Requested scalar read geometry and replay sector ratio qualify coalesced energy candidates; target path admission, saturation and physical memory energy remain separate. Efficiencies are not clipped at100%."}
 
 
 def _metrics(rows):
@@ -349,6 +399,7 @@ def assess_profile(evidence, policy=None):
     rate_summary["traffic_amplification"] = traffic
     return {"status": _status(checks), "checks": checks, "kernels": kernels, "rates_summary": rate_summary,
             "traffic_amplification": traffic, "policy": asdict(policy),
+            "memory_coalescing": _memory_coalescing(evidence, traffic, policy, _status(checks)),
             "reasons": [c["name"] + ": " + c["requirement"] for c in checks if c["status"] != "pass"],
             "scope": "path/residency admission for whole-device incremental-energy experiments; does not isolate rail or block energy"}
 
@@ -371,6 +422,7 @@ def validate_evidence(record, evidence, policy=None):
     policy = _policy(policy if policy is not None else evidence.get("validation_policy"))
     result = assess_profile(evidence, policy)
     checks = result["checks"]
+    path_check_count = len(checks)
     config = record.get("config") or {}
     provenance = evidence.get("profile_provenance") or {}
     context = evidence.get("profile_context") or {}
@@ -408,6 +460,8 @@ def validate_evidence(record, evidence, policy=None):
     benchmark = evidence.get("profile_benchmark") or {}
     measured_benchmark = record.get("benchmark") or {}
     effective_names = ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated", "kernel_implementation_version", "memory_accesses_per_thread_iteration")
+    if record.get("workload") in ("l1", "l2", "l2_latency", "hbm"):
+        effective_names += ("memory_word_bytes", "stride_words", "lane_stride_bytes")
     if record.get("workload") in NONLINEAR_WORKLOADS:
         effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution",
                             "grid_mode", "input_elements", "block_completion_count_source")
@@ -462,4 +516,16 @@ def validate_evidence(record, evidence, policy=None):
         _check(checks, "matched_actual_" + field, measured_median if median is not None else None, lambda v, e=median: e is not None and abs(v - e) / e <= policy.max_clock_error_fraction, f"actual energy/profile frequency agreement within {policy.max_clock_error_fraction:.1%}")
     result.update(status=_status(checks), suitable_verified=_status(checks) == "pass", profile_actual_clocks=actual_clocks,
                   reasons=[c["name"] + ": " + c["requirement"] for c in checks if c["status"] != "pass"])
+    coalescing = result["memory_coalescing"]
+    payload_binding_checks = [check for check in checks[:path_check_count] if check["name"] in (
+        "profile_memory_count_contract", "single_profile_workload_launch", "profile_logical_bytes",
+        "memory_profile_launch_id_unique_mapping", "memory_profile_observed_launch_count")]
+    binding_verified = _status(checks[path_check_count:] + payload_binding_checks) == "pass"
+    if coalescing["applicable"] and not binding_verified:
+        coalescing["reasons"] = sorted(set(coalescing["reasons"] + ["coalescing_profile_binding_unverified"]))
+        # An unrelated/mismatched replay cannot qualify or disqualify the
+        # measured run's coalescing. Preserve raw ratios with the binding flag.
+        coalescing["status"] = "fail" if coalescing["geometry"]["status"] == "fail" else "inconclusive"
+    coalescing.update(target_path_status=result["status"], profile_binding_verified=binding_verified,
+                      energy_eligible=coalescing["status"] == "pass" and result["suitable_verified"])
     return result

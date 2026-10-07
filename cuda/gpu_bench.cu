@@ -93,6 +93,7 @@ struct Options {
   bool blocks_explicit = false, grid_mode_explicit = false;
   bool sfu_options_explicit = false;
   bool nonlinear_mode_explicit = false;
+  bool stride_elements_explicit = false, stride_words_explicit = false;
 };
 
 uint64_t parse_u64(const std::string& value, const char* flag) {
@@ -122,7 +123,7 @@ void usage() {
     "  --fixed-batches N --warmup-batches N (profiler mode; override timed loops)\n"
     "  --profile-region (cudaProfilerStart/Stop bracket measure only; suppresses paired reference)\n"
     "  --paired-reference --reference-order AB|BA (A=active reference, B=treatment)\n"
-    "  --working-set-bytes N --stride-elements N --offset-bytes N\n"
+    "  --working-set-bytes N --stride-words N (alias --stride-elements; choose one) --offset-bytes N\n"
     "  --access read|write|copy --sm-ids 0,1,... --seed N\n"
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
     "  --row-width 1024 (RMSNorm/Softmax, FP32 full row operations)\n"
@@ -133,6 +134,8 @@ void usage() {
     "Native SFU TANH requires compute capability >=7.5; EX2/LG2 use base2.\n"
     "Canonical nonlinear experiments use sfu_* workloads. Complete streaming functions include global I/O and reductions.\n"
     "Memory stride is in 32-bit words; footprint is total input bytes.\n"
+    "stride-words=1 means 4B lane spacing; 4 means 16B, with ideal 25% payload per 32B sector.\n"
+    "Sector fractions assume a full warp, aligned nonaliasing addresses; measured bandwidth requires counters.\n"
     "L1/L2/HBM read issues one scalar load per thread/iteration with one sum32; default iterations=4096.\n"
     "Write/copy keeps four accesses per thread/iteration; default iterations=1024.\n"
     "L1 splits that footprint into disjoint per-block slices and supports read only.\n"
@@ -169,7 +172,8 @@ Options parse_options(int argc, char** argv) {
     else if (flag == "--idle-seconds") o.idle_seconds = parse_time(value, flag.c_str());
     else if (flag == "--iterations") o.iterations = parse_u64(value, flag.c_str());
     else if (flag == "--working-set-bytes") o.working_set_bytes = parse_u64(value, flag.c_str());
-    else if (flag == "--stride-elements") o.stride_elements = parse_u64(value, flag.c_str());
+    else if (flag == "--stride-elements") { o.stride_elements = parse_u64(value, flag.c_str()); o.stride_elements_explicit = true; }
+    else if (flag == "--stride-words") { o.stride_elements = parse_u64(value, flag.c_str()); o.stride_words_explicit = true; }
     else if (flag == "--offset-bytes") o.offset_bytes = parse_u64(value, flag.c_str());
     else if (flag == "--seed") o.seed = parse_u64(value, flag.c_str());
     else if (flag == "--tensor-accumulators") o.accumulators = parse_int(value, flag.c_str());
@@ -195,7 +199,9 @@ Options parse_options(int argc, char** argv) {
   if (o.reference_order != "AB" && o.reference_order != "BA") throw std::runtime_error("--reference-order must be AB or BA");
   if (o.paired_reference && !o.profile_region && o.workload != "control" && (o.seconds < 10 || o.warmup_seconds < 1 || o.idle_seconds < 6))
     throw std::runtime_error("paired energy arms require seconds>=10, warmup-seconds>=1 and idle-seconds>=6");
-  if (o.stride_elements == 0 || o.stride_elements > (1ULL << 32)) throw std::runtime_error("invalid --stride-elements");
+  if (o.stride_elements_explicit && o.stride_words_explicit)
+    throw std::runtime_error("choose only one of --stride-words and --stride-elements; both flags use 32-bit word units");
+  if (o.stride_elements == 0 || o.stride_elements > (1ULL << 32)) throw std::runtime_error("invalid --stride-words/--stride-elements");
   if (o.accumulators < 1 || o.accumulators > kMaxAccumulators) throw std::runtime_error("--tensor-accumulators must be 1..8");
   if (o.threads < 32 || o.threads > 1024 || o.threads % 32) throw std::runtime_error("--threads must be a multiple of 32 between 32 and 1024");
   if (o.offset_bytes % 4 || o.working_set_bytes % 4) throw std::runtime_error("memory offset/footprint must be multiples of 4 bytes");
@@ -1013,6 +1019,9 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"memory_address_sequence_restarts_each_launch\":" << (memory && !latency ? "true" : "false")
     << ",\"finite_footprint_scope\":\"one unfiltered memory launch; filtered values are bounds over entire launched grid; latency value bounds all measured dependent probes\""
     << ",\"stride_elements\":" << o.stride_elements << ",\"offset_bytes\":" << o.offset_bytes
+    << ",\"memory_word_bytes\":" << (memory ? "4" : "null")
+    << ",\"stride_words\":" << (memory ? std::to_string(o.stride_elements) : "null")
+    << ",\"lane_stride_bytes\":" << (memory ? std::to_string(o.stride_elements * uint64_t(4)) : "null")
     << ",\"tensor_accumulators\":" << o.accumulators
     << ",\"gemm_m\":" << o.gemm_m << ",\"gemm_n\":" << o.gemm_n << ",\"gemm_k\":" << o.gemm_k
     << ",\"seed\":" << o.seed << ",\"checksum\":" << checksum << ",\"checksum_kind\":" << quote(checksum_kind)

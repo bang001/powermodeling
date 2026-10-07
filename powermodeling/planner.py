@@ -8,13 +8,53 @@ import math
 import random
 
 from .profiles import declare_sxm
+from .memory import coalesced_read_geometry
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS
 from .sfu import SFU_WORKLOADS, REFERENCE_KIND as SFU_REFERENCE_KIND
 
 WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS
-PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "iterations",
+PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "stride_words", "iterations",
               "tensor_accumulators", "access", "sm_ids", "seed", "offset_bytes",
               "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode", "sfu_lanes", "sfu_chains", "nonlinear_mode"}
+EXPERIMENT_ROLES = {"energy_characterization", "diagnostic"}
+
+
+def _normalize_stride(parameters):
+    """Keep historical count fields canonical while accepting word terminology."""
+    if "stride_words" in parameters and "stride_elements" in parameters:
+        raise ValueError("Specify only one of stride_words or stride_elements")
+    result = dict(parameters)
+    if "stride_words" in result:
+        result["stride_elements"] = result.pop("stride_words")
+    return result
+
+
+def validate_experiment_geometry(workload, parameters, experiment_role, device):
+    """Validate declared roles before execution, preserving unlabelled old plans."""
+    if experiment_role is not None and (not isinstance(experiment_role, str)
+                                       or experiment_role not in EXPERIMENT_ROLES):
+        raise ValueError("experiment_role must be energy_characterization or diagnostic")
+    parameters = _normalize_stride(parameters)
+    if experiment_role != "energy_characterization" or workload not in ("l1", "l2", "hbm"):
+        return
+    if parameters.get("access", "read") != "read":
+        return
+    sm_count, l2_bytes = device.get("sm_count"), device.get("l2_bytes")
+    blocks = parameters.get("blocks", sm_count * 2 if type(sm_count) is int else None)
+    if workload == "l1":
+        default_ws = blocks * 16 * 1024 if type(blocks) is int else None
+    elif workload == "l2":
+        default_ws = max(4, l2_bytes // 8 * 4) if type(l2_bytes) is int else None
+    else:
+        default_ws = max(512 * 1024 * 1024, l2_bytes * 8) if type(l2_bytes) is int else None
+    geometry = coalesced_read_geometry({
+        "blocks": blocks, "threads": 256, "working_set_bytes": default_ws,
+        "access": "read", "stride_elements": 1, "offset_bytes": 0,
+        **parameters}, workload)
+    if geometry["status"] != "pass":
+        raise ValueError("energy_characterization requires coalesced read geometry: "
+                         + "; ".join(geometry["reasons"])
+                         + "; use experiment_role='diagnostic' for locality/stride probes")
 
 
 def numeric_expression(value, names):
@@ -351,6 +391,10 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
         if stage and spec.get("stage", "saturation") != stage: continue
         workload = spec["workload"]
         if workload not in WORKLOADS: raise ValueError(f"Unknown workload {workload}")
+        experiment_role = spec.get("experiment_role", "diagnostic" if _study_design(config) == "diagnostic"
+                                   else "energy_characterization")
+        if not isinstance(experiment_role, str) or experiment_role not in EXPERIMENT_ROLES:
+            raise ValueError("experiment_role must be energy_characterization or diagnostic")
         skip_unsupported = spec.get("skip_if_unsupported", False)
         if type(skip_unsupported) is not bool:
             raise ValueError("skip_if_unsupported must be boolean")
@@ -364,6 +408,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 if not skip_unsupported:
                     raise ValueError(reason)
                 unsupported_experiments.append({"workload": workload, "stage": spec.get("stage", "saturation"),
+                    "experiment_role": experiment_role,
                     "reason": reason, "compute_capability": major * 10 + minor})
                 continue
         paired = spec.get("paired_reference", paired_default if workload in {"tensor", "l1", "l2", "hbm"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS else False)
@@ -374,14 +419,22 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
         if paired and workload not in {"tensor", "l1", "l2", "hbm", "gemm"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS:
             raise ValueError("Paired issue-loop reference is available only for treatment workloads; latency/control remain diagnostic")
         grid = spec.get("grid", {})
+        parameters = spec.get("parameters", {})
+        # Reject contradictory spelling across parameters and grid as well as
+        # within one mapping, even when the two supplied values happen to match.
+        _normalize_stride({**parameters, **grid})
+        grid, parameters = _normalize_stride(grid), _normalize_stride(parameters)
         if set(grid) - PARAMETERS: raise ValueError(f"Unknown parameters: {set(grid)-PARAMETERS}")
         if any(not isinstance(v, list) or not v for v in grid.values()):
             raise ValueError("Each grid parameter must be a nonempty list")
         keys = sorted(grid, key=lambda k: (k not in ("blocks", "threads"), k))
         for values in itertools.product(*(grid[k] for k in keys)):
-            params = dict(spec.get("parameters", {}))
+            params = dict(parameters)
             params.update(dict(zip(keys, values)))
             if workload in ("l1", "l2", "hbm"):
+                params.setdefault("access", "read")
+                params.setdefault("stride_elements", 1)
+                params.setdefault("offset_bytes", 0)
                 # A scalar read emits one load per iteration. Four times the
                 # former implicit loop count preserves default payload and
                 # finite-launch coverage; explicitly requested counts are literal.
@@ -392,6 +445,8 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 value = params[key]
                 resolved[key] = value if key in ("access", "sm_ids", "grid_mode", "nonlinear_mode") else numeric_expression(value, env)
                 env[key] = resolved[key]
+                if key == "stride_elements":
+                    env["stride_words"] = resolved[key]
             if workload in NONLINEAR_WORKLOADS and resolved.get("nonlinear_mode") != "streaming":
                 raise ValueError(f"Legacy streaming workload {workload!r} requires nonlinear_mode='streaming'; use sfu_* workloads for register SFU experiments")
             if "nonlinear_mode" in resolved and workload not in NONLINEAR_WORKLOADS:
@@ -518,11 +573,14 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 reachable_sector_bytes=min(ws,(word_count//math.gcd(word_count,stride))*32)
                 if reachable_sector_bytes < names["l2_bytes"]*4:
                     raise ValueError("HBM stride aliases a potentially cache-resident footprint; enlarge working_set_bytes")
+            validate_experiment_geometry(workload, resolved, experiment_role, names)
             geometry_keys.setdefault(workload, set()).add(json.dumps({
-                "stage": spec.get("stage", "saturation"), "parameters": resolved, "paired_reference": paired}, sort_keys=True))
+                "stage": spec.get("stage", "saturation"), "experiment_role": experiment_role,
+                "parameters": resolved, "paired_reference": paired}, sort_keys=True))
             for pair in clocks:
                 clock_annotation = clock_annotations[_clock_key(pair)]
                 condition = {"workload": workload, "stage": spec.get("stage", "saturation"),
+                             "experiment_role": experiment_role,
                              "parameters": resolved, "clocks": pair,
                              "clock_policy": clock_annotation["clock_policy"],
                              "clock_selection_reasons": clock_annotation["selection_reasons"],
@@ -581,10 +639,14 @@ def benchmark_command(executable, trial, device_index=0, profiling=False):
                "--seconds", str(0.1 if profiling else trial["seconds"]),
                "--warmup-seconds", str(0 if profiling else trial["warmup_seconds"]),
                "--idle-seconds", str(0 if profiling else trial["idle_seconds"])]
-    for key, value in trial["parameters"].items():
+    # Old plans may still be bound to binaries predating the word-spelling
+    # alias. Preserve their command contract for replay and counter profiling.
+    word_spelling = "experiment_role" in trial or "stride_words" in trial["parameters"]
+    for key, value in _normalize_stride(trial["parameters"]).items():
         if profiling and key == "batch_launches": continue
         if key == "sm_ids" and isinstance(value, list): value = ",".join(str(v) for v in value)
-        command += ["--"+key.replace("_", "-"), str(value)]
+        flag = "--stride-words" if key == "stride_elements" and word_spelling else "--" + key.replace("_", "-")
+        command += [flag, str(value)]
     if profiling:
         command += ["--batch-launches","1","--warmup-batches","1","--fixed-batches","1", "--profile-region"]
     if trial.get("treatment_protocol", {}).get("kind") == "paired_active_reference":

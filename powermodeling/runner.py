@@ -15,7 +15,7 @@ import shutil
 import signal
 import time
 
-from .planner import benchmark_command
+from .planner import benchmark_command, validate_experiment_geometry
 from .sfu import SFU_WORKLOADS, REFERENCE_KIND as SFU_REFERENCE_KIND
 
 
@@ -47,6 +47,11 @@ def validate_plan_execution(plan):
     must retain every planned clock condition for each workload geometry; use
     the run limit for a partial diagnostic instead of deleting required arms.
     """
+    for trial in plan.get("trials") or []:
+        if "experiment_role" in trial and trial["experiment_role"] is None:
+            raise ValueError("experiment_role must be energy_characterization or diagnostic")
+        validate_experiment_geometry(trial.get("workload"), trial.get("parameters") or {},
+                                     trial.get("experiment_role"), plan.get("device") or {})
     coverage = plan.get("clock_sweep_coverage") or {}
     strict = plan.get("study_design") == "energy_sweep"
     reasons = coverage.get("requirement_reasons") or []
@@ -121,6 +126,7 @@ def validate_plan_execution(plan):
         design = {key: value for key, value in protocol.items()
                   if key not in ("order", "phase_order", "order_balance_note")}
         signature = json.dumps({"workload": trial.get("workload"), "stage": trial.get("stage"),
+                                "experiment_role": trial.get("experiment_role"),
                                 "parameters": trial.get("parameters"), "treatment_design": design}, sort_keys=True)
         pair = trial.get("clocks") or {}
         by_geometry.setdefault(signature, set()).add((pair.get("graphics_mhz"), pair.get("memory_mhz")))
@@ -296,6 +302,7 @@ def _trial_record(trial, cuda_device, command):
     return {
         "schema_version": 1, "trial_id": trial["trial_id"], "condition_id": trial["condition_id"],
         "repeat": trial["repeat"], "workload": trial["workload"], "status": "failed",
+        **({"experiment_role": trial["experiment_role"]} if "experiment_role" in trial else {}),
         "config": {**trial["parameters"], "gpu_uuid": cuda_device["uuid"],
                    "graphics_clock_mhz": trial["clocks"]["graphics_mhz"],
                    "memory_clock_mhz": trial["clocks"]["memory_mhz"],
@@ -510,6 +517,8 @@ def run_plan(plan, executable, output_dir, cuda_device, apply_clocks=False,
                     old = json.loads(path.read_text())
                     if old.get("condition_id") != trial["condition_id"]:
                         raise ValueError("Existing trial fingerprint differs; choose a new output directory")
+                    if old.get("experiment_role") != trial.get("experiment_role"):
+                        raise ValueError("Existing trial experiment role differs; choose a new output directory")
                     if (old.get("provenance") or {}).get("benchmark_sha256") != cuda_device.get("benchmark_sha256"):
                         raise ValueError("Existing trial was measured with a different binary; choose a new output directory")
                     if (old.get("config") or {}).get("gpu_uuid") != cuda_device["uuid"]:

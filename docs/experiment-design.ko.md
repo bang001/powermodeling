@@ -101,8 +101,8 @@ PTX의 `.ca`는 cache-all, `.cg`는 global-level caching의 힌트이다. `.cg`�
 | L1 working set/block | 8–64 KiB 구간 | 동시에 상주하는 block들의 총량이 중요 |
 | L2 working set | 조회된 용량의 0.1–0.7배부터 | slice 분포·replication·다른 트래픽에 따른 유효 용량 변화 |
 | HBM working set | 조회 L2의 4배 이상부터 | GPU 메모리 여유를 확인하고 더 크게도 반복 |
-| stride | 원소 단위 1, 2, 4, 8, 32 등 | 원소 크기를 곱해야 byte stride가 됨 |
-| address offset | 정렬된 여러 offset | 주소에 따른 slice/partition 행동을 경험적으로 관찰 |
+| stride | 이동 에너지 read는 `stride_words=1`; 2/4/8/32는 진단 | word=4 B. stride 4는 레인 간 16 B로 이상적 sector 효율 25% |
+| address offset | 이동 에너지 read는 기본 0 B; 본 실험은 32 B 정렬 | 여러 offset의 locality/정렬 비교는 진단 역할로 분리 |
 | 데이터 | 재현되는 nonzero pseudo-random | zero-filled 데이터의 압축·낮은 토글 활동과 구분 |
 
 위 working-set·stride·offset 축은 메모리 실험에 적용한다. 기본 nonlinear/SFU의 Q는
@@ -112,6 +112,14 @@ global/shared/local 데이터 load/store가 없고 초기화와 마지막 lane�
 Constant-bank operand의 공급까지 없다는 뜻은 아니다. SFU를
 고정 blocks/SM으로 제한하는 실행은 진단용으로 남기며, Q를 늘렸다는 이유만으로
 포화를 가정하지 않는다. 별도 iteration sweep으로 고정 비용의 영향을 확인한다.
+
+메모리 이동 에너지 본 실험은 full warp의 연속 scalar read가 100% sector 효율을
+내도록 설계한다. `stride_words` / `--stride-words`는 uint32(4 B) 단위이며 기존
+`stride_elements` / `--stride-elements`와 같은 의미다. 본 실험 계획은 stride 1,
+32 B 정렬 offset 및 effective region, 최소 128 B region을 요구한다. 여러 stride,
+misalignment, locality 설정은 `experiment_role=diagnostic`으로 표시하여 고정
+clock에서도 에너지 최적점에서 제외한다. 기존 기본 stride도 1이었으며,
+진단 조건의 낮은 sector 효율을 본 실험에 허용했던 검증 누락을 보완하는 변경이다.
 
 `KiB = 1,024 bytes`, `MiB = 1,048,576 bytes`이고, `GB/s = 10^9 bytes/s`이다. Nsight Compute의 정의에서 L1/L2 cache line은 128 bytes, sector는 32 bytes이며 최소 접근 크기는 sector 하나다. Line이 4 sectors라고 매 요청이 항상 128 bytes를 전송하는 것은 아니다. Full warp의 32개 thread가 각각 연속된 4-byte 원소를 읽고 시작 주소가 32-byte 정렬이면 요청량은 128 bytes, 요청 sector 수는 4다. 128-byte 정렬된 기준 주소에서 시작점을 4 bytes 옮기면 5 sectors, 32 bytes 옮기면 두 128-byte line에 걸쳐도 4 sectors이다. 현재 single-stream read v2는 이런 scalar load를 thread당 iteration마다 1개 실행하므로 warp당 logical payload는 128 bytes이다. 이전 four-stream read는 4개/512 bytes였고 write/copy는 기존 네 접근을 유지한다. [변경된 read count와 재실험 방법](memory-read-v2.ko.md)을 참고한다. [sector 검토와 정렬 비교 설정](cache-sector-review.ko.md)을 별도로 제공한다. stride가 커지면 같은 logical bytes를 읽어도 많은 sectors가 움직일 수 있다. HBM stride sweep은 전체 stride cycle에서 가능한 sector footprint와 **한 launch가 유한한 iteration 동안 방문하는 footprint**를 구분한다. 주소 시작점이 같은 짧은 launch를 반복하면 큰 할당도 cache에 머물 수 있다. worker는 정확한 footprint 또는 상한임을 표시하고 주소 정렬·SM filter 한계를 기록한다. write/copy는 각 thread의 목적지 소유권을 겹치지 않게 유효 footprint를 조정한다. actual DRAM counter는 여전히 필요하며 cache throughput과 HBM bandwidth를 logical bytes만으로 비교하지 않는다. [S9]
 
@@ -204,7 +212,16 @@ verified 선택은 NCU 통과·같은 측정 구간의 정확한 work count·반
 
 자동 평가 결과는 `pass`, `fail`, `inconclusive`와 개별 check·사용 policy·계산한 traffic 지표를 보존한다. 필수 counter가 없거나 `n/a`, 유효하지 않은 단위·범위, 불충분한 clock evidence이면 판단을 유보한다. 명확한 기준 위반은 실패로 기록한다. threshold는 변경 가능한 본 프로젝트의 실험 정책이며 NVIDIA가 보장하는 물리 경계값이 아니다. 수동 `*_verified: true` 표시는 자동 판정을 덮어쓰지 못한다. evidence 연결 시와 분석 시 재평가한다.
 
-기본 read policy는 L1/L2 hit 95% 이상, L1 bypass hit 5% 이하, cache의 하위 byte/logical byte 0.10 이하를 요구한다. HBM은 read L2 hit 20% 이하·요청 방향의 DRAM/logical byte 0.75 이상·DRAM/L2 byte 0.75–1.25를 사용한다. sector inflation 0.90–8.25와 실제 클럭 오차/drift 3% 한계도 기록한다. local load/store sector가 있으면 register spill 또는 local-memory 경로가 함께 사용되므로 component isolation의 적절성은 실패한다. L2 write/copy residency는 read hit만으로 검증할 수 없어 현재 별도 policy 필요 상태로 남긴다. Tensor activity가 양수라는 경로 확인과 Tensor peak 활용률은 구분한다.
+기본 read policy는 L1/L2 hit 95% 이상, L1 bypass hit 5% 이하, cache의 하위 byte/logical byte 0.10 이하를 요구한다. HBM은 read L2 hit 20% 이하·요청 방향의 DRAM/logical byte 0.75 이상·DRAM/L2 byte 0.75–1.25를 사용한다. 경로 진단의 넓은 sector inflation 0.90–8.25와 실제 클럭 오차/drift 3% 한계도 기록한다. local load/store sector가 있으면 register spill 또는 local-memory 경로가 함께 사용되므로 component isolation의 적절성은 실패한다. L2 write/copy residency는 read hit만으로 검증할 수 없어 현재 별도 policy 필요 상태로 남긴다. Tensor activity가 양수라는 경로 확인과 Tensor peak 활용률은 구분한다.
+
+Read의 verified 에너지 후보에는 별도 **`memory_coalescing`** 통과도 요구한다.
+L1은 L1 global-read sector bytes, L2/HBM은 L2 TEX-origin read-sector bytes를
+같은 replay의 logical read bytes와 비교한다. 예상 비율은 1.0(100% sector 효율),
+기본 관측 허용 범위는 0.95–1.05다. `.cg`의 L1 bypass 수치로 coalescing을
+확정하거나 L2 read/write sectors를 섞지 않는다. stride 4의 비율 4.0은 넓은 경로
+기준을 통과해도 이 조건에서 탈락하며, counter가 없으면 미확정으로 남는다.
+Logical BW, L1/L2 read-sector BW, DRAM read BW는 계층·측정 구간과 함께 각각
+보고한다. NCU replay의 처리량을 energy 구간의 처리량이나 pJ 분모로 대체하지 않는다.
 
 실패와 미확정의 에너지 결과를 삭제하지 않는다. 일반 raw 결과에 상태·이유를 남기고 목표가 검증된 최적값 선택에서 제외한다. `pass`가 증명하는 것은 **관측 counter에서 의도한 데이터/연산 경로를 지배적으로 사용했다는 프로젝트 기준의 적절성**이다. 대역폭이 포화됐다는 증명은 clock/geometry sweep와 별도 plateau 판정, 높은 throughput에서의 최소 에너지는 반복과 95% 선정, 순수 회로 에너지는 rail·식별 가능한 모델 검증을 추가로 요구한다.
 

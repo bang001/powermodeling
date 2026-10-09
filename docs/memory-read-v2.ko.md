@@ -1,9 +1,15 @@
-# 단순 메모리 read 커널
+# 단순 메모리 read 커널 V2·V3
 
-L1·L2·HBM의 `access=read`는 `scalar_single_stream_read_v2`를 사용한다.
+현재 L1·L2·HBM의 `access=read`는 `scalar_single_stream_read_v3`를 사용한다.
+V3는 UINT32_MAX 이하의 region word 수·iterations에 32-bit index/loop 경로를
+사용하고 큰 범위는 64-bit로 처리한다. HBM의 `.ca`/`.cs`는 별도 비교 진단이며
+기본 정책은 아래 V2와 같다. V2 raw count도 계속 인정하고 버전을 구분한다.
+[HBM 80% 기준·오버헤드·cache 정책과 실행 방법](hbm-bandwidth-design.ko.md)을 참조한다.
+
+아래는 `scalar_single_stream_read_v2`에서 도입하고 V3에도 유지하는 read/count 설계다.
 기존 네 stream의 load·XOR 누산을 단순한 grid-stride read로 변경했다.
 각 thread는 iteration마다 32-bit 원소 하나를 읽고 uint32 합계에 더한 뒤 다음 주소로 이동한다.
-L1은 `.ca`, L2/HBM은 `.cg`를 유지한다. Stride·offset·L1 CTA별 slice·SM filter도
+기본 L1은 `.ca`, L2/HBM은 `.cg`를 유지한다. Stride·offset·L1 CTA별 slice·SM filter도
 그대로 적용하며, 주소는 읽은 데이터에 의존하지 않는다.
 
 이동 에너지 본 실험은 **`stride_words=1`, `offset_bytes=0`**으로 시작한다.

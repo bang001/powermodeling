@@ -21,10 +21,16 @@ from .validation import (DURATION, DRAM_READ, DRAM_WRITE, L1_HITS, L1_MISSES,
 
 # Exact operation-specific counters are preferred. Architecture/release discovery
 # determines support; absent counters are retained as unknown in admission.
+READ_OVERHEAD_METRICS = (
+    "smsp__sass_thread_inst_executed_op_global_ld_pred_on.sum",
+    "smsp__sass_thread_inst_executed_op_integer_pred_on.sum",
+)
+# Executed predicated-on thread instructions diagnose load/address/loop issue
+# costs. They are not instruction energy coefficients or subtractable energy.
 METRICS = list(dict.fromkeys([DRAM_READ, DRAM_WRITE, DURATION, SM_HZ,
     "dram__cycles_elapsed.avg.per_second", L2_READ, L2_READ_HITS, L2_WRITE,
     L1_SECTORS, L1_HITS, L1_MISSES, L1_REQUESTS, LOCAL_LOAD, LOCAL_STORE,
-    *TENSOR_INSTRUCTIONS, *TENSOR_ACTIVITY, *SFU_INSTRUCTIONS, *SFU_ACTIVITY,
+    *TENSOR_INSTRUCTIONS, *TENSOR_ACTIVITY, *SFU_INSTRUCTIONS, *SFU_ACTIVITY, *READ_OVERHEAD_METRICS,
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
     "lts__throughput.avg.pct_of_peak_sustained_elapsed",
     "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
@@ -315,7 +321,7 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
         raise ValueError("Profiled application CUDA UUID differs from plan")
     # Application replay emits one result per pass. Require exact deterministic
     # counter-relevant metadata/payload, allowing elapsed timing to differ.
-    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated", "row_width", "elements", "row_evaluations", "math_implementation", "input_precision", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution", "kernel_implementation_version", "memory_accesses_per_thread_iteration", "grid_mode", "input_elements", "block_completion_count_source")
+    determinism_fields = ("workload", "access", "blocks", "threads", "admitted_blocks", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "logical_bytes", "operations", "kernel_launches", "paired_reference_context_allocated", "row_width", "elements", "row_evaluations", "math_implementation", "input_precision", "rms_epsilon", "affine_gamma", "nonlinear_input_distribution", "kernel_implementation_version", "memory_accesses_per_thread_iteration", "grid_mode", "input_elements", "block_completion_count_source", "read_cache_policy", "memory_read_index_math")
     if trial["workload"] in SFU_WORKLOADS:
         determinism_fields += (*SFU_CONTRACT_FIELDS, "sfu_instructions")
     deterministic = bool(benchmarks) and all(all(item.get(k) == benchmarks[0].get(k) for k in determinism_fields) for item in benchmarks)
@@ -330,12 +336,15 @@ def capture_profile(plan, trial_id, executable, output_dir, ncu="ncu", extra_met
                     "ncu_version": version_text, "ncu_release": list(version_release) if version_release else None,
                     "cuda_ordinal": ordinal, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "deterministic_application_replay": deterministic, "application_pass_results": len(benchmarks),
+                    **({key: benchmarks[0][key] for key in ("read_cache_policy", "memory_read_index_math")
+                        if key in benchmarks[0]} if deterministic else {}),
                     "profile_region": "cudaProfilerStart/Stop measured phase only",
                     "observed_device_records": devices},
                 "available_metrics": sorted(available), "requested_metrics": command[command.index("--metrics") + 1].split(","),
                 "unsupported_metrics": [m for m in METRICS if m not in available],
                 "rows": parse_ncu_csv(raw.read_text(encoding="utf-8")), "locality": "unclassified",
                 "notes": ["Profiler replay readings are not energy measurements.",
+                          "Load and integer instruction counters are optional issue-overhead diagnostics; missing counters are unknown and no energy is subtracted from them.",
                           "Admission thresholds are configurable project policies, not architecture guarantees.",
                           "Broad aggregate hit rates do not prove operation-specific cache residency.",
                           "Locality requires independent empirical SM/address maps and validated fabric counters."]}

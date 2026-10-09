@@ -104,9 +104,18 @@ sector bytes(L1) 또는 L2 TEX-origin read-sector bytes(L2/HBM)를 logical read
 bytes로 나눠 예상 1.0과 대조하고, 기본 정책 0.95–1.05를 통과해야 verified
 에너지 후보가 된다. 넓은 sector-inflation 범위 0.90–8.25에서 경로가 `pass`여도
 stride 4의 비율 4.0은 이 판정을 통과하지 못한다. Counter 미지원은 미확정이다.
-설계 목표 100% sector 효율, 관측 최고 처리량의 95% 선택 규칙, 사양상 peak
-bandwidth 대비 비율은 각각 다른 값이다. [주소별 예시](cache-sector-review.ko.md)를
+설계 목표 100% sector 효율, HBM의 해당 memory clock 이론 bandwidth 80% 기준,
+다른 workload의 관측 최고 처리량 95% 선택 규칙은 각각 다른 값이다. [주소별 예시](cache-sector-review.ko.md)를
 참고한다.
+
+HBM의 이론 byte/s는 `2 × actual_memory_MHz × 10^6 × bus_bits / 8`이다. 같은
+에너지 측정 구간의 지속 logical byte/s가 그 80% 이상인 후보에서 최소 단가를
+선택한다. 버스 폭/실제 clock 미지수는 미확정이며 peak 장치 clock 속성으로
+대체하지 않는다. **HBM에는 관측 peak 95%를 추가로 요구하지 않는다.**
+HBM의 상대 peak와 plateau는 진단으로 보존한다. 물리적 DRAM bus 사용률이나
+포화의 증명은 아니므로 NCU 경로/coalescing과 기존 품질 검증이 함께 필요하다.
+Cache/index variant를 experiment contract와 profiler binding에서 구분한다.
+[HBM 설계](hbm-bandwidth-design.ko.md)
 
 ## 3. 다섯 단계의 판단
 
@@ -127,7 +136,8 @@ bandwidth 대비 비율은 각각 다른 값이다. [주소별 예시](cache-sec
    accumulator까지 포함한다. GEMM은 m×n×k의 problem-size 근거로 별도 표시한다.
    seed/offset만 다른 조건은 새 자원 level이 아니다. 다른 clock의 geometry를
    합쳐 plateau를 만들지 않는다. 결과는 관측 근거이며 hardware saturation
-   증명은 계속 false다.
+   증명은 계속 false다. HBM에서는 이 plateau를 진단으로 보존하며 승인 조건은
+   독립적인 해당 memory clock 이론 BW 80% 기준을 사용한다.
    **Q 기반 auto grid 예외:** blocks×threads가 Q에 묶이므로 기존 자원
    plateau를 적용하지 않는다. 기본 SFU는 primitive·입력 recurrence·chains·threads·
    iterations·grid mode·binary·환경·고정 clock을 맞춘 별도 register lane Q 곡선을
@@ -144,17 +154,19 @@ bandwidth 대비 비율은 각각 다른 값이다. [주소별 예시](cache-sec
 5. **에너지 후보:** 같은 clock에서 최소 2개의 검증 geometry와 exact count,
    반복/CI 요건을 통과한 조건 중 처리량 기준을 만족하는 에너지 최소를 고른다.
    own-clock 최소와 **전체 관측 peak의 95% 성능을 유지하는 전체 clock 후보**를
-   구분한다. 후자만 component recommendation으로 낸다.
+   구분한다. 다른 workload는 후자만 component recommendation으로 낸다.
+   HBM은 이론 BW 80% 이상인 모든 적격 조건에서 최소 단가를 추천한다.
 
 에너지와 처리량의 bootstrap 95% CI 폭/중앙값이 기본 10%를 넘으면 정밀도가
 부족한 후보로 제외한다. plateau 5%, 3 levels, CI 10%는 프로젝트 평가 정책이다.
 `--throughput-fraction`과 `--evaluation-policy policy.json`으로 변경하고 사용값을
 보고서에 보존한다. policy JSON 필드는 `plateau_tolerance_fraction`,
 `minimum_resource_levels`, `maximum_relative_ci_width`다.
+HBM의 별도 이론 BW 비율은 `--hbm-bandwidth-fraction 0.80`으로 설정한다.
 
 판정은 `no_qualified_candidate`, `provisional_candidate`,
 `qualified_observed_candidate`다. 원 계획이 없거나 불완전하고, full energy sweep가
-아니거나 plateau가 미확정이면 관측 후보는 **잠정**이다. 완료된 계획·경로·정렬·
+아니거나 HBM 이외의 plateau가 미확정이면 관측 후보는 **잠정**이다. 완료된 계획·경로·정렬·
 정밀도·plateau를 통과해도 가장 좋은 **관측** 조건이며 미측정 주파수의 최적점은
 아니다. `summary.json`의 이전 empirical optimum 항목은 자체 관측 선택 범위를
 유지하고, 위의 더 강한 종합 판단은 `evaluation.recommendations`에서 확인한다.

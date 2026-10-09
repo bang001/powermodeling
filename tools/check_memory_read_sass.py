@@ -15,9 +15,9 @@ Both L1 and L2/HBM specializations must be present for every SASS architecture.
 It also rejects local-memory accesses and recognizable XOR instructions in
 these loops. This is a structural regression check, not a proof of dynamic
 load counts, cache residency, coalescing, bandwidth, or measured energy. In
-particular, retaining one of several unrolled loads can still pass. Review
-loop induction increments against load counts when changing the kernel, and
-retain the runtime NCU traffic/path checks.
+particular, this does not establish dynamic traffic. Version3 additionally
+matches recognized loop induction steps against scalar load counts and limits
+uint32-loop instruction overhead. Retain the runtime NCU traffic/path checks.
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ BRANCH = re.compile(r"\bBRA(?:\.[A-Z]+)*\s+(0x[0-9a-fA-F]+)\b")
 LOAD = re.compile(r"\bLDG(?:\.[A-Z0-9]+)*\s")
 LOCAL = re.compile(r"\b(?:LDL|STL)(?:\.[A-Z0-9]+)*\s")
 XOR = re.compile(r"\bXOR(?:\.[A-Z0-9]+)*\s|\bLOP3\.LUT\b.*?,\s*0x(?:96|3c|66|5a),", re.IGNORECASE)
+INDUCTION = re.compile(r"\bU?IADD3\s+(U?R\d+),\s*(?:U?P\d+,\s*)?\1,\s*(-?0x[0-9a-fA-F]+),\s*U?RZ\b")
+VECTOR_INDUCTION = re.compile(r"\bVIADD\s+(R\d+),\s*\1,\s*(0x[0-9a-fA-F]+)\b")
 
 
 def check_sass(sass: str) -> tuple[list[str], list[str]]:
@@ -44,6 +46,7 @@ def check_sass(sass: str) -> tuple[list[str], list[str]]:
     failures: list[str] = []
     functions = list(FUNCTION.finditer(sass))
     seen: dict[str, set[str]] = {}
+    versioned = False
     for index, match in enumerate(functions):
         name = match.group(1)
         if "simple_memory_kernel" not in name:
@@ -57,6 +60,13 @@ def check_sass(sass: str) -> tuple[list[str], list[str]]:
             continue
         arch = "sm_" + arch_match.group(1)
         variant = "L1" if specialization.group(1) == "1" else "L2/HBM"
+        contract = re.search(r"simple_memory_kernelILb([01])ELi([012])ELb([01])E", name)
+        narrow = False
+        if contract:
+            versioned = True
+            policy = ("ca", "cg", "cs")[int(contract.group(2))]
+            narrow = contract.group(3) == "1"
+            variant += " " + policy + (" uint32" if narrow else " uint64")
         seen.setdefault(arch, set()).add(variant)
         label = f"{arch} {variant}"
         instructions = [(int(m.group(1), 16), m.group(2)) for m in INSTRUCTION.finditer(body)]
@@ -75,6 +85,21 @@ def check_sass(sass: str) -> tuple[list[str], list[str]]:
             checks.append(f"{loop_label}: {loads} static global load(s), {len(loop)} instructions")
             if not loads:
                 failures.append(f"{loop_label}: no global load inside backward loop (possible load elimination)")
+            if narrow and loads and len(loop) / loads > 10:
+                failures.append(f"{loop_label}: {len(loop) / loads:.2f} static instructions/load exceeds uint32 ceiling10; inspect address/loop arithmetic")
+            if contract:
+                cache_marker = ".STRONG.GPU" if policy == "cg" else ".EF" if policy == "cs" else ".STRONG.CTA" if arch == "sm_70" else ".STRONG.SM"
+                if any(cache_marker not in ins.split()[0] for _, ins in loop if LOAD.search(ins)):
+                    failures.append(f"{loop_label}: scalar load cache policy opcode does not match {policy} ({cache_marker})")
+                steps = []
+                for _, ins in loop:
+                    match = INDUCTION.search(ins) or VECTOR_INDUCTION.search(ins)
+                    if match:
+                        step = int(match.group(2), 16)
+                        if step >= 2**31: step -= 2**32
+                        if abs(step) in (1, 4, 16): steps.append(abs(step))
+                if steps != [loads]:
+                    failures.append(f"{loop_label}: scalar load count {loads} does not match recognized iteration induction steps {steps}; inspect disassembly")
             for address, instruction in loop:
                 if LOCAL.search(instruction):
                     failures.append(f"{loop_label}: local-memory access at 0x{address:x}: {instruction}")
@@ -85,7 +110,9 @@ def check_sass(sass: str) -> tuple[list[str], list[str]]:
     architectures = {"sm_" + match.group(1) for match in ARCHITECTURE.finditer(sass)}
     for arch in sorted(architectures):
         variants = seen.get(arch, set())
-        missing = {"L1", "L2/HBM"} - variants
+        expected = ({"L1 ca uint32", "L1 ca uint64"} |
+                    {f"L2/HBM {policy} {mode}" for policy in ("ca", "cg", "cs") for mode in ("uint32", "uint64")}) if versioned else {"L1", "L2/HBM"}
+        missing = expected - variants
         if missing:
             failures.append(f"{arch}: missing specialization(s): {', '.join(sorted(missing))}")
     return checks, failures

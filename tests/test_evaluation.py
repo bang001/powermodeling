@@ -19,7 +19,7 @@ def study_fixture(step=90):
     parameters = {k: v for k, v in prototype["config"].items() if k in PARAMETERS and k != "blocks"}
     plan = expand_plan({"paired_reference": False, "study_design": "energy_sweep", "repeats": 4,
         "clock_sweep": {"graphics_min_mhz": 900, "graphics_step_mhz": step, "all_memory_clocks": True},
-        "experiments": [{"workload": "hbm", "parameters": parameters, "grid": {"blocks": [80, 160, 320]}}]},
+        "experiments": [{"workload": "l2", "parameters": parameters, "grid": {"blocks": [80, 160, 320]}}]},
         {"uuid": "GPU-evaluation-synthetic", "sm_count": 80, "l2_bytes": 1024, "total_memory_bytes": 2**30},
         {"supported_pairs": [{"graphics_mhz": g, "memory_mhz": 1593} for g in (270, 300, 900, 1110, 1200)],
          "default_applications_graphics_mhz": 1200, "default_applications_memory_mhz": 1593})
@@ -100,7 +100,7 @@ class EvaluationTests(unittest.TestCase):
         records[0]["config"]["iterations"] += 1
         summary = summarize(records, plan=plan)
         self.assertEqual(summary["evaluation"]["coverage"]["status"], "incomplete")
-        self.assertIn(records[0]["trial_id"], summary["evaluation"]["coverage"]["by_workload"]["hbm"]["mismatched_trial_ids"])
+        self.assertIn(records[0]["trial_id"], summary["evaluation"]["coverage"]["by_workload"]["l2"]["mismatched_trial_ids"])
 
     def test_plan_id_match_cannot_hide_changed_repeat_or_binary(self):
         for field in ("repeat", "binary"):

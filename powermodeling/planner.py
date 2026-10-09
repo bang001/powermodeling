@@ -15,7 +15,8 @@ from .sfu import SFU_WORKLOADS, REFERENCE_KIND as SFU_REFERENCE_KIND
 WORKLOADS = {"tensor", "gemm", "l1", "l2", "l2_latency", "hbm", "control"} | NONLINEAR_WORKLOADS | SFU_WORKLOADS
 PARAMETERS = {"blocks", "threads", "working_set_bytes", "stride_elements", "stride_words", "iterations",
               "tensor_accumulators", "access", "sm_ids", "seed", "offset_bytes",
-              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode", "sfu_lanes", "sfu_chains", "nonlinear_mode"}
+              "gemm_m", "gemm_n", "gemm_k", "batch_launches", "row_width", "grid_mode", "sfu_lanes", "sfu_chains", "nonlinear_mode",
+              "read_cache_policy"}
 EXPERIMENT_ROLES = {"energy_characterization", "diagnostic"}
 
 
@@ -29,12 +30,31 @@ def _normalize_stride(parameters):
     return result
 
 
+def resolve_read_cache_policy(workload, parameters):
+    """Resolve scalar-read modifiers without changing old command dictionaries."""
+    read = workload in ("l1", "l2", "hbm") and parameters.get("access", "read") == "read"
+    if not read and "read_cache_policy" not in parameters:
+        return None
+    requested = parameters.get("read_cache_policy", "auto")
+    if not isinstance(requested, str) or requested not in ("auto", "ca", "cg", "cs"):
+        raise ValueError("read_cache_policy must be auto, ca, cg or cs")
+    if not read:
+        raise ValueError("read_cache_policy applies only to L1/L2/HBM scalar reads")
+    policy = ("ca" if workload == "l1" else "cg") if requested == "auto" else requested
+    if workload == "l1" and policy != "ca" or workload == "l2" and policy != "cg":
+        raise ValueError("L1 reads require ca and L2 reads require cg; ca/cs comparisons apply only to HBM")
+    return policy
+
+
 def validate_experiment_geometry(workload, parameters, experiment_role, device):
     """Validate declared roles before execution, preserving unlabelled old plans."""
     if experiment_role is not None and (not isinstance(experiment_role, str)
                                        or experiment_role not in EXPERIMENT_ROLES):
         raise ValueError("experiment_role must be energy_characterization or diagnostic")
     parameters = _normalize_stride(parameters)
+    cache = resolve_read_cache_policy(workload, parameters)
+    if workload == "hbm" and cache in ("ca", "cs") and experiment_role != "diagnostic":
+        raise ValueError("HBM ca/cs comparisons require experiment_role='diagnostic'")
     if experiment_role != "energy_characterization" or workload not in ("l1", "l2", "hbm"):
         return
     if parameters.get("access", "read") != "read":
@@ -443,7 +463,7 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
             resolved, env = {}, dict(names)
             for key in sorted(params, key=lambda k: (k not in ("blocks", "threads"), k)):
                 value = params[key]
-                resolved[key] = value if key in ("access", "sm_ids", "grid_mode", "nonlinear_mode") else numeric_expression(value, env)
+                resolved[key] = value if key in ("access", "sm_ids", "grid_mode", "nonlinear_mode", "read_cache_policy") else numeric_expression(value, env)
                 env[key] = resolved[key]
                 if key == "stride_elements":
                     env["stride_words"] = resolved[key]
@@ -468,6 +488,9 @@ def expand_plan(config, device, supported_clocks=None, stage=None):
                 raise ValueError("access must be read, write or copy")
             if workload in ("l1", "l2_latency") and access != "read":
                 raise ValueError("L1 experiment supports read only; stores are not equivalent L1 accesses")
+            cache = resolve_read_cache_policy(workload, resolved)
+            if cache is not None:
+                resolved["read_cache_policy"] = cache
             if resolved.get("stride_elements", 1) < 1 or resolved.get("iterations", 1) < 1:
                 raise ValueError("stride_elements and iterations must be positive")
             if resolved.get("stride_elements", 1) > 2**32 or resolved.get("iterations", 1) > 2**32:

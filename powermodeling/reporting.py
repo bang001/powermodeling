@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 import math
 import statistics
+import textwrap
 
 from .evaluation import OBJECTIVES
 from .sfu import SFU_WORKLOADS
@@ -224,8 +225,18 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
     winner = next((p for p in points if p["group_id"] == rec.get("group_id")), None)
     if winner:
         axes[0, 2].scatter([rate(winner)], [energy(winner)], marker="*", s=220, color="#1c2840", label="candidate")
+    hbm = c["stratum"]["workload"] == "hbm"
     if c["observed_peak"] is not None:
-        axes[0, 0].axhline(c["observed_peak"] / u["rate_scale"], color="#68758c", linestyle=":", linewidth=1, label="energy-population observed peak")
+        axes[0, 0].axhline(c["observed_peak"] / u["rate_scale"], color="#68758c", linestyle=":", linewidth=1,
+                          label="observed peak (diagnostic only)" if hbm else "energy-population observed peak")
+    if hbm:
+        thresholds = [(p, p.get("hbm_bandwidth") or {}) for p in points]
+        thresholds = [(p, b) for p, b in thresholds if b.get("theoretical_bytes_s") is not None
+                      and b.get("minimum_fraction") is not None and clock(p) is not None]
+        if thresholds:
+            axes[0, 0].scatter([clock(p) for p, b in thresholds],
+                              [b["minimum_fraction"] * b["theoretical_bytes_s"] / u["rate_scale"] for p, b in thresholds],
+                              marker="_", color="#98551e", s=120, label="required fraction of theoretical HBM bandwidth")
     for ax, xlabel, ylabel, title in (
         (axes[0, 0], "Requested SM / graphics MHz", u["rate_unit"], "Sustained throughput; every geometry"),
         (axes[0, 1], "Requested SM / graphics MHz", u["energy_unit"], "Energy and repeat uncertainty"),
@@ -250,7 +261,8 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
         else: axes[1, 1].text(.5, .5, "No qualified energy cells", ha="center", transform=axes[1, 1].transAxes)
         axes[1, 1].set_xticks(range(len(graphics)), graphics, rotation=60, fontsize=7)
         axes[1, 1].set_yticks(range(len(memories)), memories, fontsize=8)
-    axes[1, 1].set(title="Own-clock energy minima; missing evidence is blank", xlabel="Requested SM MHz (discrete measured cells)", ylabel="Requested memory MHz")
+    axes[1, 1].set(title="HBM bandwidth-qualified clock minima; missing evidence is blank" if hbm else "Own-clock energy minima; missing evidence is blank",
+                   xlabel="Requested SM MHz (discrete measured cells)", ylabel="Requested memory MHz")
     statuses = list(STYLES)
     valid = [sum(p["valid_repeats"] for p in c["points"] if p["ncu_status"] == s) for s in statuses]
     rejected = [sum(p["rejected_repeats"] for p in c["points"] if p["ncu_status"] == s) for s in statuses]
@@ -258,11 +270,16 @@ def _energy_figure(c, points, objective, name, output, files, plt, np):
     axes[1, 2].bar(statuses, rejected, bottom=valid, label="rejected", color="#c77373")
     axes[1, 2].set(title="Trial quality by NCU status", ylabel="Trial count")
     axes[1, 2].legend(fontsize=8)
-    contract = str(c["stratum"]["experiment_contract"])
+    contract = textwrap.fill(str(c["stratum"]["experiment_contract"]), width=150)
     objective_label = ("signed SFU/control contrast; unqualified values are diagnostic" if objective == "paired_active_reference" else "board diagnostic: " + objective.replace("_", " ")) if sfu else objective.replace("_", " ")
     role = c["stratum"].get("experiment_role", "legacy_unspecified")
     admission_note = " NCU status is target-path evidence; coalescing eligibility is separate. Diagnostic observations do not establish energy winners." if any(p.get("memory_coalescing") for p in points) else ""
-    fig.suptitle(f"{name}: {objective_label} — {c['stratum']['gpu_uuid']}\n{contract[:180]}\n"
+    if hbm:
+        fractions = sorted({b["minimum_fraction"] for p in points if (b := p.get("hbm_bandwidth") or {}).get("minimum_fraction") is not None})
+        threshold_label = "/".join(f"{fraction:.0%}" for fraction in fractions) or "configured fraction"
+        admission_note += (f"\nHBM admission: logical sustained bandwidth ≥ {threshold_label} of actual-clock / bus-width theory."
+                           "\nObserved peak and plateau are diagnostic; no extra 95% gate; physical DRAM utilization is not measured.")
+    fig.suptitle(f"{name}: {objective_label} — {c['stratum']['gpu_uuid']}\n{contract}\n"
                  f"Role: {role}. Repeat medians / bootstrap 95% intervals. Factory default: purple ring; exact 1110: black ring. {rec['status']}.\n{admission_note}", fontsize=10)
     _save(fig, name + "-" + objective + "-energy-throughput", output, files, plt)
     files[name + "_" + objective + "_plot"] = files[name + "-" + objective + "-energy-throughput_png"]

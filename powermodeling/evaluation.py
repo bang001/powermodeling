@@ -14,6 +14,7 @@ import statistics
 from .nonlinear import NONLINEAR_WORKLOADS
 from .sfu import CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, SFU_WORKLOADS
 from .memory import coalesced_read_geometry
+from .hbm_bandwidth import throughput_eligible, threshold_metadata
 
 TENSOR = {"tensor", "gemm", "fp16_tensor", "tensor_fp16"}
 MEMORY = {"l1", "l2", "hbm"}
@@ -38,6 +39,8 @@ def experiment_contract(workload, benchmark, config):
             size = get("l1_bytes_per_block", size / blocks if number(size) is not None and number(blocks) and blocks > 0 else None)
         return {"access": get("access", "read"),
                 "kernel_implementation_version": get("kernel_implementation_version"),
+                "read_cache_policy": get("read_cache_policy", "ca" if workload == "l1" else "cg"),
+                "memory_read_index_math": get("memory_read_index_math", "uint64"),
                 "memory_accesses_per_thread_iteration": get("memory_accesses_per_thread_iteration"),
                 "l1_bytes_per_block" if workload == "l1" else "working_set_bytes": size,
                 "stride_elements": get("stride_elements", 1),
@@ -62,7 +65,11 @@ def component_stratum(group):
 
 
 def energy_role_eligible(group):
-    return group.get("experiment_role", "legacy_unspecified") in ("energy_characterization", "legacy_unspecified")
+    contract = group.get("experiment_contract") or {}
+    cache = contract.get("read_cache_policy", (group.get("config") or {}).get("read_cache_policy", "cg"))
+    access = contract.get("access", (group.get("config") or {}).get("access", "read"))
+    return (group.get("experiment_role", "legacy_unspecified") in ("energy_characterization", "legacy_unspecified")
+            and not (group.get("workload") == "hbm" and access == "read" and cache != "cg"))
 
 
 def _memory_read(group):
@@ -143,7 +150,7 @@ def _capacity(group):
     return blocks * threads * accumulators if group["workload"] == "tensor" else blocks * threads
 
 
-def _qualified(group, metric, rate, minimum_repeats, policy):
+def _qualified(group, metric, rate, minimum_repeats, policy, require_hbm_candidate=True):
     width = _ci_width(group, metric)
     rate_width = _ci_width(group, rate)
     sfu_positive = (group.get("workload") not in SFU_WORKLOADS or
@@ -152,6 +159,8 @@ def _qualified(group, metric, rate, minimum_repeats, policy):
                      and isinstance(group.get("ci95", {}).get(metric), list)
                      and len(group["ci95"][metric]) == 2 and (number(group["ci95"][metric][0]) or 0) > 0))
     return (energy_role_eligible(group) and energy_coalescing_eligible(group) and sfu_positive
+            and (not require_hbm_candidate or group.get("workload") != "hbm"
+                 or (group.get("hbm_bandwidth") or {}).get("eligible") is True)
             and group.get("valid_repeats", 0) >= minimum_repeats and group.get("verified_selection_eligible") is True
             and number(group.get(metric)) is not None and group[metric] >= 0
             and width is not None and width <= policy.maximum_relative_ci_width
@@ -161,6 +170,9 @@ def _qualified(group, metric, rate, minimum_repeats, policy):
 def _eligibility_reasons(group, objective, metric, rate, minimum_repeats, policy):
     reasons = []
     if not energy_role_eligible(group): reasons.append("Diagnostic experiment role is excluded from energy characterization")
+    if group.get("workload") == "hbm" and (group.get("hbm_bandwidth") or {}).get("eligible") is not True:
+        reasons.append("HBM clock-specific theoretical bandwidth threshold is unqualified")
+        reasons.extend((group.get("hbm_bandwidth") or {}).get("reasons", ["missing_hbm_bandwidth_evidence"]))
     if not energy_coalescing_eligible(group):
         reasons.append("Coalesced memory-read energy evidence is unqualified")
         reasons.extend((group.get("memory_coalescing") or {}).get("reasons", []))
@@ -384,12 +396,15 @@ def _comparison(candidate, groups, objective, rate, metric, minimum_repeats, pol
         return {"status": "inconclusive", "reason": "A unique matched geometry/input/seed reference is missing", "anchor": anchor}
     ref = refs[0]
     eligible = objective == "total" or ref.get(objective + "_eligible") is True
-    if not eligible or not _qualified(ref, metric, rate, minimum_repeats, policy) or ref[metric] <= 0:
-        return {"status": "inconclusive", "reason": "Reference lacks qualified positive energy, repeats, exact counts or profile evidence", "anchor": anchor, "reference_group_id": ref["group_id"]}
+    if not eligible or not _qualified(ref, metric, rate, minimum_repeats, policy, require_hbm_candidate=False) or ref[metric] <= 0:
+        return {"status": "inconclusive", "reason": "Reference lacks qualified positive energy, repeats, exact counts or profile evidence", "anchor": anchor, "reference_group_id": ref["group_id"],
+                "reference_hbm_bandwidth": ref.get("hbm_bandwidth")}
     cci, rci = candidate["ci95"][metric], ref["ci95"][metric]
     bounds = [1 - cci[1] / rci[0], 1 - cci[0] / rci[1]] if rci[0] > 0 else None
     same = candidate["group_id"] == ref["group_id"]
     return {"status": "available", "anchor": anchor, "reference_group_id": ref["group_id"],
+            "reference_hbm_bandwidth": ref.get("hbm_bandwidth"),
+            "reference_bandwidth_scope": "A qualified measured anchor remains available for comparison even when it does not meet the HBM candidate bandwidth threshold" if ref.get("workload") == "hbm" else None,
             "energy_reduction_fraction": 0 if same else 1 - candidate[metric] / ref[metric],
             "throughput_ratio": 1 if same else candidate[rate] / ref[rate],
             "energy_reduction_interval_from_ci_endpoints": [0, 0] if same else bounds,
@@ -458,6 +473,8 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "memory_observed_sector_efficiency_pct": coalescing.get("observed_sector_efficiency_pct"),
                 "memory_coalescing_energy_eligible": group.get("memory_coalescing_energy_eligible"),
                 "hbm_memory_power": group.get("hbm_memory_power"),
+                "hbm_bandwidth": group.get("hbm_bandwidth"),
+                **threshold_metadata(group, fraction),
                 "energy_peak_population_eligible": energy_peak_population_eligible(group),
                 "requested_memory_mhz": cfg.get("memory_clock_mhz"), "achieved_graphics_mhz": group.get("graphics_clock_mhz"),
                 "achieved_sm_mhz": group.get("sm_clock_mhz"), "achieved_memory_mhz": group.get("memory_clock_mhz"),
@@ -512,7 +529,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             for objective in OBJECTIVES:
                 metric = objective + "_" + u["energy_suffix"]
                 eligible = [g for g in verified if count >= minimum_geometries and _qualified(g, metric, rate, minimum_repeats, policy)
-                            and peak is not None and g[rate] >= fraction * peak
+                            and throughput_eligible(g, rate, peak, fraction)
                             and (objective == "total" or g.get(objective + "_eligible") is True)]
                 winner = min(eligible, key=lambda g: (g[metric], -g[rate], g["group_id"])) if eligible else None
                 best[objective] = winner["group_id"] if winner else None
@@ -522,13 +539,14 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                        "hardware_saturation_proven": False} if q_grid else _plateau(rows, rate, fraction, minimum_repeats, policy)
             clocks.append({"graphics_mhz": gfx, "memory_mhz": mem, "observed_peak": peak,
                 "verified_peak": max((g[rate] for g in verified), default=None), "verified_geometry_count": count,
-                "minimum_energy_group_ids": best, "plateau": plateau})
+                "minimum_energy_group_ids": best, "plateau": plateau,
+                "plateau_is_candidate_gate": workload != "hbm"})
         observed_peak = max((c["observed_peak"] for c in clocks if c["observed_peak"] is not None), default=None)
         for point in point_rows:
             clock = next((c for c in clocks if (c["graphics_mhz"], c["memory_mhz"]) == (point["requested_graphics_mhz"], point["requested_memory_mhz"])), None)
             extra = []
             if clock and clock["verified_geometry_count"] < minimum_geometries: extra.append("Too few verified execution geometries at this clock")
-            if observed_peak and point["rate"] is not None and point["rate"] < fraction * observed_peak: extra.append("Below the all-valid observed throughput threshold")
+            if workload != "hbm" and observed_peak and point["rate"] is not None and point["rate"] < fraction * observed_peak: extra.append("Below the all-valid observed throughput threshold")
             for reasons in point["eligibility_reasons"].values(): reasons.extend(extra)
         recommendations = []
         tagged = [g for rows in clock_buckets.values() for g in rows]
@@ -542,10 +560,11 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 recommendations.append({"objective": objective, "status": "diagnostic_only", "group_id": None,
                     "reason": "Board total and idle increment are not direct SFU energy results; the primary estimator is the signed matched register-loop contrast"})
                 continue
-            eligible = [g for g in candidates[objective] if observed_peak is not None and g[rate] >= fraction * observed_peak]
+            eligible = [g for g in candidates[objective] if throughput_eligible(g, rate, observed_peak, fraction)]
             if not eligible:
                 recommendations.append({"objective": objective, "status": "no_qualified_candidate", "group_id": None,
-                    "reason": "No candidate meets profile/count/repeat/CI/geometry gates and the full observed throughput threshold"}); continue
+                    "reason": "No candidate meets profile/count/repeat/CI/geometry gates and the HBM clock-specific theoretical bandwidth threshold" if workload == "hbm" else
+                              "No candidate meets profile/count/repeat/CI/geometry gates and the full observed throughput threshold"}); continue
             winner = min(eligible, key=lambda g: (g[metric], -g[rate], g["group_id"]))
             clock = next(c for c in clocks if (c["graphics_mhz"], c["memory_mhz"]) == (winner["config"]["graphics_clock_mhz"], winner["config"]["memory_clock_mhz"]))
             reasons = []
@@ -558,11 +577,15 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
             curve = _input_curve_signature(winner)
             plateau = (_input_size_plateau(winner, input_curves[curve], objective, metric, rate, fraction, minimum_repeats, policy)
                        if curve is not None else clock["plateau"])
-            if plateau["status"] not in ("observed_plateau", "observed_problem_size_plateau", "observed_input_size_plateau"):
+            if workload != "hbm" and plateau["status"] not in ("observed_plateau", "observed_problem_size_plateau", "observed_input_size_plateau"):
                 reasons.append("input-size plateau is inconclusive" if curve is not None else "resource plateau is inconclusive")
             recommendations.append({"objective": objective, "group_id": winner["group_id"],
                 "status": "provisional_candidate" if reasons else "qualified_observed_candidate", "qualification_limits": reasons,
-                "saturation_evidence": plateau,
+                "saturation_evidence": {"status": "clock_specific_theoretical_bandwidth_threshold_met",
+                                        "hardware_saturation_proven": False,
+                                        "hbm_bandwidth": winner.get("hbm_bandwidth"),
+                                        "resource_plateau_diagnostic": plateau} if workload == "hbm" else plateau,
+                **threshold_metadata(winner, fraction),
                 "energy": winner[metric], "energy_ci95": winner["ci95"].get(metric), "throughput_fraction_of_observed_peak": winner[rate] / observed_peak,
                 "near_optimum_group_ids": [g["group_id"] for g in eligible if g[metric] <= winner[metric] * (1 + selection.get("near_optimum_fraction", 0.05))],
                 "factory_default_comparison": _comparison(winner, tagged, objective, rate, metric, minimum_repeats, policy, "factory_default"),
@@ -580,8 +603,10 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "global_constraint_candidate_group_id": recommendation.get("group_id"),
                 "global_constraint_candidate_energy": energy,
                 "global_constraint_energy_over_own_clock_energy": energy / own[metric] if own and own[metric] > 0 and energy is not None else None,
-                "reason": "The lowest own-clock candidate falls below the full-sweep throughput threshold" if own and observed_peak and own[rate] < fraction * observed_peak else "The lowest own-clock candidate meets the full-sweep throughput threshold" if own else "No qualified own-clock candidate",
-                "scope": "Same count/profile/repeat/CI/geometry gates and own-clock throughput bar; comparing the added full-sweep throughput constraint, not correcting energy or proving saturation"})
+                "reason": "HBM candidates use the clock-specific theoretical bandwidth threshold; observed-peak ratios do not exclude candidates" if workload == "hbm" else
+                          "The lowest own-clock candidate falls below the full-sweep throughput threshold" if own and observed_peak and own[rate] < fraction * observed_peak else "The lowest own-clock candidate meets the full-sweep throughput threshold" if own else "No qualified own-clock candidate",
+                "scope": "HBM absolute bandwidth admission; observed-peak ratios and resource plateau are diagnostics only" if workload == "hbm" else
+                         "Same count/profile/repeat/CI/geometry gates and own-clock throughput bar; comparing the added full-sweep throughput constraint, not correcting energy or proving saturation"})
         components.append({"component_id": component_id, "stratum": stratum, "gpu_name": groups[0].get("gpu_name"), "units": u,
             "primary_objective": "paired_active_reference" if workload in SFU_WORKLOADS else "total",
             "primary_estimator": "(treatment mean power - matched register-loop control mean power) / treatment scalar SFU instruction rate" if workload in SFU_WORKLOADS else None,
@@ -599,12 +624,14 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                               "active issue-control reference; no component energy optimum" if workload == "control" else
                               "signed treatment/control contrast per scalar SFU instruction; negative or zero-crossing contrasts remain diagnostics, and board total/idle are separate diagnostics" if workload in SFU_WORKLOADS else
                               "measured whole-device energy of the stated implementation; component rail energy is not isolated"})
-    return {"schema_version": 1, "policy": {**asdict(policy), "throughput_fraction": fraction, "minimum_repeats": minimum_repeats,
+    return {"schema_version": 1, "policy": {**asdict(policy), "throughput_fraction": fraction,
+              "hbm_bandwidth_fraction": selection.get("hbm_bandwidth_fraction", 0.80), "minimum_repeats": minimum_repeats,
               "minimum_geometries": minimum_geometries}, "coverage": coverage, "components": components,
             "missing_workloads": sorted(set(coverage.get("by_workload", {})) - {c["stratum"]["workload"] for c in components}),
             "limits": ["All optima are restricted to observed supported clocks and tested configurations.",
                        "Bootstrap intervals measure repeat variation, not sensor calibration accuracy.",
                        "Profiler counter rates use replay busy time and are never energy-run sustained throughput.",
+                       "HBM candidates use sustained logical payload versus clock-specific DDR theory from complete measured memory-clock and CUDA bus-width evidence; this is not simultaneous physical DRAM utilization. Observed-peak ratios and resource plateaus are HBM diagnostics only.",
                        "Compare the same energy objective and denominator. Total/idle ratios and replay traffic amplification diagnose differences; they do not rescale the measured energy.",
                        "Diagnostic experiments and known noncoalesced memory reads cannot define energy optima or their peak. Unknown counter proof for a structurally coalesced run does not lower the observed throughput bar.",
                        "A resource plateau is empirical evidence; it does not prove hardware saturation or pure component energy.",

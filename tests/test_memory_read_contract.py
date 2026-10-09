@@ -29,7 +29,7 @@ DEVICE = {"uuid": "GPU-memory-contract-synthetic", "device_index": 0,
 def memory_record(access="read", *, legacy=False, repeat=0):
     """Twelve exact synthetic epochs, each completing ten two-block launches."""
     factor = 4 if legacy or access != "read" else 1
-    record = empirical_record("GPU-memory-contract-synthetic", 1200, access=access,
+    record = empirical_record("GPU-memory-contract-synthetic", 1200, workload="hbm", access=access,
                               blocks=2, repeat=repeat)
     benchmark = record["benchmark"]
     record["config"].update(threads=32, iterations=3)
@@ -67,6 +67,16 @@ def memory_record(access="read", *, legacy=False, repeat=0):
 
 
 class MemoryReadContractTests(unittest.TestCase):
+    def test_v2_and_v3_reads_both_require_one_access_per_iteration(self):
+        from powermodeling.memory import count_issues
+        for version in (READ_VERSION, "scalar_single_stream_read_v3"):
+            with self.subTest(version=version):
+                benchmark = memory_record()["benchmark"]
+                benchmark["kernel_implementation_version"] = version
+                self.assertEqual(count_issues(benchmark, "hbm"), [])
+                benchmark["memory_accesses_per_thread_iteration"] = 4
+                self.assertIn("memory_contract_accesses_per_iteration_mismatch", count_issues(benchmark, "hbm"))
+
     def test_old_four_load_records_keep_reported_counts_and_energy(self):
         old, new = memory_record(legacy=True), memory_record()
         old_trial, new_trial = analyze_trial(old), analyze_trial(new)
@@ -246,10 +256,38 @@ def initialized_word(index, seed):
     return (value ^ (value >> 31)) & ((1 << 32) - 1)
 
 
+@unittest.skipUnless(os.environ.get("POWERBENCH_CLI_TESTS") == "1", "requires compiled CUDA CLI")
+class MemoryReadCliTests(unittest.TestCase):
+    def test_accepted_cache_policies_pass_input_guards(self):
+        for workload, policy in (("l1", "auto"), ("l1", "ca"), ("l2", "auto"), ("l2", "cg"),
+                                 ("hbm", "auto"), ("hbm", "ca"), ("hbm", "cg"), ("hbm", "cs")):
+            with self.subTest(workload=workload, policy=policy):
+                result = subprocess.run([os.environ.get("POWERBENCH", "build/powerbench"),
+                                         "--workload", workload, "--read-cache-policy", policy, "--describe"],
+                                        capture_output=True, text=True)
+                # A CPU-only host reaches CUDA discovery; an actual GPU returns metadata.
+                self.assertNotIn("read-cache-policy", result.stderr)
+                self.assertTrue(result.returncode == 0 or "cuda" in result.stderr.lower(), result.stderr)
+
+    def test_invalid_cache_policy_combinations_fail_before_cuda_initialization(self):
+        cases = [("hbm", "read", "bogus"), ("l1", "read", "cg"),
+                 ("l2", "read", "ca"), ("hbm", "write", "cg"),
+                 ("tensor", "read", "auto"), ("l2_latency", "read", "cg")]
+        for workload, access, policy in cases:
+            with self.subTest(workload=workload, access=access, policy=policy):
+                result = subprocess.run([os.environ.get("POWERBENCH", "build/powerbench"),
+                                         "--workload", workload, "--access", access,
+                                         "--read-cache-policy", policy], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("read-cache-policy", result.stderr)
+                self.assertNotIn("unknown option", result.stderr)
+                self.assertNotIn("cuda", result.stderr.lower())
+
+
 @unittest.skipUnless(os.environ.get("POWERBENCH_GPU_TESTS") == "1",
                      "requires an actual NVIDIA GPU; opt in with POWERBENCH_GPU_TESTS=1")
 class MemoryReadGpuTests(unittest.TestCase):
-    def run_kernel(self, workload, access, words, iterations, stride=1, offset=0):
+    def run_kernel(self, workload, access, words, iterations, stride=1, offset=0, cache_policy=None):
         command = [os.environ.get("POWERBENCH", "build/powerbench"), "--workload", workload,
                    "--access", access, "--blocks", "2", "--threads", "32",
                    "--working-set-bytes", str(words * 4), "--stride-elements", str(stride),
@@ -258,6 +296,8 @@ class MemoryReadGpuTests(unittest.TestCase):
                    "--fixed-batches", "2"]
         if iterations is not None:
             command += ["--iterations", str(iterations)]
+        if cache_policy is not None:
+            command += ["--read-cache-policy", cache_policy]
         completed = subprocess.run(command, text=True, capture_output=True, check=True, timeout=60)
         return next(event for event in map(json.loads, completed.stdout.splitlines()) if event["type"] == "result")
 
@@ -268,7 +308,9 @@ class MemoryReadGpuTests(unittest.TestCase):
         for workload, words, iterations, stride, offset in cases:
             with self.subTest(workload=workload, words=words, iterations=iterations, stride=stride, offset=offset):
                 result = self.run_kernel(workload, "read", words, iterations, stride, offset)
-                self.assertEqual(result["kernel_implementation_version"], READ_VERSION)
+                self.assertEqual(result["kernel_implementation_version"], "scalar_single_stream_read_v3")
+                self.assertEqual(result["memory_read_index_math"], "uint32")
+                self.assertEqual(result["read_cache_policy"], "ca" if workload == "l1" else "cg")
                 self.assertEqual(result["memory_accesses_per_thread_iteration"], 1)
                 self.assertEqual(result["admitted_blocks"], 4)
                 self.assertEqual(result["operations"], 4 * 32 * iterations)
@@ -295,6 +337,17 @@ class MemoryReadGpuTests(unittest.TestCase):
                 self.assertGreater(result["memory_read_validation"]["checked_values"], 0)
                 self.assertEqual(result["memory_read_validation"]["mismatched_values"], 0)
                 self.assertTrue(result["sanity"]["memory_read_sample_matches_reference"])
+
+    def test_actual_hbm_cache_variants_preserve_sum_and_exact_work(self):
+        results = [self.run_kernel("hbm", "read", 2050, 19, 3, 4, policy)
+                   for policy in ("ca", "cg", "cs")]
+        self.assertEqual(len({result["checksum"] for result in results}), 1)
+        for policy, result in zip(("ca", "cg", "cs"), results):
+            self.assertEqual(result["read_cache_policy"], policy)
+            self.assertEqual(result["memory_read_index_math"], "uint32")
+            self.assertEqual(result["operations"], 4 * 32 * 19)
+            self.assertEqual(result["logical_bytes"], result["operations"] * 4)
+            self.assertEqual(result["memory_read_validation"]["status"], "pass")
 
     def test_actual_write_copy_keep_four_access_counts_and_read_default_is_4096(self):
         for access in ("read", "write", "copy"):

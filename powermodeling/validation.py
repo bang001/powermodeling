@@ -462,6 +462,9 @@ def validate_evidence(record, evidence, policy=None):
     effective_names = ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "tensor_accumulators", "gemm_m", "gemm_n", "gemm_k", "access", "l1_bytes_per_block", "paired_reference_context_allocated", "kernel_implementation_version", "memory_accesses_per_thread_iteration")
     if record.get("workload") in ("l1", "l2", "l2_latency", "hbm"):
         effective_names += ("memory_word_bytes", "stride_words", "lane_stride_bytes")
+    scalar_read = record.get("workload") in ("l1", "l2", "hbm") and measured_benchmark.get("access", config.get("access", "read")) == "read"
+    if scalar_read:
+        effective_names += ("read_cache_policy", "memory_read_index_math")
     if record.get("workload") in NONLINEAR_WORKLOADS:
         effective_names += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution",
                             "grid_mode", "input_elements", "block_completion_count_source")
@@ -477,11 +480,47 @@ def validate_evidence(record, evidence, policy=None):
             continue
         if name in benchmark or name in measured_benchmark:
             _check(checks, "matching_effective_" + name, benchmark.get(name), lambda v, e=measured_benchmark.get(name): e is not None and v == e, "exact effective profile/energy workload parameter")
+    if scalar_read:
+        for name, allowed in (("read_cache_policy", {"ca"} if record["workload"] == "l1" else {"cg"} if record["workload"] == "l2" else {"ca", "cg", "cs"}),
+                              ("memory_read_index_math", {"uint32", "uint64"})):
+            if name in benchmark or name in measured_benchmark:
+                _check(checks, "valid_effective_" + name, benchmark.get(name), lambda v, a=allowed: isinstance(v, str) and v in a, "canonical scalar-read implementation metadata")
+        requested_cache = config.get("read_cache_policy")
+        if requested_cache is not None:
+            expected_cache = ("ca" if record["workload"] == "l1" else "cg") if requested_cache == "auto" else requested_cache
+            actual_cache = benchmark.get("read_cache_policy")
+            if ("read_cache_policy" not in benchmark and "read_cache_policy" not in measured_benchmark
+                    and benchmark.get("kernel_implementation_version") in (None, "scalar_single_stream_read_v2")
+                    and measured_benchmark.get("kernel_implementation_version") in (None, "scalar_single_stream_read_v2")):
+                # Old scalar-read binaries have fixed .ca/.cg modifiers and no
+                # metadata field. Preserve that known default, never invent a
+                # legacy .ca/.cs HBM diagnostic from absent metadata.
+                actual_cache = "ca" if record["workload"] == "l1" else "cg"
+            _check(checks, "matching_requested_read_cache_policy", actual_cache,
+                   lambda v: v == expected_cache, "effective modifier matches requested read cache policy")
+        for name in ("read_cache_policy", "memory_read_index_math"):
+            if name in provenance:
+                _check(checks, "matching_variant_provenance_" + name, provenance[name],
+                       lambda v, n=name: benchmark.get(n) is not None and v == benchmark[n],
+                       "profile variant provenance matches effective worker metadata")
+        if benchmark.get("kernel_implementation_version") == "scalar_single_stream_read_v3" and "memory_read_index_math" in benchmark:
+            working_set, iterations, blocks = (_number(benchmark.get(name)) for name in ("working_set_bytes", "iterations_per_launch", "blocks"))
+            expected_index = None
+            dimensions = (working_set, iterations, blocks) if record["workload"] == "l1" else (working_set, iterations)
+            if all(value is not None and value > 0 and value.is_integer() for value in dimensions):
+                words = int(working_set) // 4
+                if record["workload"] == "l1":
+                    words //= int(blocks)
+                expected_index = "uint32" if words <= 2**32 - 1 and iterations <= 2**32 - 1 else "uint64"
+            _check(checks, "consistent_memory_read_index_math", benchmark.get("memory_read_index_math") if expected_index else None,
+                   lambda v: v == expected_index, "index variant matches effective region words and iteration bounds")
     clocks = provenance.get("requested_clocks") or {}
     actual_clocks = {}
     required_effective = ("blocks", "threads", "iterations_per_launch", "tensor_accumulators") if record.get("workload") == "tensor" else ("gemm_m", "gemm_n", "gemm_k", "iterations_per_launch") if record.get("workload") == "gemm" else ("blocks", "threads", "iterations_per_launch", "working_set_bytes", "stride_elements", "offset_bytes", "access")
     if record.get("workload") in SFU_WORKLOADS:
         required_effective = ("blocks", "threads", "paired_reference_context_allocated", *SFU_CONTRACT_FIELDS)
+    if scalar_read and "scalar_single_stream_read_v3" in (benchmark.get("kernel_implementation_version"), measured_benchmark.get("kernel_implementation_version")):
+        required_effective += ("read_cache_policy", "memory_read_index_math")
     if record.get("workload") in NONLINEAR_WORKLOADS:
         required_effective += ("row_width", "math_implementation", "input_precision", "nonlinear_input_distribution")
         if (measured_benchmark.get("math_implementation") == Q_GRID_MATH_IMPLEMENTATION

@@ -25,10 +25,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 #include <chrono>
 #include <time.h>
 #include <unistd.h>
+#include "memory_read_math.cuh"
 
 namespace {
 constexpr unsigned kSmSlots = 4096;
@@ -84,6 +86,7 @@ struct Options {
   uint64_t fixed_batches = 0, warmup_batches = 0;
   uint64_t offset_bytes = 0, seed = 1;
   std::string workload = "tensor", access = "read", reference_order = "AB";
+  std::string read_cache_policy = "auto";
   std::string grid_mode = "auto";
   std::string nonlinear_mode;
   uint64_t sfu_lanes = 262144;
@@ -93,6 +96,7 @@ struct Options {
   bool blocks_explicit = false, grid_mode_explicit = false;
   bool sfu_options_explicit = false;
   bool nonlinear_mode_explicit = false;
+  bool read_cache_policy_explicit = false;
   bool stride_elements_explicit = false, stride_words_explicit = false;
 };
 
@@ -125,6 +129,7 @@ void usage() {
     "  --paired-reference --reference-order AB|BA (A=active reference, B=treatment)\n"
     "  --working-set-bytes N --stride-words N (alias --stride-elements; choose one) --offset-bytes N\n"
     "  --access read|write|copy --sm-ids 0,1,... --seed N\n"
+    "  --read-cache-policy auto|ca|cg|cs (read only; L1 ca, L2 cg, HBM ca/cg/cs)\n"
     "  --gemm-m 4096 --gemm-n 4096 --gemm-k 4096\n"
     "  --row-width 1024 (RMSNorm/Softmax, FP32 full row operations)\n"
     "  --grid-mode auto|fixed (nonlinear/SFU; default auto)\n"
@@ -180,6 +185,7 @@ Options parse_options(int argc, char** argv) {
     else if (flag == "--reference-order") o.reference_order = value;
     else if (flag == "--workload") o.workload = value;
     else if (flag == "--access") o.access = value;
+    else if (flag == "--read-cache-policy") { o.read_cache_policy = value; o.read_cache_policy_explicit = true; }
     else if (flag == "--gemm-m") o.gemm_m = parse_int(value, flag.c_str());
     else if (flag == "--gemm-n") o.gemm_n = parse_int(value, flag.c_str());
     else if (flag == "--gemm-k") o.gemm_k = parse_int(value, flag.c_str());
@@ -196,6 +202,16 @@ Options parse_options(int argc, char** argv) {
     } else throw std::runtime_error("unknown option " + flag);
   }
   if (o.seconds <= 0) throw std::runtime_error("--seconds must be positive");
+  const bool cache_read = o.access == "read" && (o.workload == "l1" || o.workload == "l2" || o.workload == "hbm");
+  if (o.read_cache_policy != "auto" && o.read_cache_policy != "ca" && o.read_cache_policy != "cg" && o.read_cache_policy != "cs")
+    throw std::runtime_error("--read-cache-policy must be auto, ca, cg or cs");
+  if (o.read_cache_policy_explicit && !cache_read)
+    throw std::runtime_error("--read-cache-policy applies only to L1/L2/HBM read workloads");
+  if (cache_read) {
+    if (o.read_cache_policy == "auto") o.read_cache_policy = o.workload == "l1" ? "ca" : "cg";
+    if ((o.workload == "l1" && o.read_cache_policy != "ca") || (o.workload == "l2" && o.read_cache_policy != "cg"))
+      throw std::runtime_error("--read-cache-policy requires ca for L1 and cg for L2; HBM supports ca/cg/cs");
+  }
   if (o.reference_order != "AB" && o.reference_order != "BA") throw std::runtime_error("--reference-order must be AB or BA");
   if (o.paired_reference && !o.profile_region && o.workload != "control" && (o.seconds < 10 || o.warmup_seconds < 1 || o.idle_seconds < 6))
     throw std::runtime_error("paired energy arms require seconds>=10, warmup-seconds>=1 and idle-seconds>=6");
@@ -287,6 +303,12 @@ __device__ __forceinline__ uint32_t load_ca(const uint32_t* p) {
 __device__ __forceinline__ uint32_t load_cg(const uint32_t* p) {
   uint32_t value; asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(value) : "l"(p) : "memory"); return value;
 }
+template<int Policy>
+__device__ __forceinline__ uint32_t load_read(const uint32_t* p) {
+  if constexpr (Policy == 0) return load_ca(p);
+  if constexpr (Policy == 1) return load_cg(p);
+  uint32_t value; asm volatile("ld.global.cs.u32 %0, [%1];" : "=r"(value) : "l"(p) : "memory"); return value;
+}
 __device__ __forceinline__ void store_cg(uint32_t* p, uint32_t value) {
   asm volatile("st.global.cg.u32 [%0], %1;" :: "l"(p), "r"(value) : "memory");
 }
@@ -301,7 +323,7 @@ __device__ __forceinline__ uint64_t add_wrap(uint64_t a, uint64_t b, uint64_t n)
 // the requested grid/stride and loop index, never on the loaded value. One
 // uint32 sum makes every loaded value observable; asm volatile alone would let
 // ptxas discard intermediate loads when only the last value is consumed.
-template<bool L1>
+template<bool L1, int Policy, bool Narrow>
 __global__ void simple_memory_kernel(const uint32_t* input, uint32_t* sink,
     uint64_t total_words, uint64_t slice_words, uint64_t stride, uint64_t iterations,
     const unsigned char* mask, bool filtered, unsigned long long* blocks_per_sm) {
@@ -311,8 +333,12 @@ __global__ void simple_memory_kernel(const uint32_t* input, uint32_t* sink,
   const uint64_t lanes = L1 ? blockDim.x : uint64_t(gridDim.x) * blockDim.x;
   const uint64_t tid = L1 ? threadIdx.x : uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const bool pow2 = (n & (n - 1)) == 0;
-  uint64_t position = wrap(tid * stride, n, pow2);
-  const uint64_t advance = wrap(lanes * stride, n, pow2);
+  using Index = typename std::conditional<Narrow, uint32_t, uint64_t>::type;
+  Index position = Index(wrap(tid * stride, n, pow2));
+  const Index advance = Index(wrap(lanes * stride, n, pow2));
+  // Subtract at the boundary instead of adding then wrapping: the narrow
+  // path remains exact even when n is near UINT32_MAX, without overflow.
+  const Index boundary = Index(n) - advance;
   const uint32_t* region_input = input;
   if constexpr (L1) {
     // Materialize the fixed CTA base once. An opaque PTX add prevents the
@@ -322,9 +348,10 @@ __global__ void simple_memory_kernel(const uint32_t* input, uint32_t* sink,
     region_input = reinterpret_cast<const uint32_t*>(base_address);
   }
   uint32_t sum = 0;
-  for (uint64_t i = 0; i < iterations; ++i) {
-    sum += L1 ? load_ca(region_input + position) : load_cg(region_input + position);
-    position = add_wrap(position, advance, n);
+  for (Index i = 0; i < Index(iterations); ++i) {
+    sum += load_read<Policy>(region_input + position);
+    if constexpr (Narrow) position = memory_read_next32(position, advance, boundary);
+    else position = add_wrap(position, advance, n);
   }
   sink[uint64_t(blockIdx.x) * blockDim.x + threadIdx.x] = sum;
 }
@@ -465,6 +492,22 @@ KernelResources query_kernel_resources(Kernel kernel, int threads, size_t dynami
   return result;
 }
 
+template<bool L1, int Policy>
+KernelResources dispatch_memory_read(const Options& o, bool narrow, bool launch,
+    const uint32_t* input, uint32_t* sink, uint64_t words, uint64_t slice,
+    const unsigned char* mask, bool filtered, unsigned long long* admitted) {
+  if (narrow) {
+    if (!launch) return query_kernel_resources(simple_memory_kernel<L1, Policy, true>, o.threads);
+    simple_memory_kernel<L1, Policy, true><<<o.blocks, o.threads>>>(input, sink, words, slice,
+      o.stride_elements, o.iterations, mask, filtered, admitted);
+  } else {
+    if (!launch) return query_kernel_resources(simple_memory_kernel<L1, Policy, false>, o.threads);
+    simple_memory_kernel<L1, Policy, false><<<o.blocks, o.threads>>>(input, sink, words, slice,
+      o.stride_elements, o.iterations, mask, filtered, admitted);
+  }
+  return {};
+}
+
 std::string uuid_string(const cudaUUID_t& uuid) {
   std::ostringstream out; out << "GPU-" << std::hex << std::setfill('0');
   for (int i = 0; i < 16; ++i) {
@@ -591,7 +634,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
   const bool memory = o.workload == "l1" || o.workload == "l2" || latency || o.workload == "hbm";
   const bool simple_memory_read = memory && !latency && o.access == "read";
   const uint64_t memory_accesses_per_iteration = simple_memory_read ? 1 : 4;
-  const char* implementation_version = simple_memory_read ? "scalar_single_stream_read_v2" :
+  const char* implementation_version = simple_memory_read ? "scalar_single_stream_read_v3" :
     memory && !latency ? "scalar_four_stream_write_copy_v1" : latency ? "dependent_pointer_chain_v1" :
     o.workload == "tensor" ? "wmma_register_reuse_v1" : o.workload == "gemm" ? "cublas_dense_gemm_v1" :
     o.workload == "control" ? "integer_issue_loop_v1" : "fp32_complete_nonlinear_q_grid_v2";
@@ -628,6 +671,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
   if (latency && words > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("pointer chain exceeds uint32 node-index range");
   if (o.workload == "l1" && !slice) throw std::runtime_error("L1 footprint must contain at least one word per block");
   if (o.workload == "l1") words = slice * o.blocks;
+  const bool narrow_memory_read = simple_memory_read &&
+    memory_read_uses_uint32(o.workload == "l1" ? slice : words, o.iterations);
   uint64_t offset_words = memory ? o.offset_bytes / 4 : 0;
   if (words > std::numeric_limits<uint64_t>::max() - offset_words) throw std::runtime_error("allocation size overflow");
   if (memory && words + offset_words > uint64_t(p.totalGlobalMem) / 4 / (o.access == "read" ? 1 : 2) * 3 / 4)
@@ -686,8 +731,22 @@ void experiment(Options o, const cudaDeviceProp& p) {
   }
   // Set a stable carveout preference for L1; actual shared/L1 partition and hit
   // rate still require counters. No shared memory is consumed by this kernel.
-  if (o.workload == "l1")
-    CUDA_CHECK(cudaFuncSetAttribute(simple_memory_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
+  if (o.workload == "l1") {
+    CUDA_CHECK(cudaFuncSetAttribute(simple_memory_kernel<true, 0, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
+    CUDA_CHECK(cudaFuncSetAttribute(simple_memory_kernel<true, 0, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
+  }
+  auto read_kernel = [&](bool launch) {
+    const uint32_t* in = input.ptr + offset_words;
+    const bool filtered = !o.sm_ids.empty();
+    if (o.workload == "l1") return dispatch_memory_read<true, 0>(o, narrow_memory_read, launch, in, sink.ptr,
+      words, slice, mask.ptr, filtered, sm_blocks.ptr);
+    if (o.read_cache_policy == "ca") return dispatch_memory_read<false, 0>(o, narrow_memory_read, launch, in, sink.ptr,
+      words, 0, mask.ptr, filtered, sm_blocks.ptr);
+    if (o.read_cache_policy == "cs") return dispatch_memory_read<false, 2>(o, narrow_memory_read, launch, in, sink.ptr,
+      words, 0, mask.ptr, filtered, sm_blocks.ptr);
+    return dispatch_memory_read<false, 1>(o, narrow_memory_read, launch, in, sink.ptr,
+      words, 0, mask.ptr, filtered, sm_blocks.ptr);
+  };
   KernelResources resources;
   if (o.workload == "tensor") {
     #define TENSOR_RESOURCE_CASE(N) case N: resources = query_kernel_resources(tensor_kernel<N>, o.threads); break
@@ -696,9 +755,9 @@ void experiment(Options o, const cudaDeviceProp& p) {
       TENSOR_RESOURCE_CASE(5); TENSOR_RESOURCE_CASE(6); TENSOR_RESOURCE_CASE(7); TENSOR_RESOURCE_CASE(8);
     }
     #undef TENSOR_RESOURCE_CASE
-  } else if (o.workload == "l1") resources = query_kernel_resources(simple_memory_kernel<true>, o.threads);
+  } else if (o.workload == "l1") resources = read_kernel(false);
   else if (o.workload == "l2" || o.workload == "hbm") {
-    if (o.access == "read") resources = query_kernel_resources(simple_memory_kernel<false>, o.threads);
+    if (o.access == "read") resources = read_kernel(false);
     else if (o.access == "write") resources = query_kernel_resources(memory_kernel<false, 1>, o.threads);
     else resources = query_kernel_resources(memory_kernel<false, 2>, o.threads);
   } else if (latency) resources = query_kernel_resources(latency_kernel, o.threads);
@@ -742,8 +801,7 @@ void experiment(Options o, const cudaDeviceProp& p) {
       else row_nonlinear_kernel<false><<<o.blocks, o.threads, o.threads * sizeof(float)>>>(input.ptr, gamma.ptr, output.ptr, words / o.row_width, o.row_width, o.iterations);
     } else {
       const uint32_t* in = input.ptr + offset_words; uint32_t* out = output.ptr + (o.access == "read" ? 0 : offset_words);
-      if (o.workload == "l1") simple_memory_kernel<true><<<o.blocks, o.threads>>>(in, sink.ptr, words, slice, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
-      else if (o.access == "read") simple_memory_kernel<false><<<o.blocks, o.threads>>>(in, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
+      if (o.workload == "l1" || o.access == "read") read_kernel(true);
       else if (o.access == "write") memory_kernel<false, 1><<<o.blocks, o.threads>>>(in, out, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
       else memory_kernel<false, 2><<<o.blocks, o.threads>>>(in, out, sink.ptr, words, 0, o.stride_elements, o.iterations, mask.ptr, filtered, sm_blocks.ptr);
     }
@@ -991,6 +1049,8 @@ void experiment(Options o, const cudaDeviceProp& p) {
     << ",\"block_completion_count_source\":" << quote(nonlinear ? "synchronized_completed_launches" : o.workload == "gemm" ? "not_applicable" : "per_sm_admission_atomics")
     << ",\"memory_accesses_per_thread_iteration\":" << (memory && !latency ? std::to_string(memory_accesses_per_iteration) : "null")
     << ",\"memory_read_checksum_scope\":" << (simple_memory_read ? "\"sum32_of_all_reads_per_thread\"" : "null")
+    << ",\"read_cache_policy\":" << (simple_memory_read ? quote(o.read_cache_policy) : "null")
+    << ",\"memory_read_index_math\":" << (simple_memory_read ? quote(narrow_memory_read ? "uint32" : "uint64") : "null")
     << ",\"memory_read_validation\":";
   if (!simple_memory_read) std::cout << "null";
   else std::cout << "{\"status\":" << quote(read_validation_status)
@@ -1103,7 +1163,10 @@ void experiment(Options o, const cudaDeviceProp& p) {
         << ",\"cycles\":" << cycles[id] << ",\"cycles_per_access\":" << (loads[id] ? double(cycles[id]) / loads[id] : 0) << "}";
     }
   }
-  std::cout << "}},\"cache_policy\":" << quote(o.workload == "l1" ? "ld.global.ca; prefer maximum L1 carveout" : memory || nonlinear ? "ld/st.global.cg; L1 bypass; L2/DRAM residency requires counters" : "not applicable")
+  const std::string cache_scope = simple_memory_read ? "ld.global." + o.read_cache_policy +
+    (o.workload == "l1" ? "; prefer maximum L1 carveout" : o.read_cache_policy == "cg" ? "; L1 bypass; L2/DRAM residency requires counters" : "; HBM cache-policy diagnostic; DRAM residency requires counters") :
+    memory || nonlinear ? "ld/st.global.cg; L1 bypass; L2/DRAM residency requires counters" : "not applicable";
+  std::cout << "}},\"cache_policy\":" << quote(cache_scope)
     << ",\"memory_count_scope\":\"logical requested payload; excludes sector inflation, writeback, initialization, telemetry and sink transfers\""
     << ",\"sm_filter_scope\":\"best-effort dispatched-block admission; no physical SM disable or GPC mapping; GEMM SM IDs unavailable\""
     << ",\"control_scope\":\"integer issue-loop reference, not matched cache/tensor dynamic power or transistor static power\""

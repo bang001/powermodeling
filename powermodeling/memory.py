@@ -5,9 +5,10 @@ interpreted as the new single-stream implementation or divided by four.
 """
 import math
 
-SINGLE_STREAM_READ = "scalar_single_stream_read_v2"
+SINGLE_STREAM_READ = "scalar_single_stream_read_v3"
+SINGLE_STREAM_READ_VERSIONS = {SINGLE_STREAM_READ, "scalar_single_stream_read_v2"}
 FOUR_STREAM_WRITE_COPY = "scalar_four_stream_write_copy_v1"
-VERSIONS = {SINGLE_STREAM_READ, FOUR_STREAM_WRITE_COPY}
+VERSIONS = SINGLE_STREAM_READ_VERSIONS | {FOUR_STREAM_WRITE_COPY}
 READ_WORKLOADS = {"l1", "l2", "hbm"}
 
 
@@ -114,7 +115,7 @@ def count_issues(benchmark, workload):
     if workload not in ("l1", "l2", "hbm") or benchmark.get("kernel_implementation_version") not in VERSIONS:
         return []
     version, access = benchmark["kernel_implementation_version"], benchmark.get("access")
-    read = version == SINGLE_STREAM_READ
+    read = version in SINGLE_STREAM_READ_VERSIONS
     factor = 1 if read else 4
     issues = []
     if access not in (("read",) if read else ("write", "copy")):

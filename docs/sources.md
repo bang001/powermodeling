@@ -32,6 +32,12 @@ The [NVIDIA NVML header](https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nv
 
 These sensor readings are a separate memory-subsystem observable. The HBM report integrates them over the measured treatment window and normalizes only by matching logical payload counts. It neither adds them to whole-device energy nor treats separate NCU replay traffic as matched physical HBM bits. This source check is not a hardware measurement.
 
+## HBM bandwidth and cache-policy source check (2026-10-10, Asia/Seoul)
+
+- The official [NVIDIA CCCL/CUB v2.8.2 load implementation](https://github.com/NVIDIA/cccl/blob/v2.8.2/cub/cub/thread/thread_load.cuh) was read from its GitHub origin. It defines `LOAD_CA` as “Cache at all levels”, `LOAD_CG` as “Cache at global level”, and `LOAD_CS` as “Cache streaming (likely to be accessed once)”, and maps them to the corresponding PTX operators. [PTX cache operators](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#cache-operators) remains the semantic reference; direct access to that document was restricted in this environment, so its evict-first wording was not newly retrieved here. `.cs` is not a guarantee of bypassing L2 or reaching HBM.
+- Installed NVIDIA CUDA 12.9.86 `cuda_runtime_api.h` documents `cudaDevAttrMemoryClockRate` as “Peak memory clock frequency in kilohertz” and `cudaDevAttrGlobalMemoryBusWidth` as “Global memory bus width in bits”. The official [CUDA deviceQuery v12.5](https://github.com/NVIDIA/cuda-samples/blob/v12.5/Samples/1_Utilities/deviceQuery/deviceQuery.cpp) was also checked for units. The current-DVFS HBM reference uses measured NVML memory MHz with the CUDA bus width and the targeted HBM DDR convention: `2 × memory_MHz × 10^6 × bus_bits / 8` byte/s. Missing measured clock/width is not replaced with a nominal GPU-name lookup.
+- The **80% threshold is a user-selected experiment policy**, not a literature guarantee. [Luo et al., arXiv:2402.13499v1](https://arxiv.org/abs/2402.13499v1), Tables III/V, use a vectorized 5-read+1-write global benchmark, which is not the same read-only definition. Their warning that FP64 arithmetic can limit a memory test motivates checking supporting arithmetic; it does not prove the current uint32 sum is a bottleneck. See [HBM design and limits](hbm-bandwidth-design.ko.md).
+
 ## Claims that require measurements
 
 - The minimum pJ/FLOP or pJ/logical-bit of a specific SXM GPU and its idle power.

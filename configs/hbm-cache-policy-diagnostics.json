@@ -1,0 +1,39 @@
+{
+  "description": "HBM cache-policy diagnostic: compare cg/ca/cs at one identical coalesced geometry. These probes never enter energy-optimum selection. Fix supported clocks: exact 1110 MHz and the highest graphics clock at the highest memory domain, plus the advertised default pair. Compare cache policies only within the same pair. Missing anchors remain explicit in plan coverage.",
+  "seconds": 12,
+  "warmup_seconds": 3,
+  "idle_seconds": 6,
+  "repeats": 3,
+  "sample_interval_s": 0.05,
+  "randomization_seed": 2026,
+  "clock_sweep": {
+    "graphics_quantiles": [1.0],
+    "graphics_min_mhz": 1110,
+    "memory_quantiles": [1.0],
+    "required_graphics_mhz": [1110],
+    "include_advertised_default": true,
+    "include_default_policy": false
+  },
+  "target_form_factor": "SXM",
+  "paired_reference": false,
+  "study_design": "diagnostic",
+  "experiments": [
+    {
+      "workload": "hbm",
+      "stage": "hbm_cache_policy",
+      "experiment_role": "diagnostic",
+      "parameters": {
+        "blocks": "sm_count*8",
+        "threads": 256,
+        "iterations": 4096,
+        "batch_launches": 16,
+        "working_set_bytes": "max(l2_bytes*8,268435456)",
+        "seed": 2026,
+        "stride_words": 1,
+        "offset_bytes": 0,
+        "access": "read"
+      },
+      "grid": {"read_cache_policy": ["cg", "ca", "cs"]}
+    }
+  ]
+}

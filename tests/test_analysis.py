@@ -47,8 +47,8 @@ def verified_profile(record):
     return record
 
 
-def empirical_record(uuid, gfx, memory=1593, workload="hbm", access="read", power=150, throughput=100, repeat=0, blocks=80):
-    """Synthetic fixture only: exercise independent GPU/frequency decisions."""
+def empirical_record(uuid, gfx, memory=1593, workload="l2", access="read", power=150, throughput=100, repeat=0, blocks=80):
+    """Generic L2 fixture: arbitrary rates do not model an HBM interface ceiling."""
     from test_ncu_validation import pass_fixture, change
     from powermodeling.validation import SM_HZ
     record = synthetic_trial(workload, active_power=power, throughput=throughput, repeat=repeat)
@@ -86,7 +86,7 @@ def empirical_record(uuid, gfx, memory=1593, workload="hbm", access="read", powe
     return record
 
 
-def paired_record(power=150, reference_power=80, order="AB", workload="hbm"):
+def paired_record(power=150, reference_power=80, order="AB", workload="l2"):
     record = empirical_record("GPU-paired", 1200, workload=workload, power=power)
     reference_phase = copy.deepcopy(record["phases"]["measure"])
     reference = copy.deepcopy(record["benchmark"])
@@ -492,7 +492,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("negative_power:idle_pre", analyze_trial(record)["baseline_issues"])
 
     def test_total_is_preserved_when_idle_is_missing_and_increment_optimum_is_withheld(self):
-        records = [empirical_record("GPU-total", 1200, workload="hbm", repeat=i) for i in range(3)]
+        records = [empirical_record("GPU-total", 1200, workload="l2", repeat=i) for i in range(3)]
         for record in records:
             record["phases"].pop("idle_post")
         trial = analyze_trial(records[0])
@@ -555,9 +555,13 @@ class AnalysisTests(unittest.TestCase):
         for memory, gfx, power in ((1215, 930, 100), (1215, 1110, 100), (1215, 1380, 160), (1593, 930, 150), (1593, 1380, 90)):
             for access in ("read", "copy"):
                 for repeat in range(3):
-                    records.append(empirical_record("GPU-domain", gfx, memory, access=access, power=power, repeat=repeat))
-                    records.append(empirical_record("GPU-domain", gfx, memory, access=access, power=power * 1.2,
-                                                    throughput=99, repeat=repeat, blocks=40))
+                    peak = 2 * memory * 1e6 * 5120 / 8
+                    for blocks, multiplier in ((80, 1), (40, .99)):
+                        record = empirical_record("GPU-domain", gfx, memory, workload="hbm", access=access,
+                                                  power=power if blocks == 80 else power * 1.2,
+                                                  throughput=peak * multiplier, repeat=repeat, blocks=blocks)
+                        record["cuda_device"] = {"uuid": "GPU-domain", "memory_bus_width_bits": 5120}
+                        records.append(record)
         summary = summarize(records)
         total = [point for point in summary["empirical_gpu_energy_optima"] if point["objective"] == "total"]
         self.assertEqual(len(total), 4)

@@ -1,6 +1,6 @@
 # NVIDIA GPU power modeling
 
-**SXM 모듈의 V100·A100·H100**에서 **충분한 처리량을 유지하는 pJ/FLOP·pJ/logical-bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. 현재 자동 판정은 측정한 격자의 관측 peak·plateau에 대한 상대 평가이며, 높은 하드웨어 활용률이나 전역 최소점을 보장하지 않는다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
+**SXM 모듈의 V100·A100·H100**에서 **충분한 처리량을 유지하는 pJ/FLOP·pJ/logical-bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. HBM은 **실제 memory clock과 버스 폭으로 계산한 이론 bandwidth의 80% 이상**에서 최소 단가를 고른다. 다른 계층·연산은 관측 peak·plateau의 상대 평가를 사용한다. 어느 판정도 물리적 포화나 전역 최소점을 보장하지 않는다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
 
 SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter가 목표 경로를 확인한 뒤에도 측정 에너지를 해당 물리 회로만의 에너지로 동일시하지 않는다.
 
@@ -13,7 +13,7 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 | 기능 | 구현 |
 |---|---|
 | Tensor | FP16 입력·FP32 누산 WMMA 반복, 독립 accumulator sweep, cuBLAS dense GEMM 비교 |
-| L1·L2·HBM | `.ca`/`.cg` load, working set·grid·thread·stride·주소 offset·read/copy sweep |
+| L1·L2·HBM | L1 `.ca`, L2/HBM `.cg` load, HBM `.ca`/`.cs` 비교 진단; working set·grid·thread·stride·주소 offset·read/copy sweep |
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
 | Register SFU | EX2·LG2·RCP·RSQ·SQRT·native TANH의 register 반복, SFU를 뺀 control 대비 차분 pJ/scalar instruction |
 | 전력 측정 | capability 기반 NVML 평균/현재/누적에너지, 지원되는 memory scope, raw timestamps·오류 |
@@ -287,19 +287,20 @@ python -m powermodeling analyze --input results/validated \
 | `energy_per_work_kind` | 같은 구간의 실제 count 기반 단가인지, 과거 whole-run rate를 이용한 추정인지 |
 | `verified_selection_eligible` | 품질·NCU 통과·같은 구간의 정확한 work count가 최적값 선택에 충분한지 |
 | `uncontrolled_clock_exploratory_best` | 기본 DVFS 결과의 탐색용 최적값; 고정 클럭 비교와 별도 |
-| `within_clock_best`, `cross_clock_best` | 같은 clock/전체 clock 관측 최고 처리량의 95% 이상 조건에서 최저 승인된 증가분 단가 |
-| `within_clock_best_total_energy`, `cross_clock_best_total_energy` | 95% 처리량 조건에서 최소 전체 에너지 단가의 설정 |
+| `within_clock_best`, `cross_clock_best` | 최저 승인된 증가분 단가. HBM은 해당 memory clock 이론 BW의 80% 이상; 다른 workload는 같은 clock/전체 clock 관측 peak의 95% 이상 |
+| `within_clock_best_total_energy`, `cross_clock_best_total_energy` | 위 workload별 처리량 조건에서 최소 전체 에너지 단가의 설정 |
 | `pareto_frontiers` | 더 높은 처리량과 더 낮은 전력으로 동시에 개선할 수 없는 관측 설정 |
 | `active_control_associations` | 별도로 실행한 control과의 설명용 연결; same-process paired arm과 다르며 자동 component 차감에 사용하지 않음 |
-| `empirical_gpu_energy_optima` | GPU UUID·작업·access·고정 memory MHz·objective별 승인 단가 최솟값. 각 frequency pair의 최소 2 검증 resource geometry 비교·관측 peak의 기본 95% 이상 요구 |
+| `empirical_gpu_energy_optima` | GPU UUID·작업·access·고정 memory MHz·objective별 승인 단가 최솟값. 각 frequency pair의 최소 2 검증 resource geometry 비교; HBM은 이론 BW 80%, 다른 workload는 관측 peak 95% 기준 |
 | `empirical_gpu_overall_energy_optima` | 같은 승인 조건에서 measured graphics·memory domain을 함께 비교한 각 GPU의 실제 최솟값 |
 | `exploratory_single_geometry_energy_optima`, `exploratory_single_geometry_overall_energy_optima` | 검증된 geometry 한 종류뿐인 fixed/overall 탐색 결과; 승인된 효율 최적점과 분리 |
 | `own_clock_verified_distinct_geometry_count`, `own_clock_observed_distinct_geometry_count` | 해당 clock pair의 검증된/전체 유효 resource geometry 비교 수. `own_clock_distinct_geometry_count`는 검증 수 alias |
 | `geometry_evidence_status`, `saturation_proven` | 승인 또는 단일 geometry 진단의 근거. 최소 2 비교도 실제 hardware saturation 증명이 아니므로 `saturation_proven: false` |
 | `near_optimum_support_points`, `uncertainty_overlap_support_points` | 기본 최소 단가 5% 이내 / 95% 구간이 겹치는 실측 support points; 미측정 gap이나 연속 최적 구간을 보장하지 않음 |
 | `observed_frequency_pairs_without_eligible_candidate` | 측정은 했으나 검증·활용·baseline 요건으로 최적점 후보를 만들지 못한 frequency pair |
-| `verified_target_*` | NCU 통과·정확한 시간 정렬 조건 중 **전체 유효 고정 클럭 sweep 최고 처리량의 95% 이상**을 달성한 결과의 최저 단가; 없으면 winner 없음 |
-| `verified_target_coverage` | 전체/검증된 최고 처리량·비율·95% 통과 조건 수·미검증 또는 실패한 peak group을 보고 |
+| `verified_target_*` | NCU 통과·정확한 시간 정렬과 workload별 처리량 기준을 만족하는 최저 단가. HBM은 이론 BW 80%이며 관측 peak 95%를 추가로 요구하지 않음; 없으면 winner 없음 |
+| `verified_target_coverage` | 전체/검증 peak·비율과 workload별 기준 통과 조건 수·미검증 또는 실패한 peak group을 보고 |
+| `hbm_bandwidth` | HBM의 actual memory MHz·bus width·이론 byte/s·sustained logical byte/s·비율·80% 판정. 미지수는 미확정; 실제 DRAM bus 사용률 측정과 구분 |
 
 `valid=true`는 기록의 품질 기준을 통과했다는 뜻이며, `target_verified=true`나 물리 블록 isolation의 증명이 아니다. worker는 약 1초 간격의 완료 batch 수와 실제 SM admission 수를 기록하고, 분석은 양 끝을 제외한 완료 구간에서 work count와 에너지를 함께 계산한다. 이 기록이 없는 과거 결과는 지속 처리량이 일정하다는 가정의 추정치로 남기고 검증된 최적값에는 사용하지 않는다. idle와 active의 실제 클럭이나 온도가 다르면 증가분에는 activation·주파수 상태·누설 변화가 섞일 수 있으며 경고가 남는다. 3–4회처럼 적은 반복의 bootstrap 범위는 거칠다. 수치 차이가 작으면 반복과 최소점 주변 지원 주파수 측정을 늘리고 온도·센서·counter evidence를 확인한다. V100·A100·H100의 최적 pJ/bit·pJ/FLOP 주파수는 각 UUID의 결과에서 독립적으로 선택하며 1110 MHz를 최적점으로 미리 지정하지 않는다. physical pJ/bit는 동일 energy-window의 계층 traffic provenance가 없어 현재 withheld이고 NCU replay bytes만으로 단가를 계산하지 않는다.
 
@@ -322,7 +323,7 @@ H100에서 제공하는 NVIDIA **GPU Memory Power Readings**를 HBM 실험의 �
 
 ## 단순 메모리 read 커널
 
-L1·L2·HBM의 `access=read`는 **단일 stream의 32-bit load + uint32 덧셈 누산**을 사용한다. 이전 네 stream의 XOR 누산과 여러 주소 관리를 줄였으며 L1 `.ca`, L2/HBM `.cg`를 유지한다. 읽은 값을 전혀 사용하지 않으면 컴파일러가 중간 load를 제거하므로 덧셈 하나는 남긴다. 기본 iterations는 4096으로, 이전 read의 1024 × 4 loads와 같은 요청량이다. 직접 지정한 iterations는 변환하지 않는다.
+L1·L2·HBM의 `access=read`는 **단일 stream의 32-bit load + uint32 덧셈 누산**을 사용한다. 현재 V3는 region word 수와 iterations가 UINT32_MAX 이하일 때 주소 index·loop counter를 32-bit로 처리하고, 큰 범위는 64-bit로 처리한다. 실제 pointer는 64-bit이며 wrap 주소 순서와 count는 같다. 이전 네 stream의 XOR 누산을 제거했고 L1 `.ca`, L2/HBM `.cg`를 기본으로 유지한다. 읽은 값을 전혀 사용하지 않으면 컴파일러가 중간 load를 제거하므로 덧셈 하나는 남긴다. 기본 iterations는 4096으로, 이전 read의 1024 × 4 loads와 같은 요청량이다. 직접 지정한 iterations는 변환하지 않는다. HBM의 `.ca`/`.cs` 비교는 별도 진단이다. [HBM 80%·오버헤드·cache 정책 설계](docs/hbm-bandwidth-design.ko.md)
 
 [변경 내용·count·재실험 절차](docs/memory-read-v2.ko.md)를 참고한다. [메모리 read 전용 점검 설정](configs/memory-read-smoke.json)은 L1/L2/HBM 합계 12 trials·최소 9분이며, `--stage hbm_read`로 HBM만 실행하면 4 trials·최소 3분이다. NCU·준비 시간은 별도다. 새 binary로 plan과 profile을 다시 만들고, 이전 결과와는 implementation version·binary hash로 구분한다. 실제 에너지 개선은 GPU 재측정으로 확인해야 한다.
 
@@ -371,7 +372,7 @@ python -m powermodeling analyze --input results/verified --output results/verifi
 
 profile 대상이 매우 짧으면 active 구간에 NVML memory-clock sample이 없어 `inconclusive`가 될 수 있다. 이때 verified 표시를 수동으로 바꾸지 말고 같은 workload의 iteration/batch 설정을 검토하여 plan을 다시 생성한 뒤 전력과 profile을 같은 조건으로 재실행한다. counter·클럭 누락과 명확한 workload 실패는 별도 이유로 기록된다.
 
-실패·미확정 조건의 raw 에너지 측정은 보존하고 `verified_target_*` 최적값 선정에서 제외한다. 95% 기준의 분모는 미검증·target 실패 후보를 포함한 **전체 유효 고정 클럭 sweep의 최고 처리량**이다. 검증된 후보들만으로 최고값을 낮추지 않는다. 해당 기준에 도달하는 검증 후보가 없으면 winner를 비워 두고 `verified_target_coverage`에 이유를 남긴다. 연결 대상이 아닌 trial도 새 결과 디렉터리에 그대로 보존한다. `pass`는 목표 경로의 적절성 판단이며 대역폭 포화·높은 처리량의 최소 에너지·순수 물리 회로 에너지 분리는 각각 별도 판단이다.
+실패·미확정 조건의 raw 에너지 측정은 보존하고 `verified_target_*` 최적값 선정에서 제외한다. HBM은 **해당 actual memory clock 이론 BW의 80% 이상**을 요구한다. 다른 workload의 상대 95% 기준은 미검증·target 실패 후보를 포함한 **전체 유효 고정 클럭 sweep의 최고 처리량**을 분모로 쓰며 검증된 후보들만으로 최고값을 낮추지 않는다. 해당 기준에 도달하는 검증 후보가 없으면 winner를 비워 두고 `verified_target_coverage`에 이유를 남긴다. 연결 대상이 아닌 trial도 새 결과 디렉터리에 그대로 보존한다. `pass`는 목표 경로의 적절성 판단이며 대역폭 포화·높은 처리량의 최소 에너지·순수 물리 회로 에너지 분리는 각각 별도 판단이다.
 
 profiling은 전력 측정이 아니다. CUDA profiler start/stop 구간에 실제 대상 workload만 넣고 setup·initialization·warmup은 제외한다. cuBLAS의 내부 kernel 이름을 추측하지 않는다. 생성 명령은 `--profile-from-start off --cache-control none --clock-control none --replay-mode application --print-units base`를 사용하며, `--log-file`로 NCU CSV를 worker JSON과 분리한다. cache flushing을 껐다고 residency가 보장되지는 않으므로 실제 hit와 DRAM bytes를 확인한다. [공식 자료](docs/sources.md)
 
@@ -419,7 +420,11 @@ Tensor의 클럭별 ceiling은 `SM 개수 × 실제 SM MHz × FLOP/SM/cycle × 1
 
 메모리의 같은 측정 구간에서 전력 `P`가 W, 유효 요청 대역폭 `B`가 decimal GB/s라면 `e_total = 125 × P / B` pJ/logical bit다. 대역폭이 낮으면 idle·기본 동작 전력의 몫이 커지기 쉽다. 전력 증가율보다 처리량 증가율이 클 때 단가가 개선되므로 **최대 bandwidth와 최소 pJ/bit가 항상 같은 geometry라는 가정도 하지 않는다**. 먼저 충분한 공급 병렬도와 계층별 bandwidth 기준을 확보하고, 처리량을 유지하는 후보에서 에너지를 비교한다.
 
-현재 정책은 주파수별 관측 peak의 95%를 유지하는 후보와 전체 고정 클럭 sweep의 peak 대비 95%를 유지하는 후보를 구분한다. 반복 품질·서로 다른 resource geometry·NCU 경로·coalescing·완료 work count를 검사한다. 그러나 **모든 측정이 느리면 그 안의 95%와 plateau도 통과할 수 있다**. `qualified_observed_candidate`는 관측 격자 안의 승인 후보이며 `hardware_saturation_proven=false`다. 독립적으로 측정한 동일 조건 bandwidth 기준에 대한 하한이나 높은 achieved occupancy를 강제하는 gate는 아직 없다. [평가 구현](powermodeling/evaluation.py), [관측 최소점 분석](powermodeling/analysis.py)
+HBM은 `B_theory = 2 × achieved_memory_MHz × 10^6 × bus_bits / 8` byte/s의 **80% 이상**에서 최소 pJ/logical bit를 선택한다. 버스 폭은 CUDA device metadata, memory MHz는 같은 에너지 구간의 실제 NVML 관측값이다. Peak clock 속성이나 요청 clock으로 누락값을 대체하지 않는다. **관측 peak의 95%는 HBM의 추가 탈락 조건이 아니다.** `--hbm-bandwidth-fraction 0.80`으로 기준을 명시할 수 있다. 버스 폭·클럭이 미지수인 기존 raw는 보존하되 승인 후보로 쓰지 않는다.
+
+분자는 에너지 구간의 logical payload rate이며 물리적 HBM bus 사용률의 동시 측정은 아니다. NCU replay의 DRAM bytes를 에너지 분모로 섞지 않고, HBM 경로·coalescing을 별도 검증한다. 80%는 사용자 선택 정책으로 물리적 포화를 뜻하지 않는다. 반복 품질·서로 다른 resource geometry·완료 count·clock·CI 조건도 유지한다.
+
+다른 계층·연산에는 주파수별/전체 고정 클럭 sweep의 관측 peak 95% 정책이 남는다. **모든 측정이 느리면 상대 95%와 plateau도 통과할 수 있는 한계는 해당 계층에 남아 있다.** `qualified_observed_candidate`는 관측 격자 안의 승인 후보이며 `hardware_saturation_proven=false`다. [HBM 기준과 구현](docs/hbm-bandwidth-design.ko.md), [평가 구현](powermodeling/evaluation.py), [관측 최소점 분석](powermodeling/analysis.py)
 
 ### Static·dynamic과 세 가지 에너지 결과
 
@@ -466,6 +471,18 @@ Pstate·enforced power cap은 조회되는 경우 비교하며, 모두 미지원
 | HBM | `memory-read.json`은 `max(8×L2,256 MiB)` 할당, coalesced read | 유한 iterations·stride·SM filter 아래에서 실제 방문하는 범위와 DRAM traffic 확인. 큰 할당만으로 HBM 실험이 되지 않음 |
 
 현재 read는 thread/iteration당 u32 load 하나와 합계 누산 하나를 사용한다. 주소·loop·issue 비용과 부족한 load 병렬도가 bandwidth를 제한할 수 있으므로 iterations/batching 진단과 compiled SASS·counter를 확인한다. 매 launch에서 주소 순회가 다시 시작하므로 전체 stride cycle의 footprint와 한 launch의 실제 footprint도 다르다. Write/copy의 count 규약은 별도이며 copy는 read와 write payload를 모두 센다. 데이터 seed·압축 가능성·working set·cache warm 상태도 비교 조건으로 보존한다.
+
+V3는 일반적인 footprint에서 32-bit index 경로로 주소·제어 명령을 줄인다. CUDA 12.9의 SM70/80/90 SASS에서 L2/HBM `.cg` 16-load loop는 V2의 189개 명령에서 91–92개로 줄었다. 이 값은 **정적 명령 수**이며 실행 시간이나 에너지 감소율이 아니다. Sum32는 load 생존성을 위해 남기며 CPU oracle·입력 생성은 측정 밖이다. 같은 memory clock에서 SM clock을 조절해 80% HBM 요청률을 유지하는 조건을 찾고, 전체 전력과 H100 memory-scope 전력을 별도로 본다. 범용 XOR/산술 control을 빼서 순수 HBM 에너지로 해석하지 않는다.
+
+### `.ca`·`.cg`·`.cs`와 짧은 HBM 진단
+
+| 정책 | 설계 판단 |
+|---|---|
+| `.ca` | L1/L2 캐싱. L1 측정 기본이며 HBM에서는 L1 재사용이 결과를 바꿀 수 있음 |
+| `.cg` | L1 우회·L2 캐싱. L2/HBM 기본; HBM 도달 여부는 footprint와 DRAM counter로 검증 |
+| `.cs` | streaming/evict-first 힌트. L2 bypass를 보장하지 않으며 실측 전 효율 우위를 가정하지 않음 |
+
+`--read-cache-policy auto|ca|cg|cs`는 memory read 전용이며 auto=L1 ca/L2·HBM cg다. HBM의 ca/cs는 진단으로만 실행하고 최적값 후보와 섞지 않는다. [HBM cache 진단 preset](configs/hbm-cache-policy-diagnostics.json)은 blocks=8S·T=256·stride=1·iterations=4096의 한 geometry에서 cg/ca/cs를 비교한다. 지원된 exact 1110·최대 SM clock·advertised default 고정 pair를 사용하고, 같은 memory/SM pair 안에서 비교한다. 3회 반복·paired control 없이 nominal trial 27초로, 보통 2–3 pair이면 초기화·settle·NCU 제외 약 8–12분이다. 이후 cg의 iterations=4096/16384와 필요한 geometry만 추가 진단한다. [실행 명령·공식 근거·해석 한계](docs/hbm-bandwidth-design.ko.md)
 
 Jia 등의 Volta, Abdelkhalik 등의 Ampere, Luo 등의 Hopper microbenchmark 연구는 warmed cache, latency와 throughput 커널의 분리, 독립 load 공급과 경로 검증의 근거로 사용한다. 논문의 thread/block 수를 현재 scalar-read 커널의 에너지 최적으로 복사하지 않는다. 원문·버전·해당 절은 [연구 사례 검토](docs/cache-sector-review.ko.md)에 기록되어 있다.
 
@@ -544,7 +561,8 @@ Geometry pilot은 보통 **계층당 두 clock 합계 14–16조건**, 모든 T�
 |---|---|---|
 | 전체/idle 증가분/paired 대비와 static·dynamic 구분 | 구현됨 | `analysis.py`, `test_analysis.py`; 순수 leakage/switching 분리는 주장하지 않음 |
 | Thread/block 한계와 compiled occupancy 기록 | 구현됨 | `planner.py`, CUDA worker, `test_planner.py`; 실제 residency는 GPU에서 확인 |
-| 충분히 높은 bandwidth에서 효율 비교 | **부분 구현** | 관측 95%·plateau는 있으나 독립 bandwidth 기준 하한 없음. 느린 sweep도 상대 기준 통과 가능 |
+| 충분히 높은 bandwidth에서 효율 비교 | **부분 구현** | HBM은 actual memory clock·bus 폭 이론 BW의 80% gate 구현. 다른 계층의 관측 95% 한계와 GPU 실측 검증은 남음 |
+| Read의 연산 오버헤드와 cache 정책 | 구현됨 | V3의 32-bit index 경로·sum32·SASS 검사; HBM cg 기본, ca/cs 별도 진단. 실측 BW·pJ 개선은 미검증 |
 | Occupancy에 맞춘 좁은 pilot→후보→정식 sweep | **미구현** | preset은 고정 Cartesian grid. 수동 진단은 가능하나 자동 후보 선택·R 기반 범위 생성 없음 |
 | Default 고정 pair·exact 1110 포함 | 구현됨 | `planner.py`, `runner.py`, clock tests; device/driver 지원·actual MHz는 실측 필요 |
 | 동일 memory clock에서 clock 효과 비교 | **부분 구현** | 1110 비교는 일치 검사. Factory-default 개선율은 memory 변경 효과를 포함할 수 있음 |
@@ -555,7 +573,7 @@ Geometry pilot은 보통 **계층당 두 clock 합계 14–16조건**, 모든 T�
 | 실험 정의·단위·rank·holdout에 근거한 모델 | **부분 구현** | `model.py`의 입력/식별/예측 gate는 있음. 동시 mixed 수집과 수동 provenance 검증은 별도 필요 |
 | 재현 가능한 도구·결과·오류 보존 | 구현됨 | 설치 스크립트, raw JSON, plan, binary/toolkit 정보, `--resume`; 실제 GPU 측정 검증을 대체하지 않음 |
 
-현재 합성 반례로 두 차이를 확인할 수 있다. `tests/test_evaluation.py`의 `study_fixture()`는 peak 100 bytes/s에서도 `qualified_observed_candidate`와 `observed_plateau`를 만든다. 또한 같은 L2 설정의 두 repeat에 서로 다른 검증 locality 라벨만 붙이면 한 group으로 합쳐진다. 둘 다 **정책/그룹화의 한계를 확인하는 합성 사례**이며 GPU 실측 숫자가 아니다. 후속 보완의 우선순위는 독립 bandwidth 기준과 pilot 범위, mapping별 locality 그룹/비교, 동일 memory clock의 default 대조, mixed calibration 자동화다.
+기존 HBM 상대 기준은 peak 100 bytes/s인 합성 sweep도 승인할 수 있었으나, 이제 유효한 장치 이론 BW의 80%를 충족해야 한다. 같은 L2 설정의 repeat에 서로 다른 검증 locality 라벨만 붙였을 때 한 group으로 합쳐지는 한계는 남아 있다. 이는 **정책/그룹화의 합성 사례**이며 GPU 실측 숫자가 아니다. 후속 보완은 다른 계층의 bandwidth 기준과 pilot 자동화, mapping별 locality 그룹/비교, 동일 memory clock의 default 대조, mixed calibration 자동화다.
 
 ## 검증 및 상세 설계
 

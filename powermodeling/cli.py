@@ -47,6 +47,8 @@ def parser():
     analyze.add_argument("--input",required=True)
     analyze.add_argument("--output",required=True)
     analyze.add_argument("--throughput-fraction",type=float,default=0.95)
+    analyze.add_argument("--hbm-bandwidth-fraction",type=float,default=0.80,
+                         help="HBM-only minimum sustained logical bandwidth / theory from measured memory clock and CUDA bus width; observed-peak fraction is diagnostic for HBM")
     analyze.add_argument("--plan",help="Original plan for missing-trial and required-clock evaluation; defaults to INPUT/plan.json when present")
     analyze.add_argument("--evaluation-policy",help="JSON overrides for plateau tolerance, minimum resource levels and maximum relative CI width")
     analyze.add_argument("--plots",action="store_true",help="Write energy/throughput and clock plots (requires matplotlib)")
@@ -153,6 +155,7 @@ def main(argv=None):
             plan_path=Path(args.plan) if args.plan else Path(args.input)/"plan.json"
             evaluation_plan=read_json(plan_path) if args.plan or plan_path.is_file() else None
             result=summarize(records,throughput_fraction=args.throughput_fraction,plan=evaluation_plan,
+                             hbm_bandwidth_fraction=args.hbm_bandwidth_fraction,
                              evaluation_policy=read_json(args.evaluation_policy) if args.evaluation_policy else None)
             paths=write_summary(result,args.output)
             if args.plots:

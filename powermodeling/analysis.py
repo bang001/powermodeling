@@ -18,6 +18,9 @@ from typing import Any, Iterable, Mapping
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
 from .memory import count_issues as memory_count_issues, coalesced_read_geometry
 from .memory_power import trial_sensor, group_sensor
+from .hbm_bandwidth import (DEFAULT_FRACTION as DEFAULT_HBM_BANDWIDTH_FRACTION,
+                            trial_bandwidth, group_bandwidth, validate_fraction,
+                            throughput_eligible, threshold_metadata)
 from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, REFERENCE_KIND as SFU_REFERENCE_KIND, count_issues as sfu_count_issues
 from .evaluation import (experiment_contract, evaluate, energy_role_eligible,
                          energy_coalescing_eligible, energy_peak_population_eligible)
@@ -591,13 +594,15 @@ def _group_measurement_diagnostics(valid, group):
         grouped["scope_factors"]["idle_increment_eligible" if objective == "operational_idle_increment" else "paired_reference_eligible"] = eligible
     return grouped
 
-def analyze_trial(record: Mapping[str, Any], policy: AnalysisPolicy | Mapping[str, Any] | None = None) -> dict[str, Any]:
+def analyze_trial(record: Mapping[str, Any], policy: AnalysisPolicy | Mapping[str, Any] | None = None,
+                  hbm_bandwidth_fraction: float = DEFAULT_HBM_BANDWIDTH_FRACTION) -> dict[str, Any]:
     """Calculate operational incremental energy for one sustained trial.
 
 Complete monotonic work epochs align the work denominator and energy integral.
 Older records without epochs retain a clearly qualified whole-run rate estimate;
 stable clock/thermal telemetry alone cannot prove stationary work throughput.
 """
+    hbm_bandwidth_fraction = validate_fraction(hbm_bandwidth_fraction)
     policy = policy if isinstance(policy, AnalysisPolicy) else AnalysisPolicy(**(policy or {}))
     benchmark = record.get("benchmark") or record.get("result") or {}
     phase_records = record.get("phases", {})
@@ -861,7 +866,8 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         elif memory_geometry.get("status") != "pass" and memory_coalescing.get("status") == "pass":
             memory_coalescing["status"] = "inconclusive"
     coalescing_eligible = not read_coalescing_required or memory_coalescing.get("energy_eligible") is True
-    role_eligible = experiment_role in ("energy_characterization", "legacy_unspecified")
+    role_eligible = energy_role_eligible({"workload": record.get("workload"), "experiment_role": experiment_role,
+                                        "config": config, "experiment_contract": experiment_contract(record.get("workload"), benchmark, config)})
     result: dict[str, Any] = {
         "trial_id": record.get("trial_id"), "condition_id": record.get("condition_id"), "workload": record.get("workload"), "gpu_uuid": gpu_uuid,
         "experiment_role": experiment_role,
@@ -1033,6 +1039,7 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         result[prefix + "pj_per_element"] = power / element_rate * 1e12 if power is not None and element_rate else None
         result[prefix + "pj_per_row"] = power / row_rate * 1e12 if power is not None and row_rate else None
     result["energy_peak_population_eligible"] = energy_peak_population_eligible(result)
+    result["hbm_bandwidth"] = trial_bandwidth(record, result, measure.get("_selected", []), hbm_bandwidth_fraction)
     result["hbm_memory_power"] = trial_sensor(record, result, phases, phase_records,
                                              policy.max_sample_gap_s, policy.max_idle_drift_fraction,
                                              _integrate, _idle_at)
@@ -1079,6 +1086,7 @@ def _group_key(trial: Mapping[str, Any]) -> str:
                        "config": config, "uncontrolled_achieved_clocks": achieved,
                        "benchmark_sha256": trial.get("benchmark_sha256"),
                        "measurement_stratum": trial.get("measurement_stratum"),
+                       "experiment_contract": trial.get("experiment_contract"),
                        "nonlinear_contract": trial.get("nonlinear_contract"),
                        "sfu_contract": trial.get("sfu_contract"),
                        "treatment_design_stratum": trial.get("treatment_design_stratum"),
@@ -1150,7 +1158,7 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
         # when its fastest conditions are unprofiled or fail target admission.
         # An incomplete validated subset cannot lower the high-utilization bar.
         observed_max = all_max if verified_only else candidate_max
-        eligible = [g for g in candidates if g[throughput] >= fraction * observed_max]
+        eligible = [g for g in candidates if throughput_eligible(g, throughput, observed_max, fraction)]
         if not eligible:
             continue
         best = min(eligible, key=lambda g: (g[metric], -g[throughput]))
@@ -1158,13 +1166,13 @@ def _selections(groups: list[dict[str, Any]], fraction: float, min_repeats: int,
                            "metric": metric, "metric_value": best[metric], "metric_ci95": best["ci95"].get(metric),
                            "throughput": best[throughput], "observed_max_throughput": observed_max,
                            "throughput_fraction_of_observed_max": best[throughput] / observed_max if observed_max else None,
-                           "throughput_threshold_fraction": fraction, "eligible_groups": len(eligible),
+                           **threshold_metadata(best, fraction), "eligible_groups": len(eligible),
                            "target_verified": best["target_verified"], "valid_repeats": best["valid_repeats"],
                            "clock_comparison_controlled": best["clock_comparison_controlled"],
                            "observation_scope": "uncontrolled-clock exploratory" if exploratory_only else "requested fixed-clock comparison",
                            "observed_max_throughput_all_valid_groups": all_max,
                            "verified_peak_coverage_fraction": candidate_max / all_max if verified_only and all_max > 0 else None,
-                           "meets_threshold_vs_all_valid_groups": best[throughput] >= fraction * all_max,
+                           "meets_threshold_vs_all_valid_groups": throughput_eligible(best, throughput, all_max, fraction),
                            "selection_scope": "best measured among tested configurations; sweep completeness and physical target attribution are not implied"})
     return selections
 
@@ -1213,7 +1221,7 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_g
                 continue
         elif geometry_count < min_geometries:
             continue
-        if clock_peak is None or (_finite(group.get(throughput)) or 0) < fraction * clock_peak:
+        if not throughput_eligible(group, throughput, clock_peak, fraction):
             continue
         tensor = group["workload"] in _TENSOR_WORKLOADS
         for objective, prefix, eligibility in objectives:
@@ -1243,7 +1251,7 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_g
                     "requested_memory_clock_mhz": point["config"].get("memory_clock_mhz"),
                     "metric_value": point[point_metric], "metric_ci95": point["ci95"].get(point_metric),
                     "throughput": point[point_throughput], "throughput_fraction_of_own_clock_observed_peak": point[point_throughput] / point_peak,
-                    "config": point["config"], "valid_repeats": point["valid_repeats"],
+                    **threshold_metadata(point, fraction), "config": point["config"], "valid_repeats": point["valid_repeats"],
                     "paired_reference_order_counts": point.get("paired_reference_order_counts"),
                     "resource_geometry": point.get("resource_geometry"),
                     "own_clock_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(point, False), sort_keys=True), set())),
@@ -1269,7 +1277,7 @@ def _empirical_energy_optima(groups, fraction, min_repeats, near_fraction, min_g
                         "winning_achieved_memory_clock_mhz": group.get("memory_clock_mhz"),
                         "throughput": group[throughput], "own_clock_observed_max_throughput": clock_peak,
                         "throughput_fraction_of_own_clock_observed_peak": group[throughput] / clock_peak,
-                        "throughput_threshold_fraction": fraction, "candidate_groups": len(candidates),
+                        **threshold_metadata(group, fraction), "candidate_groups": len(candidates),
                         "own_clock_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(group, False), sort_keys=True), set())),
                         "own_clock_verified_distinct_geometry_count": len(verified_geometries.get(json.dumps(_clock_stratum(group, False), sort_keys=True), set())),
                         "own_clock_observed_distinct_geometry_count": len(geometries.get(json.dumps(_clock_stratum(group, False), sort_keys=True), set())),
@@ -1304,14 +1312,16 @@ def _verification_coverage(groups, fraction, min_repeats, cross_clock):
         peak = max(g[throughput] for g in candidates)
         verified = [g for g in candidates if g["verified_selection_eligible"]]
         verified_peak = max(g[throughput] for g in verified) if verified else None
-        eligible = [g for g in verified if g[throughput] >= fraction * peak]
+        eligible = [g for g in verified if throughput_eligible(g, throughput, peak, fraction)]
         result.append({"stratum": json.loads(key), "scope": "cross_clock" if cross_clock else "within_clock",
                        "observed_max_throughput_all_valid_groups": peak,
                        "observed_max_throughput_verified_groups": verified_peak,
                        "verified_peak_coverage_fraction": verified_peak / peak if verified_peak is not None else 0,
-                       "throughput_threshold_fraction": fraction, "valid_groups": len(candidates),
+                       **threshold_metadata(candidates[0], fraction), "valid_groups": len(candidates),
                        "verified_groups": len(verified), "verified_high_throughput_groups": len(eligible),
-                       "selection_status": "eligible_verified_conditions_available" if eligible else "no_verified_condition_reaches_complete_sweep_throughput_threshold",
+                       "selection_status": "eligible_verified_conditions_available" if eligible else
+                           "no_verified_condition_reaches_hbm_theoretical_bandwidth_threshold" if candidates[0]["workload"] == "hbm" else
+                           "no_verified_condition_reaches_complete_sweep_throughput_threshold",
                        "unverified_or_failed_peak_group_ids": [g["group_id"] for g in candidates if g[throughput] == peak and not g["verified_selection_eligible"]]})
     return result
 
@@ -1389,9 +1399,11 @@ def _group_memory_coalescing(valid):
 
 def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float = 0.95,
               policy: AnalysisPolicy | Mapping[str, Any] | None = None, min_repeats: int = 3,
-              plan: Mapping[str, Any] | None = None, evaluation_policy=None) -> dict[str, Any]:
+              plan: Mapping[str, Any] | None = None, evaluation_policy=None,
+              hbm_bandwidth_fraction: float = DEFAULT_HBM_BANDWIDTH_FRACTION) -> dict[str, Any]:
     if not 0 < throughput_fraction <= 1 or min_repeats < 1:
         raise ValueError("throughput_fraction must be in (0, 1], min_repeats must be positive")
+    hbm_bandwidth_fraction = validate_fraction(hbm_bandwidth_fraction)
     policy = policy if isinstance(policy, AnalysisPolicy) else AnalysisPolicy(**(policy or {}))
     records = list(records)
     trials = []
@@ -1404,7 +1416,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             continue
         if trial_id is not None:
             seen_ids.add(trial_id)
-        trials.append(analyze_trial(record, policy))
+        trials.append(analyze_trial(record, policy, hbm_bandwidth_fraction=hbm_bandwidth_fraction))
     buckets: dict[str, list[dict[str, Any]]] = {}
     for trial in trials:
         buckets.setdefault(_group_key(trial), []).append(trial)
@@ -1456,6 +1468,7 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             values = [value for t in valid if (value := _finite(t.get(metric))) is not None]
             group[metric] = statistics.median(values) if values else None
             group["ci95"][metric] = _median_ci(values, int(digest, 16))
+        group["hbm_bandwidth"] = group_bandwidth(valid, group["workload"], hbm_bandwidth_fraction)
         group["hbm_memory_power"] = group_sensor(valid, group["workload"], int(digest, 16), _median_ci, repeats)
         if group["hbm_memory_power"] is not None:
             sensor = group["hbm_memory_power"]
@@ -1522,11 +1535,13 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             "metric_aliases": {"pj_per_op": "legacy operational idle increment per reported benchmark operation; tensor FLOP uses explicit operational_idle_increment_pj_per_flop",
                                "pj_per_logical_byte": "legacy operational idle increment per logical byte; divide by 8 for logical-bit metric",
                                "incremental_power_w": "operational_idle_increment_power_w; a baseline contrast, not physical switching power"},
-            "selection_policy": {"throughput_fraction": throughput_fraction, "min_repeats": min_repeats, "min_geometries": policy.min_geometries,
+            "selection_policy": {"throughput_fraction": throughput_fraction, "hbm_bandwidth_fraction": hbm_bandwidth_fraction,
+                                 "hbm_throughput_constraint": "all conditions with median sustained logical bandwidth >= the configured fraction of clock-specific DDR theory; every valid repeat needs complete measured memory-clock and CUDA bus-width evidence; observed 95% and plateaus are diagnostic only",
+                                 "min_repeats": min_repeats, "min_geometries": policy.min_geometries,
                                  "near_optimum_fraction": policy.near_optimum_fraction,
                                  "geometry_requirement": "at least min_geometries distinct verified execution-resource geometries per frequency; throughput peak still uses all valid groups; repeat/seed/footprint-only variants do not qualify; count alone is not saturation proof",
                                  "primary_energy_objective": "whole-device total energy per logical bit, FLOP or nonlinear output element",
-                                 "frequency_utilization_constraint": "own-frequency complete measured geometry peak; global-near-peak optima are reported separately",
+                                 "frequency_utilization_constraint": "HBM: clock-specific theoretical bandwidth gate; other workloads: own-frequency complete measured geometry peak, with global-near-peak optima reported separately",
                                  "baseline_objectives": "separate matched operational idle increment and paired active-reference contrast; never automatically substituted for total energy",
                                  "ci_method": "deterministic percentile bootstrap of repeat medians (1000 draws); n=3 intervals are coarse"},
             "notes": ["No fabricated measurement or architecture-specific idle wattage is supplied.",
@@ -1551,7 +1566,7 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
               "memory_access_geometry", "memory_coalescing", "memory_coalescing_energy_eligible", "energy_peak_population_eligible",
               "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "baseline_state_matched", "baseline_state_issues", "baseline_state_domains_compared", "resource_geometry", "row_width", "nonlinear_contract", "counted_measure_elements", "element_count_convention", "row_operation_convention", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
               "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source",
-              "hbm_memory_power", "memory_rail_energy_j", "memory_rail_idle_power_w",
+              "hbm_memory_power", "hbm_bandwidth", "memory_rail_energy_j", "memory_rail_idle_power_w",
               "memory_rail_incremental_energy_j", "memory_rail_sources",
               "sfu_contract", "counted_measure_sfu_instructions", "sfu_instruction_count_convention",
               "sfu_reference_delta_measurement_valid", "sfu_reference_delta_positive_optimum_eligible",

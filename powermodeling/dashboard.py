@@ -16,7 +16,8 @@ def write_evaluation(evaluation, output):
               "recommendation_status", "quality_issues", "eligibility_reasons", "dense_tensor_peak_fraction", "row_width", "pj_per_row",
               "measurement_diagnostics", "nonlinear_launch", "sfu_launch", "sfu_reference_delta", "sfu_reference_diagnostics",
               "experiment_role", "memory_stride_words", "memory_lane_stride_bytes", "memory_observed_sector_efficiency_pct",
-              "memory_coalescing_energy_eligible", "energy_peak_population_eligible", "memory_access_geometry", "memory_coalescing"]
+              "memory_coalescing_energy_eligible", "energy_peak_population_eligible", "memory_access_geometry", "memory_coalescing",
+              "hbm_memory_power"]
     with csv_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
         for c in evaluation["components"]:
@@ -38,7 +39,44 @@ def write_evaluation(evaluation, output):
     # Untrusted names/metadata cannot close this script tag or create markup.
     payload = json.dumps(evaluation, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace("&", "\\u0026")
     html_path.write_text(_HTML.replace("__EVALUATION_DATA__", payload))
-    return {"evaluation_json": str(data_path), "evaluation_csv": str(csv_path), "evaluation_html": str(html_path)}
+    paths = {"evaluation_json": str(data_path), "evaluation_csv": str(csv_path), "evaluation_html": str(html_path)}
+    paths.update(_write_hbm_memory_power(evaluation, output))
+    return paths
+
+
+def _write_hbm_memory_power(evaluation, output):
+    components = [c for c in evaluation["components"] if c["stratum"]["workload"] == "hbm"]
+    if not components:
+        return {}
+    path = output / "hbm-memory-power.csv"
+    fields = ["component_id", "group_id", "gpu_uuid", "gpu_name", "requested_graphics_mhz",
+              "requested_memory_mhz", "geometry", "experiment_contract", "ncu_status",
+              "status", "scope", "source", "semantics", "measurement_valid", "normalization_valid",
+              "incremental_valid", "observed_repeats", "valid_repeats", "normalized_repeats",
+              "incremental_repeats", "power_w", "energy_j", "idle_power_w", "incremental_power_w",
+              "incremental_energy_j", "pj_per_logical_bit", "incremental_pj_per_logical_bit", "ci95",
+              "freshness_status", "freshness_verified", "maximum_sensor_age_s", "freshness_maximum_age_s",
+              "board_invalid_repeats", "duplicate_repeats_excluded",
+              "board_power_w", "board_total_pj_per_logical_bit", "issues", "incremental_issues"]
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for component in components:
+            for point in component["points"]:
+                sensor = point.get("hbm_memory_power") or {
+                    "status": "unavailable", "scope": "memory", "issues": ["missing_sensor_analysis"]}
+                contributions = (point.get("measurement_diagnostics") or {}).get("power_contributions") or {}
+                row = {**{key: sensor.get(key) for key in fields},
+                       **{key: point.get(key) for key in ("group_id", "requested_graphics_mhz",
+                                                         "requested_memory_mhz", "geometry", "ncu_status")},
+                       "component_id": component["component_id"], "gpu_uuid": component["stratum"]["gpu_uuid"],
+                       "gpu_name": component.get("gpu_name"),
+                       "experiment_contract": component["stratum"].get("experiment_contract"),
+                       "board_power_w": contributions.get("total_w"),
+                       "board_total_pj_per_logical_bit": point["energies"].get("total")}
+                writer.writerow({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+                                 for key, value in row.items()})
+    return {"hbm_memory_power_csv": str(path)}
 
 
 _HTML = r'''<!doctype html>
@@ -55,6 +93,7 @@ _HTML = r'''<!doctype html>
 <section><div class="bar"><h2 style="flex:1">Measured response</h2><div><label for="view">View</label><select id="view"><option value="clock_rate">Clock vs sustained throughput</option><option value="clock_energy">Clock vs energy</option><option value="pareto">Throughput vs energy</option><option value="geometry">Issue resource vs throughput</option><option value="input_rate">Q vs throughput</option><option value="input_energy">Q vs energy</option><option value="power">One repeat: power over time</option><option value="temperature">One repeat: temperature over time</option></select></div><button id="export">Download SVG</button></div><div id="chart"></div><div class="legend">● NCU pass (green), × fail (red), □ inconclusive (amber), △ unprofiled (blue). Purple ring: advertised factory default fixed pair. Black ring: exact 1110 MHz. Large marker: selected candidate. Bars: bootstrap 95% intervals. Hover for clocks, geometry and quality. Points are observed; no interpolation across missing conditions.</div><p id="chartnote" class="muted"></p></section>
 <section><h2>Clock and resource coverage</h2><div id="clocks" class="scroll"></div></section>
 <section><h2>Conditions, uncertainty and rejected repeats</h2><div id="points" class="scroll"></div></section>
+<section id="hbmMemorySection" hidden><h2>HBM memory sensor</h2><p class="muted">Separate memory-subsystem readings, including supported H100 GPU Memory Power Readings. Memory W and integrated J use the treatment window; pJ/logical bit uses its counted logical payload. These readings are never added to whole-device energy. Average readings cover the previous second; instant and average sources are not pooled. Idle increments require a matched memory-sensor baseline and may include refresh, clock and background activity. Missing readings remain unavailable. Intervals describe repeat uncertainty, not sensor accuracy; NCU target-path evidence remains separate.</p><div id="hbmMemory" class="scroll"></div><details><summary>Sensor status, repeat coverage and uncertainty</summary><pre id="hbmMemoryDetails"></pre></details></section>
 <section id="coalescingSection" hidden><h2>Memory read coalescing and experiment role</h2><p class="muted">Coalesced energy reads require a 1-word / 4-byte lane stride and sector-aligned full-warp geometry, plus bound sector-counter evidence near 100% efficiency. Target-path admission is separate. Efficiency is logical payload / counter-sector bytes: 25% means four times as many sector bytes. The counter scope identifies the memory level; L1/L2 sector efficiency is not HBM bus efficiency. Replay counters never rescale logical bandwidth or measured pJ. Explicit diagnostic experiments remain visible and cannot define energy optima or their observed peak.</p><div id="coalescing" class="scroll"></div></section>
 <section id="inputScalingSection" hidden><h2>Q-scaling evidence</h2><p id="inputScalingScope" class="muted"></p><p id="inputScalingDecision" class="muted"></p><div id="inputScaling" class="scroll"></div><details><summary>Matched curve definitions and selected-candidate evidence</summary><pre id="inputScalingDetails"></pre></details></section>
 <section><h2>Energy accounting and comparison checks</h2><p class="muted">Values below are repeat medians. Compare the same energy scope, unit, clock and input definition. A byte contains 8 bits; dense FMA counts as 2 FLOPs. Total/idle factors are observed scope differences, not correction coefficients. Unqualified contrasts remain diagnostic.</p><p id="selectionAccounting" class="muted"></p><div id="accounting" class="scroll"></div><details><summary>Same-window counts, reconstruction, sensor crosscheck and execution diagnostics</summary><pre id="accountingDetails"></pre></details></section>
@@ -78,6 +117,16 @@ const current=()=>data.components.find(c=>c.component_id===$('component').value)
 const scale=(x,n)=>typeof x==='number'&&Number.isFinite(x)?x/n:null;
 const rec=(c)=>c.recommendations.find(r=>r.objective===$('objective').value);
 let previousWorkload=null;
+function renderHbmMemory(c,points){
+ $('hbmMemorySection').hidden=c.stratum.workload!=='hbm';
+ if(c.stratum.workload!=='hbm')return;
+ const value=(s,key)=>fmt(s[key])+(s.ci95?.[key]?' / ['+s.ci95[key].map(fmt).join(', ')+']':'');
+ table('hbmMemory',['Group / requested SM, memory MHz','Geometry','Status / source','Sensor / observed repeats','Count-normalized / idle-matched repeats','Memory W / 95% CI','Memory J / 95% CI','Memory pJ/logical bit / 95% CI','Idle memory W','Idle increment W / J','Idle increment pJ/logical bit / 95% CI','Whole-device pJ/logical bit','Issues'],points.map(p=>{
+   const s=p.hbm_memory_power||{status:'unavailable',issues:['missing_sensor_analysis']};
+   return[p.group_id+' / '+(p.requested_graphics_mhz??'incoming')+', '+(p.requested_memory_mhz??'incoming'),p.geometry,s.status+' / '+(s.source||'unavailable')+' / '+(s.semantics||'unknown')+' / freshness: '+(s.freshness_status||'unverified'),(s.valid_repeats??0)+' / '+(s.observed_repeats??p.valid_repeats),(s.normalized_repeats??0)+' / '+(s.incremental_repeats??0),value(s,'power_w'),value(s,'energy_j'),value(s,'pj_per_logical_bit'),fmt(s.idle_power_w),fmt(s.incremental_power_w)+' / '+fmt(s.incremental_energy_j),value(s,'incremental_pj_per_logical_bit'),fmt(p.energies.total),[...(s.issues||[]),...(s.incremental_issues||[])]];
+ }));
+ $('hbmMemoryDetails').textContent=JSON.stringify(points.map(p=>({group_id:p.group_id,hbm_memory_power:p.hbm_memory_power})),null,2);
+}
 function render(){const c=current();if(!c){$('decision').textContent='No measured component data';return}if(previousWorkload!==c.stratum.workload){$('objective').value=c.primary_objective||'total';previousWorkload=c.stratum.workload}const sfu=c.primary_objective==='paired_active_reference';for(const option of $('objective').options){option.textContent=({total:sfu?'Board total (diagnostic)':'Whole-device total',operational_idle_increment:sfu?'Idle increment (diagnostic)':'Matched idle increment',paired_active_reference:sfu?'Signed SFU / control contrast':'Paired active-reference contrast'})[option.value]}const o=$('objective').value,r=rec(c),u=c.units;
  const oldMemory=$('memory').value,oldClock=$('clock').value;options('memory',[['all','All observed domains'],...[...new Set(c.points.map(p=>p.requested_memory_mhz))].map(v=>[v??'incoming',v===null?'Incoming policy':v+' MHz'])]);options('clock',[['all','All observed clocks'],...[...new Set(c.points.map(p=>p.requested_graphics_mhz))].map(v=>[v??'incoming',v===null?'Incoming policy':v+' MHz'])]);if([...$('memory').options].some(x=>x.value===oldMemory))$('memory').value=oldMemory;if([...$('clock').options].some(x=>x.value===oldClock))$('clock').value=oldClock;$('policy').textContent='Throughput ≥ '+pct(data.policy.throughput_fraction)+' of the valid observed energy-population peak; ≥ '+data.policy.minimum_repeats+' valid repeats and ≥ '+data.policy.minimum_geometries+' verified geometries per clock; plateau: '+data.policy.minimum_resource_levels+(c.stratum.experiment_contract?.grid_mode==='auto'?' increasing Q levels at matched threads/clocks within ':' increasing issue-resource levels within ')+pct(data.policy.plateau_tolerance_fraction)+'; relative CI width ≤ '+pct(data.policy.maximum_relative_ci_width)+'.';$('contract').textContent=JSON.stringify(c.stratum,null,2);$('cards').replaceChildren(...[['Valid / rejected trials',(c.trial_counts.valid||0)+' / '+(c.trial_counts.invalid||0)],['Energy-population observed peak',fmt(scale(c.observed_peak,u.rate_scale))+' '+u.rate_unit],['Candidate energy',fmt(r?.energy)+' '+u.energy_unit],['Performance retained',pct(r?.throughput_fraction_of_observed_peak)]].map(([a,b])=>{const n=el('div',undefined,'card');n.append(el('div',a,'muted'),el('div',b,'value'));return n}));
  $('decision').textContent=c.interpretation+'. '+(c.primary_estimator?'Estimator: '+c.primary_estimator+'. ':'')+(c.correctness_scope||'')+'. '+label(r?.status||'No energy decision')+(r?.reason?': '+r.reason:'')+(r?.qualification_limits?.length?' — '+r.qualification_limits.join('; '):'');
@@ -86,6 +135,7 @@ function render(){const c=current();if(!c){$('decision').textContent='No measure
  table('points',['Group / anchors','Experiment role','Requested / achieved SM MHz','Memory MHz','Geometry','Q / grid / count source','SFU signed contrast status','Repeats valid / rejected','NCU','Throughput ('+u.rate_unit+')','Energy ('+u.energy_unit+') / 95% CI','Energy per complete row (pJ/row)','Dense Tensor ceiling fraction','Contrast eligible','CI relative width / issues'],c.points.map(p=>[p.group_id+' '+p.anchor_tags.join(', '),p.experiment_role||'legacy_unspecified',p.requested_graphics_mhz+' / '+fmt(p.achieved_sm_mhz??p.achieved_graphics_mhz),p.requested_memory_mhz??'incoming policy',p.geometry,p.nonlinear_launch||p.sfu_launch,p.sfu_reference_delta,p.valid_repeats+' / '+p.rejected_repeats,p.ncu_status,fmt(scale(p.rate,u.rate_scale)),fmt(p.energies[o])+' / '+JSON.stringify(p.energy_ci95[o]),fmt(p.pj_per_row[o]),pct(p.tensor_dense_peak_fraction),p.objective_eligible[o],{widths:p.relative_ci_widths,issues:p.quality_issues,selection_reasons:p.eligibility_reasons?.[o]}]));
  const selectionCheck=c.energy_selection_diagnostics?.find(v=>v.objective===o);$('selectionAccounting').textContent=selectionCheck?'Whole-stratum selection check: lowest own-clock candidate '+fmt(selectionCheck.lowest_own_clock_candidate_energy)+' '+u.energy_unit+', performance relative to full-sweep peak '+pct(selectionCheck.own_clock_candidate_global_throughput_fraction)+'. Full-sweep performance constraint candidate '+fmt(selectionCheck.global_constraint_candidate_energy)+' '+u.energy_unit+'. '+selectionCheck.reason+'.':'Selection constraint accounting unavailable.';
  const filtered=c.points.filter(p=>($('memory').value==='all'||String(p.requested_memory_mhz??'incoming')===$('memory').value)&&($('clock').value==='all'||String(p.requested_graphics_mhz??'incoming')===$('clock').value));
+ renderHbmMemory(c,filtered);
  const memoryReads=filtered.filter(p=>p.memory_coalescing?.applicable);$('coalescingSection').hidden=!memoryReads.length;table('coalescing',['Group / role','Stride words / bytes','Offset / region bytes','Requested efficiency','Observed sector / logical bytes','Observed sector efficiency','Counter / scope','Target path','Coalescing / energy eligible','Peak population / reasons'],memoryReads.map(p=>{const g=p.memory_access_geometry||{},m=p.memory_coalescing;return[p.group_id+' / '+p.experiment_role,p.memory_stride_words+' / '+p.memory_lane_stride_bytes,g.offset_bytes+' / '+g.effective_region_bytes,pct(g.requested_sector_efficiency_fraction),fmt(m.observed_sector_bytes_per_logical_read_byte),pct(m.observed_sector_efficiency_fraction),(m.counter_name||'unavailable')+' / '+(m.counter_scope||'unknown'),p.ncu_status,m.status+' / '+p.memory_coalescing_energy_eligible,{included:p.energy_peak_population_eligible,reasons:m.reasons}]}));
 
  const inputCurves=c.input_scaling?.curves||[];$('inputScalingSection').hidden=!inputCurves.length;$('inputScalingScope').textContent=c.input_scaling?.scope||'';$('inputScalingDecision').textContent=Boolean(r?.saturation_evidence?.curve_id)?label(r.saturation_evidence.status)+': '+r.saturation_evidence.reason:'No selected candidate has Q-scaling qualification.';

@@ -24,6 +24,14 @@ Reviewed 2026-10-05 (UTC); cache-sector definitions and three microbenchmark stu
 | S18 | [NVML supported graphics clocks](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html), [NVML R550 default applications clock semantics](https://docs.nvidia.com/deploy/archive/R550/nvml-api/group__nvmlDeviceQueries.html) | Supported graphics clocks are queried for each memory-clock domain. The default applications pair is distinct from the current clock policy and achieved frequencies. Current NVML marks applications-clock APIs deprecated; capability errors are recorded and an unknown default is not invented. This project uses the CUDA 12 comparison toolchain and includes supported exact 1110 MHz anchors plus approximate 90 MHz grid points as experimental policies. |
 | S19 | [CUDA Runtime API 13.0 device management](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-runtime-api/group__CUDART__DEVICE.html) | CUDA 13 removes `clockRate` and `memoryClockRate` from `cudaDeviceProp`. Query `cudaDevAttrClockRate` and `cudaDevAttrMemoryClockRate` with `cudaDeviceGetAttribute` to retain clock metadata in both CUDA 12 and 13; achieved clocks still come from NVML measurement. |
 
+## HBM memory-power source check (2026-10-09)
+
+The NVIDIA-supplied `nvidia-smi(1)` manual in the official [nvidia-utils 580.65.06 package](https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/nvidia-utils-580_580.65.06-0ubuntu1_amd64.deb) was checked against S10. “GPU Memory Power Readings” defines average power as GPU-memory power over the last second in watts, and instantaneous power as its last measured value in watts. The manual's changelog records memory-power reporting added between v535 Update and v545. The relevant display selector is `nvidia-smi -q -d POWER`; `-d MEMORY` describes memory capacity/use.
+
+The [NVIDIA NVML header](https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nvml.h) and installed Python binding expose the `NVML_FI_DEV_POWER_AVERAGE` / `NVML_FI_DEV_POWER_INSTANT` fields and `NVML_POWER_SCOPE_MEMORY`. The implementation uses exported constants, converts field milliwatts to watts, and preserves source, per-field errors, CPU-epoch microsecond timestamps and averaging semantics. Numeric scope descriptions in header comments can lag the named constants; support and returned scope are checked at runtime. Availability on a particular H100 SKU/driver must be established from successful responses, not its model name.
+
+These sensor readings are a separate memory-subsystem observable. The HBM report integrates them over the measured treatment window and normalizes only by matching logical payload counts. It neither adds them to whole-device energy nor treats separate NCU replay traffic as matched physical HBM bits. This source check is not a hardware measurement.
+
 ## Claims that require measurements
 
 - The minimum pJ/FLOP or pJ/logical-bit of a specific SXM GPU and its idle power.

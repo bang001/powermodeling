@@ -271,6 +271,7 @@ class AnalysisTests(unittest.TestCase):
         for name, phase in record["phases"].items():
             for sample in phase["samples"]:
                 sample["memory_power_w"] = 30 if name == "measure" else 10
+                sample["memory_power_source"] = "memory_power_instant_w"
         trial = analyze_trial(record)
         self.assertEqual(trial["memory_rail_incremental_power_w"], 20)
         self.assertEqual(trial["memory_rail_incremental_energy_j"], 160)

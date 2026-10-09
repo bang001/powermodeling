@@ -457,6 +457,7 @@ def evaluate(summary, plan=None, policy=None, raw_records=()):
                 "memory_lane_stride_bytes": memory_geometry.get("lane_stride_bytes"),
                 "memory_observed_sector_efficiency_pct": coalescing.get("observed_sector_efficiency_pct"),
                 "memory_coalescing_energy_eligible": group.get("memory_coalescing_energy_eligible"),
+                "hbm_memory_power": group.get("hbm_memory_power"),
                 "energy_peak_population_eligible": energy_peak_population_eligible(group),
                 "requested_memory_mhz": cfg.get("memory_clock_mhz"), "achieved_graphics_mhz": group.get("graphics_clock_mhz"),
                 "achieved_sm_mhz": group.get("sm_clock_mhz"), "achieved_memory_mhz": group.get("memory_clock_mhz"),

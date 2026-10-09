@@ -170,7 +170,7 @@ class NvmlDevice:
                 }.get(value_type)
                 if member is None:
                     raise TelemetryError(f"Unsupported NVML value type {value_type}")
-                result[key] = _number(getattr(field.value, member)) / 1000.0
+                power_w = _number(getattr(field.value, member)) / 1000.0
                 result["field_metadata"][key] = {
                     "field": field_name, "scope": scope_label, "scope_id": scope_id,
                     "timestamp_us": int(field.timestamp),
@@ -178,6 +178,7 @@ class NvmlDevice:
                     "latency_us": int(field.latencyUsec),
                     "semantics": "one_second_average" if "average" in key else "driver_instantaneous",
                 }
+                result[key] = power_w
                 self.capabilities[key] = {"available": True, "field": field_name, "scope": scope_label}
             except Exception as exc:
                 result["errors"][key] = _error(exc)

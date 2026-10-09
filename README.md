@@ -1,10 +1,12 @@
 # NVIDIA GPU power modeling
 
-**SXM 모듈의 V100·A100·H100**에서 **충분히 활용한 조건의 실측 pJ/FLOP·pJ/bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
+**SXM 모듈의 V100·A100·H100**에서 **충분한 처리량을 유지하는 pJ/FLOP·pJ/logical-bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. 현재 자동 판정은 측정한 격자의 관측 peak·plateau에 대한 상대 평가이며, 높은 하드웨어 활용률이나 전역 최소점을 보장하지 않는다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
 
-SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter로 검증하기 전에는 목표 계층과 물리 회로 에너지를 동일시하지 않는다.
+SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter가 목표 경로를 확인한 뒤에도 측정 에너지를 해당 물리 회로만의 에너지로 동일시하지 않는다.
 
 [실험 설계 HTML](docs/experiment-design.html)은 treatment/reference 도식, clock coverage, 실제 plan·summary JSON의 로컬 뷰어를 제공한다. 서버 업로드 없이 사용할 수 있으며 문서 도식에는 실측 전력곡선이 없다.
+
+바로가기: [설계 원칙과 정합성](#설계-원칙과-구현-정합성) · [설치와 빌드](#설치와-빌드) · [sweep 구성](#sweep-구성) · [결과 읽기](#결과-읽기) · [H100 메모리 센서](#h100-hbm-메모리-전력에너지).
 
 ## 제공 기능
 
@@ -25,9 +27,42 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 
 ## 설치와 빌드
 
-Linux, Python 3.10 이상, CMake 3.22 이상, NVIDIA driver와 CUDA Toolkit이 필요하다. **A100은 CUDA 13.0의 `sm_80` 빌드를 지원한다.** V100·A100·H100을 같은 Toolkit으로 비교하려면 CUDA 12.x를 사용한다. CUDA 13.0은 V100/Volta의 offline compilation과 library support를 제거했다.
+저장소 루트에서 아래 명령으로 실험 도구를 자동 설치하고 빌드할 수 있다. 전체 설치는 **Linux x86_64, Python 3.10 이상(`venv` 포함)**이 필요하며 `sudo` 없이 저장소 안에 설치한다. `pypi.org`, `files.pythonhosted.org`, `conda.anaconda.org`에 HTTPS로 접근할 수 있어야 한다. 다운로드는 약 1.1 GB이며 설치·패키지 캐시·빌드용으로 **8 GB 이상의 여유 공간**을 준비한다.
 
-NCU도 세대 지원을 맞춰야 한다. **V100·A100·H100 공통 profiling에는 Nsight Compute 2025.2.x처럼 GV100을 지원하는 버전을 사용한다.** Nsight Compute 2025.3부터 Volta 지원이 제거되어 최신 NCU만 설치하면 V100 검증이 실행되지 않는다. `profile`/`validate-run --ncu /설치경로/ncu`로 실제 사용할 executable을 지정하고 driver 요구사항을 확인한다. [공식 버전 지원 자료](docs/sources.md)
+```bash
+python3 tools/setup_experiment.py --build --jobs 2
+source .tools/env.sh
+python -m powermodeling --help
+"$NCU" --version
+"$POWERBENCH" --help
+```
+
+[설치 스크립트](tools/setup_experiment.py)는 V100·A100·H100 공통 도구로 **CUDA 12.9, cuBLAS, profiler API, Nsight Compute 2025.2.1, GCC/G++ 13, cuobjdump, nvdisasm**을 설치한다. Python 가상환경에는 이 프로젝트와 `numpy`, `nvidia-ml-py`, `matplotlib`, CMake와 Ninja를 설치한다. `--build`를 생략하면 도구만 설치하고, 빌드는 `--build`로 다시 실행한다. 같은 명령을 재실행하면 기존 설치와 다운로드 캐시를 재사용한다.
+
+| 경로 / 변수 | 용도 |
+|---|---|
+| `.venv/`, `.venv/bin/python` | 프로젝트·분석·plot·테스트에 사용하는 Python 환경 |
+| `.venv/bin/cmake`, `.venv/bin/ninja` | 빌드 도구 |
+| `.tools/cuda12/` | CUDA 12.9·cuBLAS·NCU·host compiler 설치 prefix |
+| `.tools/cuda12/bin/nvcc`, `cuobjdump`, `nvdisasm` | CUDA compiler·SASS 도구; 세 executable 모두 같은 `bin/` 안에 설치 |
+| `.tools/cuda12/bin/ncu`, `$NCU` | 설치한 Nsight Compute executable; 실행 시 `$NCU`로 지정 |
+| `build-cuda12/powerbench`, `$POWERBENCH` | `--build`로 생성한 `70;80;90` CUDA 실행 파일 |
+| `.tools/env.sh` | `.venv` 활성화 및 `PATH`, `CUDACXX`, `CUDAToolkit_ROOT`, `CXX`, `CUDAHOSTCXX`, `NCU`, `POWERBENCH` 설정 |
+| `.tools/cache/`, `.tools/mamba/` | 다운로드·패키지 캐시와 설치 관리자 상태 |
+
+새 Bash 세션마다 `source .tools/env.sh`를 실행한다. `NCU`와 `POWERBENCH`는 절대 경로로 설정되므로 시스템의 다른 NCU나 `build/powerbench`와 섞이지 않는다. **NVIDIA driver 설치·변경과 GPU counter 권한 설정은 스크립트가 수행하지 않는다.** 실제 측정에는 호환 driver가 있는 GPU 호스트와 필요한 counter/clock 권한이 별도로 필요하다. 설치·빌드와 버전 조회만으로 GPU 실행이나 측정 정확도가 검증되는 것은 아니다.
+
+GPU 도구 없이 Python 분석·plot·CPU 테스트만 준비하려면 다음을 실행한다. 이 모드는 CUDA/NCU 경로를 설정하지 않으며 `--build`와 함께 사용할 수 없다.
+
+```bash
+python3 tools/setup_experiment.py --python-only
+source .tools/env.sh
+python -m unittest discover -s tests -v
+```
+
+수동 설치에서는 Linux, Python 3.10 이상, CMake 3.22 이상, NVIDIA driver와 CUDA Toolkit을 준비한다. **A100은 CUDA 13.0의 `sm_80` 빌드를 지원한다.** V100·A100·H100을 같은 Toolkit으로 비교하려면 CUDA 12.x를 사용한다. CUDA 13.0은 V100/Volta의 offline compilation과 library support를 제거했다.
+
+NCU도 Toolkit·GPU 세대에 맞춘다. **자동 설치의 CUDA 12.9 + Nsight Compute 2025.2.1은 V100·A100·H100 공통 경로다.** Nsight Compute 2025.3부터 Volta 지원이 제거되었다. A100/H100의 수동 CUDA 13 경로에는 CUDA 13을 지원하는 **별도 Nsight Compute 2025.3 이상**을 설치하고, 자동 설치의 NCU 2025.2를 재사용하지 않는다. `profile`/`validate-run --ncu /설치경로/ncu`로 실제 executable을 지정하고 driver 요구사항을 확인한다. [공식 버전 지원 자료](docs/sources.md)
 
 ```bash
 python -m pip install -e .
@@ -47,7 +82,7 @@ cmake --build build-a100-cuda13 -j
 python -m powermodeling discover --device 0 --bench build-a100-cuda13/powerbench
 ```
 
-아키텍처를 생략한 새 빌드의 기본값은 CUDA 12에서 `70;80;90`, CUDA 13에서 `80;90`이다. `-DCMAKE_CUDA_ARCHITECTURES`와 `CUDAARCHS` 환경변수의 지정값을 우선한다. A100 + CUDA 13의 NCU 검증에는 CUDA 13을 지원하는 Nsight Compute 2025.3 이상을 사용한다. 아래 실행 예시의 `--bench build/powerbench`도 선택한 실행 파일 경로로 바꾼다. 비선형 함수 지침에는 두 빌드 경로를 모두 제공한다. CUDA/cuBLAS 버전이 다른 측정은 별도 분석 층으로 기록한다.
+아키텍처를 생략한 새 빌드의 기본값은 CUDA 12에서 `70;80;90`, CUDA 13에서 `80;90`이다. `-DCMAKE_CUDA_ARCHITECTURES`와 `CUDAARCHS` 환경변수의 지정값을 우선한다. 수동 CUDA 13 실행에서는 `POWERBENCH=build-a100-cuda13/powerbench`, `NCU=/별도-NCU-2025.3-이상-설치경로/ncu`로 두 실행 파일을 함께 바꾼다. CUDA/cuBLAS 버전이 다른 측정은 별도 분석 층으로 기록한다.
 
 CUDA 12 compiler를 별도 경로로 지정하려면 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc`를 추가한다. Python 분석만 사용할 때는 CUDA 빌드가 필요하지 않다.
 
@@ -55,18 +90,21 @@ CUDA 12 compiler를 별도 경로로 지정하려면 `-DCMAKE_CUDA_COMPILER=/usr
 
 먼저 장치를 조회하고 기본 DVFS 상태의 smoke sweep으로 실행·센서·결과 형식을 확인한다. smoke도 평균 센서 때문에 수초씩 실행하며, 포화 조건을 전수 탐색하는 용도는 아니다.
 
+아래 실행 예시는 자동 설치의 경로를 사용한다. 수동 설치를 사용하면 `source .tools/env.sh`를 생략하고 선택한 `POWERBENCH`와 `NCU`를 직접 `export`한다. 같은 plan의 전력 실행과 NCU 검증에는 같은 benchmark 실행 파일을 사용한다.
+
 ```bash
-python -m powermodeling discover --device 0 --bench build/powerbench
-python -m powermodeling plan --config configs/smoke.json --device 0 --bench build/powerbench --output smoke-plan.json
-python -m powermodeling run --plan smoke-plan.json --device 0 --bench build/powerbench --output results/smoke
+source .tools/env.sh
+python -m powermodeling discover --device 0 --bench "$POWERBENCH"
+python -m powermodeling plan --config configs/smoke.json --device 0 --bench "$POWERBENCH" --output smoke-plan.json
+python -m powermodeling run --plan smoke-plan.json --device 0 --bench "$POWERBENCH" --output results/smoke
 python -m powermodeling analyze --input results/smoke --output results/smoke-report
 ```
 
 고정 클럭의 처리량·효율 sweep은 다음과 같다. `plan`이 지원 clock pair를 탐색하고 실행 수와 최소 예상 시간을 보여 준다. 실제 시간에는 메모리 준비와 clock settling 등이 추가된다.
 
 ```bash
-python -m powermodeling plan --config configs/saturation.json --device 0 --bench build/powerbench --output saturation-plan.json
-python -m powermodeling run --plan saturation-plan.json --device 0 --bench build/powerbench --output results/saturation --apply-clocks --clock-method applications
+python -m powermodeling plan --config configs/saturation.json --device 0 --bench "$POWERBENCH" --output saturation-plan.json
+python -m powermodeling run --plan saturation-plan.json --device 0 --bench "$POWERBENCH" --output results/saturation --apply-clocks --clock-method applications
 python -m powermodeling analyze --input results/saturation --output results/saturation-report
 ```
 
@@ -92,7 +130,7 @@ Stride는 **4-byte word 개수**다. 새 config 이름 `stride_words`와 CLI `--
 표는 정렬된 full warp가 서로 다른 주소의 4 B를 하나씩 읽는 경우다. Stride 1이어도 offset 4 B나 잘못 정렬된 L1 slice는 sector 낭비를 만든다. Energy read plan은 stride 1·32 B 정렬된 offset/region·최소 128 B region을 검사한다. L1은 CTA별 slice와 시작 주소도 확인한다. 128 B cache line이 4 sectors라는 사실이 매 접근을 항상 128 B 전송으로 만드는 것은 아니다.
 
 ```bash
-export POWERBENCH=build/powerbench  # A100/CUDA13: build-a100-cuda13/powerbench
+source .tools/env.sh  # 자동 설치의 CUDA 12.9 / NCU 2025.2.1 경로
 python -m powermodeling plan --config configs/memory-read.json \
   --bench "$POWERBENCH" --device 0 --output results/memory-read-plan.json
 python -m powermodeling run --plan results/memory-read-plan.json \
@@ -100,7 +138,7 @@ python -m powermodeling run --plan results/memory-read-plan.json \
   --apply-clocks --clock-method applications
 python -m powermodeling validate-run --plan results/memory-read-plan.json \
   --input results/memory-read --output results/memory-read-validated \
-  --profiles-dir results/memory-read-profiles --bench "$POWERBENCH" --device 0 \
+  --profiles-dir results/memory-read-profiles --bench "$POWERBENCH" --ncu "$NCU" --device 0 \
   --apply-clocks --clock-method applications
 python -m powermodeling analyze --input results/memory-read-validated \
   --plan results/memory-read-plan.json --output results/memory-read-report --plots
@@ -130,7 +168,7 @@ Q=`sfu_lanes`는 register 작업 lane 수이며 블록 수는 `ceil(Q/threads)`�
 ### 실행과 검증
 
 ```bash
-export POWERBENCH=build/powerbench  # A100/CUDA13: build-a100-cuda13/powerbench
+source .tools/env.sh  # 수동 CUDA 13은 설치 절의 POWERBENCH·NCU 경로 사용
 python -m pip install -e ".[plots]"
 python tools/check_sfu_sass.py --binary "$POWERBENCH" --output results/sfu-sass.json
 python -m powermodeling plan --config configs/nonlinear-smoke.json \
@@ -150,7 +188,7 @@ python -m powermodeling run --plan results/nonlinear-plan.json \
   --apply-clocks --clock-method applications
 python -m powermodeling validate-run --plan results/nonlinear-plan.json \
   --input results/nonlinear --output results/nonlinear-validated \
-  --profiles-dir results/nonlinear-profiles --bench "$POWERBENCH" --device 0 \
+  --profiles-dir results/nonlinear-profiles --bench "$POWERBENCH" --ncu "$NCU" --device 0 \
   --apply-clocks --clock-method applications
 python -m powermodeling analyze --input results/nonlinear-validated \
   --plan results/nonlinear-plan.json --output results/nonlinear-report --plots
@@ -221,7 +259,7 @@ python -m powermodeling analyze --input results/validated \
 
 | 값 | 해석 |
 |---|---|
-| `board_power_w` | 측정 구간의 NVML GPU scope 평균 전력 |
+| `board_power_w` | NVML device/관련 회로의 구간 평균 전력; 유효 누적 energy 차분을 우선하고 `nvmlDeviceGetPowerUsage` 적분으로 대체. 별도 field API의 GPU scope나 고립된 core rail과 동일하다고 가정하지 않음 |
 | `idle_power_w` | 전후 idle 구간으로 보간한 기준 전력 |
 | `incremental_power_w` | 전체 GPU 전력의 기준 대비 증가분; 순수 block dynamic이 아님 |
 | `total_pj_per_flop`, `total_pj_per_logical_bit` | 전체 GPU 단가. FMA=2 FLOP, logical bit=요청 byte×8 |
@@ -235,6 +273,7 @@ python -m powermodeling analyze --input results/validated \
 | `paired_reference_order_counts` | group의 AB/BA 유효 반복 수. 두 순서의 수가 같아야 paired 최적점 승인 |
 | 기존 `pj_per_op`, `pj_per_logical_byte` | legacy alias; `metric_aliases`와 실제 FLOP/byte 정의를 함께 읽음 |
 | `memory_rail_*` | 지원되는 memory scope의 관측값; 미지원이면 null |
+| `hbm_memory_power` | HBM 실험의 별도 메모리 센서 W·J·pJ/logical bit, 출처·품질·반복 수·신뢰구간 |
 | `tensor_peak_tflops_at_achieved_clock` | 실제 SM 개수·실측 MHz로 계산한 dense FP16 issue ceiling |
 | `tensor_utilization_vs_dense_clock_peak` | 측정 TFLOP/s / 해당 클럭의 dense peak |
 | `idle_fraction_of_measured_power` | 기준 idle / 측정 부하 전력 |
@@ -264,6 +303,23 @@ python -m powermodeling analyze --input results/validated \
 
 `valid=true`는 기록의 품질 기준을 통과했다는 뜻이며, `target_verified=true`나 물리 블록 isolation의 증명이 아니다. worker는 약 1초 간격의 완료 batch 수와 실제 SM admission 수를 기록하고, 분석은 양 끝을 제외한 완료 구간에서 work count와 에너지를 함께 계산한다. 이 기록이 없는 과거 결과는 지속 처리량이 일정하다는 가정의 추정치로 남기고 검증된 최적값에는 사용하지 않는다. idle와 active의 실제 클럭이나 온도가 다르면 증가분에는 activation·주파수 상태·누설 변화가 섞일 수 있으며 경고가 남는다. 3–4회처럼 적은 반복의 bootstrap 범위는 거칠다. 수치 차이가 작으면 반복과 최소점 주변 지원 주파수 측정을 늘리고 온도·센서·counter evidence를 확인한다. V100·A100·H100의 최적 pJ/bit·pJ/FLOP 주파수는 각 UUID의 결과에서 독립적으로 선택하며 1110 MHz를 최적점으로 미리 지정하지 않는다. physical pJ/bit는 동일 energy-window의 계층 traffic provenance가 없어 현재 withheld이고 NCU replay bytes만으로 단가를 계산하지 않는다.
 
+### H100 HBM 메모리 전력·에너지
+
+H100에서 제공하는 NVIDIA **GPU Memory Power Readings**를 HBM 실험의 별도 결과로 보고한다. `nvmlDeviceGetFieldValues`에서 `NVML_POWER_SCOPE_MEMORY`의 순간·평균 전력을 조회하며, 사용 가능한 순간값을 우선하고 평균값으로 대체하면 그 출처를 기록한다. 평균값은 최근 1초의 전력이다. GPU 호스트에서 `nvidia-smi -q -d POWER`로 메모리 전력 항목을 확인할 수 있다. [NVIDIA 출처 S2·S10](docs/sources.md)
+
+`hbm` workload의 `run`과 `analyze`에 별도 센서 옵션을 추가할 필요는 없다. 실제 응답으로 지원 여부를 판단하며 지원하는 다른 GPU의 메모리 센서도 같은 방식으로 기록한다.
+
+| 결과 | 확인 경로 |
+|---|---|
+| 각 측정과 반복 집계의 센서 값·상태 | `summary.json`의 trial/group `hbm_memory_power`, `trials.csv` |
+| 조건별 메모리 W·J·pJ/logical bit·idle 증가분·유효 센서 반복 수 | `hbm-memory-power.csv` |
+| 전체 GPU 단가 옆에 표시한 메모리 센서 표 | `evaluation.html`의 **HBM memory sensor** 및 `evaluation.json` |
+| 메모리 센서와 idle 증가분의 별도 그래프 | `analyze --plots`의 `hbm*-memory-sensor.png`·`.svg` |
+
+`energy_j = ∫ memory_power_w dt`로 완료된 측정 구간을 적분하고, 같은 구간에서 센 benchmark 요청량으로 `pj_per_logical_bit = energy_j / (logical_bytes × 8) × 10¹²`를 계산한다. 전후 idle의 메모리 센서 값과 클럭·온도 등 상태가 맞는 경우에만 idle 대비 증가분을 별도 제공한다. 메모리 센서는 refresh와 주변 회로를 포함할 수 있으므로 이 증가분을 순수 HBM cell switching 에너지라고 단정하지 않는다.
+
+센서 미지원은 `unavailable`과 null로, 일부 반복에서만 유효하면 `partial`과 실제 유효 반복 수로 표시한다. 누락 구간·음수 전력·오래된 센서 timestamp·순간/평균 출처 혼합 등으로 무효인 수치를 0으로 채우지 않는다. 센서 timestamp와 조회 시각이 없는 과거 기록은 `freshness_status=unverified`로 표시한다. 전후 메모리 idle 변화가 `max_idle_drift_fraction`을 넘으면 증가분을 보류한다. 정확한 동일 구간의 work count가 없으면 센서 W·J와 단가의 적합성을 구분하며, NCU replay의 bytes를 단가 분모로 대체하지 않는다. 메모리 센서 에너지는 전체 GPU 에너지에 더하거나 빼지 않으며, 기존 전체 GPU 에너지 최적점 선택과 독립적으로 보고한다.
+
 ## 단순 메모리 read 커널
 
 L1·L2·HBM의 `access=read`는 **단일 stream의 32-bit load + uint32 덧셈 누산**을 사용한다. 이전 네 stream의 XOR 누산과 여러 주소 관리를 줄였으며 L1 `.ca`, L2/HBM `.cg`를 유지한다. 읽은 값을 전혀 사용하지 않으면 컴파일러가 중간 load를 제거하므로 덧셈 하나는 남긴다. 기본 iterations는 4096으로, 이전 read의 1024 × 4 loads와 같은 요청량이다. 직접 지정한 iterations는 변환하지 않는다.
@@ -285,14 +341,15 @@ L1·L2·HBM의 `access=read`는 **단일 stream의 32-bit load + uint32 덧셈 �
 권장 순서는 **전력 sweep → 전체 조건의 NCU 검증 → 분석**이다. `validate-run`은 같은 condition의 반복 중 하나를 별도로 profile하고 모든 반복에 판정을 연결한다. 처리한 조건과 남은 조건을 manifest에 남기며 전체 energy trial을 보존한다. 고정 클럭 조건에는 전력 실행과 같은 클럭 적용 옵션을 사용한다.
 
 ```bash
-python -m powermodeling validate-run --input results/saturation --plan saturation-plan.json --output results/validated --profiles-dir profiles --apply-clocks --clock-method applications
+source .tools/env.sh
+python -m powermodeling validate-run --input results/saturation --plan saturation-plan.json --output results/validated --profiles-dir profiles --bench "$POWERBENCH" --ncu "$NCU" --apply-clocks --clock-method applications
 python -m powermodeling analyze --input results/validated --output results/validated-report
 ```
 
 `--limit-conditions N`은 일부 조건의 실행 점검용이다. 검증 coverage가 제한된 결과에서 전체 sweep의 verified 최적값을 확정하지 않는다. 개별 조건을 확인하거나 기존 evidence를 다시 평가하려면 `plan.json`의 `trial_id`를 사용한다.
 
 ```bash
-python -m powermodeling profile --plan saturation-plan.json --trial-id TRIAL_ID --device 0 --bench build/powerbench --output profiles --apply-clocks --clock-method applications
+python -m powermodeling profile --plan saturation-plan.json --trial-id TRIAL_ID --device 0 --bench "$POWERBENCH" --ncu "$NCU" --output profiles --apply-clocks --clock-method applications
 python -m powermodeling evaluate-profile --evidence profiles/TRIAL_ID.evidence.json --output profiles/TRIAL_ID.assessment.json
 python -m powermodeling attach-verification --input results/saturation --evidence profiles/TRIAL_ID.evidence.json --output results/verified
 python -m powermodeling analyze --input results/verified --output results/verified-report
@@ -319,6 +376,8 @@ profile 대상이 매우 짧으면 active 구간에 NVML memory-clock sample이 
 profiling은 전력 측정이 아니다. CUDA profiler start/stop 구간에 실제 대상 workload만 넣고 setup·initialization·warmup은 제외한다. cuBLAS의 내부 kernel 이름을 추측하지 않는다. 생성 명령은 `--profile-from-start off --cache-control none --clock-control none --replay-mode application --print-units base`를 사용하며, `--log-file`로 NCU CSV를 worker JSON과 분리한다. cache flushing을 껐다고 residency가 보장되지는 않으므로 실제 hit와 DRAM bytes를 확인한다. [공식 자료](docs/sources.md)
 
 L2 Fabric counter는 `--extra-metrics`로 추가할 수 있다. `local-heavy`/`remote-heavy`/`mixed` 분류는 독립적으로 검증한 SM·주소·fabric 지도를 요구하며 기본값은 `unclassified`다. counter 통과만으로 해당 지도를 자동 생성하지 않는다.
+
+현재 locality 라벨과 mapping 식별자는 분석의 repeat/group key에 포함되지 않는다. **같은 설정에서 라벨만 다른 기록은 합쳐질 수 있으므로**, 검증된 near/far 에너지 비교가 구현되었다고 해석하지 않는다. offset·`sm_ids`가 다른 설정은 기존 config key로 분리되지만 mapping별 분리를 대신하지 못한다. 아래 정합성 검토에 필요한 보완 범위를 기록했다.
 
 산점도와 클럭별 비교 이미지를 함께 만들려면 `python -m pip install -e ".[plots]"` 후 analyze에 `--plots`를 추가한다.
 
@@ -352,13 +411,168 @@ Tensor의 클럭별 ceiling은 `SM 개수 × 실제 SM MHz × FLOP/SM/cycle × 1
 
 400 W/312 TFLOPS만으로 idle 몫을 구할 수는 없다. TDP는 상한 사양이며 실제 부하 전력과 다르고, 312 TFLOPS는 특정 A100 SKU의 dense FP16 Tensor peak다. 측정한 idle, 실제 power, 실제 clock의 peak ceiling을 사용하여 idle 비율과 throughput utilization을 평가한다.
 
+## 설계 원칙과 구현 정합성
+
+검토 기준: **2026-10-09 UTC의 현재 작업 트리**. 아래는 이 프로그램을 설계할 때 요구한 원칙, 실험 전에 정해야 할 범위, 현재 코드가 실제로 보장하는 범위를 함께 정리한 것이다. **구현됨**은 코드·설정·합성 검증의 일치를 뜻하며 GPU 실측 완료를 뜻하지 않는다. **부분 구현 / 미구현** 항목은 실험 결과 해석과 후속 구현의 제약으로 남긴다.
+
+### 목표: 높은 처리량에서의 에너지 단가
+
+메모리의 같은 측정 구간에서 전력 `P`가 W, 유효 요청 대역폭 `B`가 decimal GB/s라면 `e_total = 125 × P / B` pJ/logical bit다. 대역폭이 낮으면 idle·기본 동작 전력의 몫이 커지기 쉽다. 전력 증가율보다 처리량 증가율이 클 때 단가가 개선되므로 **최대 bandwidth와 최소 pJ/bit가 항상 같은 geometry라는 가정도 하지 않는다**. 먼저 충분한 공급 병렬도와 계층별 bandwidth 기준을 확보하고, 처리량을 유지하는 후보에서 에너지를 비교한다.
+
+현재 정책은 주파수별 관측 peak의 95%를 유지하는 후보와 전체 고정 클럭 sweep의 peak 대비 95%를 유지하는 후보를 구분한다. 반복 품질·서로 다른 resource geometry·NCU 경로·coalescing·완료 work count를 검사한다. 그러나 **모든 측정이 느리면 그 안의 95%와 plateau도 통과할 수 있다**. `qualified_observed_candidate`는 관측 격자 안의 승인 후보이며 `hardware_saturation_proven=false`다. 독립적으로 측정한 동일 조건 bandwidth 기준에 대한 하한이나 높은 achieved occupancy를 강제하는 gate는 아직 없다. [평가 구현](powermodeling/evaluation.py), [관측 최소점 분석](powermodeling/analysis.py)
+
+### Static·dynamic과 세 가지 에너지 결과
+
+| 구분 | 계산과 반영 | 해석의 한계 |
+|---|---|---|
+| 물리적 static | 주어진 전압·온도에서의 leakage를 구분해 생각한다 | 보드 센서와 idle 하나로 순수 leakage를 식별할 수 없음. Refresh는 주기적 동작이며 leakage와 구분 |
+| 운영상 idle 기준 | 같은 process/context를 유지한 전후 idle 평균을 treatment 시점으로 선형 보간 | clock gating·refresh·background·context 전력이 포함되므로 `P_static`으로 명명하지 않음 |
+| 전체 에너지 | 유효 counter 차분 또는 `∫P_device dt`; 완료 work로 나눔 | 기준 차감 없이 실제 부하 전체 비용을 보여 주는 기본 결과 |
+| Idle 증가분 | `E_total − ∫P_idle_reference dt` | actual clock·온도·cap·상태·간섭·drift가 맞아야 최적점에 사용; 순수 physical dynamic이 아님 |
+| Paired active-reference | 같은 process·할당·정책의 AB/BA arm에서 `(P_treatment−P_reference)/R_treatment` | control도 전력을 소비하고 명령·register·occupancy가 다를 수 있음; arm 길이가 다를 수 있으므로 raw energy 두 개를 단순 차감하지 않음 |
+| H100 메모리 scope | 지원되는 메모리 센서 W·적분 J·동일 work 기준 단가와 별도의 idle 증가분 | 전체 GPU 값과 중복 합산하지 않음; HBM cell만의 switching 전력이라는 증명은 아님 |
+
+음수 차분을 0으로 바꾸지 않고 진단으로 보존한다. 기준이 부적합하면 해당 차분의 사용을 제한하면서 유효한 treatment 전체 결과는 유지한다. `baseline_valid`, `operational_idle_increment_eligible`, `paired_active_reference_eligible`를 구분하며 `dynamic_attribution_eligible`도 물리적 분리를 입증하는 이름으로 읽지 않는다. SFU의 주 목적은 register control 대비 signed pJ/scalar instruction이고 전체 GPU·idle 목적은 진단용이다. [분석](powermodeling/analysis.py), [HBM 센서 검증](powermodeling/memory_power.py)
+
+Pstate·enforced power cap은 조회되는 경우 비교하며, 모두 미지원인 것이 검증된 상태 일치를 뜻하지 않는다. 일반 차분의 group median에는 진단용 미승인 값이 포함될 수 있으므로 숫자와 함께 eligibility·반복 수·이유를 읽는다.
+
+`idle_power / measured_load_power`는 관측 부하에서 기준 idle이 차지하는 비율이다. `idle_power / power_limit`는 전력 상한 대비 기준의 비율이다. TDP나 표기 TFLOPS를 실측 전력·처리량으로 대신하여 static/dynamic 비중을 역산하지 않는다.
+
+### GPU 실행 구조: SM·block·warp·thread·GPC
+
+| 대상 | 설계에서 구분할 것 | 현재 제어·관측 범위 |
+|---|---|---|
+| Thread / warp | warp는 32 threads. block당 thread 수와 SM당 동시 상주 thread 수는 다른 상한 | `threads`는 32의 배수인 32–1024; 실제 장치·커널의 한계를 추가 확인 |
+| Block / CTA | CTA는 같은 block의 다른 이름. launch한 block 수와 동시에 상주한 block 수는 다름 | `blocks`는 전체 grid 수; `sm_count*4`는 각 SM에 정확히 4개를 배치하라는 명령이 아님 |
+| SM | V100·A100·H100의 2048 threads/SM, 64 warps/SM은 상주 상한 | 실제 `max_threads_per_sm`, block 한계, SM 수와 compiled kernel 자원을 조회; 2048 threads/block을 요청하지 않음 |
+| Occupancy | registers/thread, 할당 단위, shared memory, threads/block과 CTA 상한이 함께 제한 | CUDA occupancy API의 `max_active_blocks_per_sm`은 이론 상한; 실제 residency·issue 효율·bandwidth는 별도 측정 |
+| SM filter | dispatch와 실행 admission을 구분 | `sm_ids`는 dispatch 이후 best-effort 허용 검사. SM ID는 sparse할 수 있고 누적 admission 수는 동시 상주 수가 아님 |
+| GPC / L2 경로 | 같은 SM 번호 구간이 같은 GPC·partition이라는 가정 금지 | GPC 강제 배치나 사용하지 않는 SM의 전원 차단 기능은 없음. 실제 SM 분포와 주소 mapping 검증 필요 |
+
+공개 설정에 `blocks_per_sm` 매개변수는 없다. 전체 launch 평균은 `blocks/SM_count`이고, 코드 내부의 같은 이름 카운터는 실행 중 누적 admitted CTA를 센다. `grid_average_blocks_per_sm`, occupancy 상한, achieved occupancy를 서로 대체하지 않는다. SM filter는 custom Tensor/memory 진단에 사용하고 cuBLAS GEMM·streaming nonlinear·register SFU에는 적용하지 않는다. [CUDA worker](cuda/gpu_bench.cu), [SFU worker](cuda/sfu.cuh), [planner 제한](powermodeling/planner.py)
+
+`S=실제 SM 수`, `T=threads/block`, `R(T)=해당 compiled kernel의 최대 상주 blocks/SM`라 두면 thread 상한은 `T×R(T)≤2048`이다. 다른 제약이 없을 때 64/128/256/512/1024 threads는 각각 32/16/8/4/2 blocks/SM으로 2048을 채운다. 이것은 **실험 범위를 정하는 계산**이며 100% occupancy가 에너지 최적이라는 뜻은 아니다. 충분한 outstanding requests를 만들려면 대략 `in-flight bytes ≈ 목표 bytes/s × latency(s)`가 필요하므로 thread 수 외에도 load 독립성·eligible warp·issue 병목을 확인한다.
+
+현재 `memory-read.json`은 T=128/256, 전체 grid=2S/4S/8S를 사용한다. T=128의 상단은 launch 평균 1024 threads/SM이며 T=256의 상단만 2048에 해당한다. `saturation.json`의 1S/2S/4S 범위는 T=256에서도 평균 1024이다. **따라서 현 preset이 모든 GPU의 충분한 병렬도 범위를 이미 포함한다고 보장하지 않는다.**
+
+### 메모리 계층·sector·stride·실제 방문 범위
+
+기본 energy read는 `stride_words=1`, `offset_bytes=0`, full warp의 scalar 4 B load다. L1/L2의 128 B line은 32 B sector 4개로 구성된다. 정렬된 warp에서 stride 1/2/4/8은 각각 4/8/16/32 sectors와 이상적인 payload 효율 100/50/25/12.5%를 만든다. 이 조건의 최소 정렬은 32 B이며 128 B 정렬은 같은 line에 들어가는 추가 조건이다. Sector 효율·cache hit·DRAM bandwidth는 각각 검사하고, stride 실험을 coalesced 에너지 최적점과 섞지 않는다. [sector 검토](docs/cache-sector-review.ko.md), [geometry 검사](powermodeling/memory.py)
+
+| 계층 | Footprint와 경로 설계 | 실험 전 확인 |
+|---|---|---|
+| L1 | `.ca`, CTA별 작은 slice. V100/A100/H100의 128/192/256 KiB는 shared와 합친 최대 용량 | 대략 `동시 상주 CTA×slice`가 사용 가능한 L1에 맞는지 확인. `memory-read.json`은 CTA당 16 KiB이며 작은 4 KiB 시작점은 별도 제안 |
+| L2 | `.cg`로 L1 우회, L2-resident working set | L2 hit·DRAM 유입·fabric 경로 확인. `.cg`는 L2 우회 명령이 아님 |
+| HBM | `memory-read.json`은 `max(8×L2,256 MiB)` 할당, coalesced read | 유한 iterations·stride·SM filter 아래에서 실제 방문하는 범위와 DRAM traffic 확인. 큰 할당만으로 HBM 실험이 되지 않음 |
+
+현재 read는 thread/iteration당 u32 load 하나와 합계 누산 하나를 사용한다. 주소·loop·issue 비용과 부족한 load 병렬도가 bandwidth를 제한할 수 있으므로 iterations/batching 진단과 compiled SASS·counter를 확인한다. 매 launch에서 주소 순회가 다시 시작하므로 전체 stride cycle의 footprint와 한 launch의 실제 footprint도 다르다. Write/copy의 count 규약은 별도이며 copy는 read와 write payload를 모두 센다. 데이터 seed·압축 가능성·working set·cache warm 상태도 비교 조건으로 보존한다.
+
+Jia 등의 Volta, Abdelkhalik 등의 Ampere, Luo 등의 Hopper microbenchmark 연구는 warmed cache, latency와 throughput 커널의 분리, 독립 load 공급과 경로 검증의 근거로 사용한다. 논문의 thread/block 수를 현재 scalar-read 커널의 에너지 최적으로 복사하지 않는다. 원문·버전·해당 절은 [연구 사례 검토](docs/cache-sector-review.ko.md)에 기록되어 있다.
+
+### A100 20+20 MiB·H100 25+25 MiB와 near/far L2
+
+설계에서는 전체 L2 `C`와 한 partition `P`를 구분하고 **A100 P=20 MiB, H100 P=25 MiB**를 기준으로 footprint를 검토한다. 실제 SKU와 CUDA 조회 바이트 수도 함께 기록한다. MB와 MiB를 섞지 않으며 이 두-partition 용량 가정을 V100에 자동 적용하지 않는다. 용량 구분은 연속 가상주소를 반으로 나누면 각 partition에 놓인다는 뜻이 아니다.
+
+| Partition 기준 footprint | A100 | H100 | 용도 |
+|---|---:|---:|---|
+| 0.25P | 5 MiB | 6.25 MiB | 작은 cache-resident 점 |
+| **0.5P** | **10 MiB** | **12.5 MiB** | 권장 첫 locality 에너지 비교점 |
+| 0.75P | 15 MiB | 18.75 MiB | 용량 내 추가점 |
+| 1.25P | 25 MiB | 31.25 MiB | 단일 partition 용량 초과 진단; remote 증거는 아님 |
+
+현 `memory-read.json`의 `0.5C`는 한 partition 전체 용량 P에 해당하며, 위 첫 비교점 `0.5P`와 다르다. `locality.json`의 SM/latency 진단은 `0.125C`를 사용한다. 위 표의 범위로 preset이 자동 변경되는 것은 아니다.
+
+Near/far 비교에는 **SM 집합↔partition↔실제 주소 집합의 검증된 지도**가 필요하다. Pointer chase로 지연시간 후보를 찾고 L2 hit·낮은 DRAM leakage·지원되는 fabric counter를 확인한 뒤, 같은 주소 집합을 두 SM 집합에서 읽는 양방향 2×2 대조를 별도의 고처리량 커널로 실행한다. 동일 clock pair·활성 SM 수·geometry·방문 bytes·반복 기준에서 `e_remote−e_local`과 비율·CI를 보고해야 한다. 일부 SM의 처리량은 같은 SM 범위의 기준과 비교한다. 다른 allocation에서 얻은 mapping을 energy run이나 NCU replay에 자동 복사하지 않는다.
+
+**현재는 latency/offset/SM 진단까지 구현되어 있다.** Mapping별 에너지 그룹화, `local-heavy/remote-heavy/mixed/unclassified`의 독립 최적점, remote−local 단가 표는 미구현이다. `attach_verification`이 라벨을 보존해도 같은 config의 라벨만 다른 기록은 현재 합쳐질 수 있다. Near/far별 기록은 해당 보완 전까지 별도 입력·출력으로 유지하고 합친 결과를 locality 차이로 보고하지 않는다. [locality 설정](configs/locality.json), [검증 메타데이터](powermodeling/validation.py), [분석 그룹 key](powermodeling/analysis.py)
+
+### 클럭 고정과 공정한 비교
+
+최소 대조는 **advertised default 고정 pair**와 **동일 memory MHz의 exact 1110 MHz pair**다. Default는 NVML default applications pair를 조회한 값이며 순간 boost·최대 clock·무설정 DVFS와 다르다. Default graphics가 이미 1110이면 한 조건에 두 라벨이 붙고 독립 비교가 아니다. Exact 1110이 해당 memory domain에서 미지원이면 `not_applicable`과 이유를 기록한다. 다른 공통 memory domain을 추가한다면 native default pair를 보존하고 추가 비교임을 명시한다.
+
+정식 sweep은 900 MHz 이상·기본 90 MHz 간격의 지원 grid, 끝점, default pair, 지원되는 1110 pair와 incoming-policy reference를 포함한다. 요청 clock과 실제 SM/memory clock·온도·throttling을 함께 본다. DVFS에서 같은 MHz가 같은 전압이라는 가정은 하지 않는다. 적용 실패를 무설정 실행으로 바꾸지 않고 이전 정책 복원을 시도한다. Application clock 복원은 policy readback을 검사하지만 locked clock의 `restored=True`는 복원 API 성공이며 이전 순간 주파수를 실측해 복원했다는 뜻은 아니다. [클럭 정책](powermodeling/clocks.py), [계획 검사](powermodeling/runner.py)
+
+**비교 표의 현재 한계:** exact-1110 비교는 동일 memory MHz를 요구한다. 반면 factory-default 개선율은 default **pair 전체**에 대한 비교라 candidate의 memory MHz가 다를 수 있다. 이를 SM clock만 바꾼 효과로 해석하지 않는다. 동일 memory clock에서 default graphics와 1110을 직접 비교하는 요건은 pair 존재·geometry·실측 클럭을 별도로 확인해야 한다. [anchor 비교 구현](powermodeling/evaluation.py)
+
+GPU 간에는 UUID·SXM SKU·실제 SM 수·HBM 용량/세대·ECC·MIG·power cap·온도·driver·CUDA/cuBLAS·binary·datatype·count 규약을 맞추거나 별도 층으로 보고한다. 물리 GPU와 CUDA ordinal/UUID 대응을 확인하고 MIG·다른 프로세스 간섭을 검사한다. V100/A100/H100 공통 비교 도구는 CUDA 12.9·NCU 2025.2.1이며 수동 CUDA 13 결과는 버전 층을 분리한다. 공통 WMMA와 Hopper WGMMA/TMA 또는 cuBLAS 내부 geometry도 같은 구현으로 간주하지 않는다.
+
+### NVML API·측정 시간·NCU의 차이
+
+| API / 값 | 단위·범위·시간 의미 | 적용 |
+|---|---|---|
+| `nvmlDeviceGetPowerUsage` | mW; GPU와 관련 회로. V100·A100 **GA100**은 현재 전력, H100은 약 1초 평균 | `power_w`로 환산; 폴링을 빠르게 해도 센서 갱신 주기가 빨라지지 않음 |
+| `nvmlDeviceGetTotalEnergyConsumption` | driver reload 이후 누적 mJ; 지원 여부 확인 | 동일 구간 counter 차분을 우선. 감소/reset을 가로지르는 차분은 버리고 가능한 경우 power 적분으로 대체 |
+| `NVML_FI_DEV_POWER_INSTANT` / `AVERAGE`, GPU scope | 요청한 field/scope의 마지막 측정값 / 최근 1초 평균 | 위 legacy API 및 module scope와 구별해 기록; 고립된 core rail로 해석하지 않음 |
+| 같은 field의 MEMORY scope | 별도 메모리 subsystem 전력; H100에서도 SKU/driver 응답 확인 | 순간값 우선·평균값 fallback, mW→W. 센서 source·상태·timestamp를 유지하여 HBM 별도 결과로 제공 |
+| Host `t_s` / field timestamp | 순차 NVML 호출의 monotonic midpoint / CPU epoch microseconds | 서로 다른 timebase. Host 조회 시각을 물리 센서의 정확한 획득 시각으로 부르지 않음 |
+| `latencyUsec` | NVML field 갱신 latency; 여러 field에 공유될 수 있음 | 물리 센서 지연이나 1초 averaging window 길이와 동일한 값이 아님 |
+
+기본 50 ms polling, warmup 3초, arm 12초, 전후 idle 각 6초를 사용하고 active 양 끝 2초·idle 양 끝 1초를 제외한다. 완료 batch epoch만 선택하여 work와 에너지를 같은 경계로 맞춘다. 평균 센서의 필터링이 사라지는 것은 아니며 host launch·sync·readback의 공백도 sustained 에너지/처리량에 포함된다. CUDA-event kernel rate는 별도 진단값이다. 짧은 실행·큰 sample gap·clock/온도 drift·counter 불일치는 정책에 따라 판정한다. [텔레메트리](powermodeling/telemetry.py), [구간 정렬](powermodeling/analysis.py), [공식 API 출처](docs/sources.md)
+
+H100 HBM 센서는 W·J 측정, 동일 count의 pJ/logical bit, matched idle 증가분을 각각 승인한다. 전후 memory idle drift와 오래된 field timestamp를 별도로 검사하며 기본 freshness 허용 상한 2.5초는 프로젝트 정책이다. Timestamp 비교 근거가 없는 과거 기록은 `freshness_status=unverified`로 남는다. 실패·미지원은 null과 이유로 표시하며 instant/average 반복을 섞어 median을 만들지 않는다. 전체 GPU 채널로부터 HBM 값을 더하거나 빼서 core 전력을 생성하지 않는다. 출력 경로는 위 [H100 센서 절](#h100-hbm-메모리-전력에너지)에 정리했다.
+
+NCU는 별도 application replay에서 setup/warmup/reference를 제외한 target을 검증한다. Binary·UUID·workload·geometry·clock·할당 준비 상태의 binding을 확인하고 profiler clock/cache control을 끈다. Replay의 전력·busy-time throughput·DRAM bytes를 원 energy run의 분자/분모로 대체하지 않는다. **현재 physical pJ/bit는 withheld**이며 logical-bit 단가와 cache/traffic 근거를 나란히 보고한다. Counter 통과는 높은 bandwidth나 순수 회로 attribution의 증명이 아니다.
+
+### 탐색 시간을 줄이기 위한 범위와 단계
+
+넓은 Cartesian product를 처음부터 실행하지 않는 것이 설계 목표다. 아래는 **권장 수동 절차이며 자동 adaptive sweep 기능은 아직 없다**. GPU별 occupancy와 bandwidth를 본 뒤 후보를 좁혀야 하므로 고정 thread/block 값을 사전 최적으로 선언하지 않는다.
+
+| 단계 | 먼저 비교할 범위 | 확대 조건·주의점 |
+|---|---|---|
+| 준비 | 장치·clock pair·커널 자원·센서·smoke 확인 | smoke/current-policy 결과는 에너지 최적점 증거가 아님 |
+| Geometry pilot | 두 고정 clock에서 T=128/256/512, grid=`S×ceil(R(T)/2)`와 `S×R(T)` | 같은 T라도 registers/shared/커널별 R이 다름. 현재 planner는 R 표현식을 지원하지 않아 수동 계산 필요 |
+| 공급량 추가 | 양쪽 clock에서 유망한 T의 합집합 1–2종에 `2S×R(T)` | 계속 빨라지면 T=64/1024나 추가 wave 검토. 다른 geometry만 측정한 두 clock을 직접 비교하지 않음 |
+| Footprint / ILP 진단 | stride 1·offset 0 유지, L1 작은 slice·L2 0.5P·HBM 큰 footprint 한 점부터 | residency/경로가 맞지 않을 때 footprint·iterations·batching·독립 load 공급을 한 축씩 점검 |
+| 정식 에너지 | 선택한 geometry를 동일하게 유지해 충분한 arm 길이·짝수 반복·필수 clock coverage 검사 | 최소 2 geometry는 비교의 하한일 뿐; 관측 plateau에는 최소 3 resource 수준과 counter 근거 필요 |
+| Locality | 검증된 mapping이 있으면 1 geometry×1 footprint×양방향 4셀×두 clock부터 | mapping 구축과 near/far별 에너지 분석은 추가 구현·측정 필요 |
+
+Geometry pilot은 보통 **계층당 두 clock 합계 14–16조건**, 모든 T에 추가 wave를 넣으면 18조건이다. 1초 warmup+2초 timing×3회의 짧은 pilot은 worker 수준의 처리량 진단으로만 생각하며 정식 pJ 측정으로 사용하지 않는다. 현 planner는 측정 ≥10초·warmup ≥1초·idle ≥6초·반복 ≥3을 요구한다. 두 clock으로 줄인 진단 config도 full `energy_sweep`의 전체 memory domain·grid coverage를 대신하지 못한다. `--stage`는 지정한 실험을 골라 실행하는 기능이며 이전 결과를 보고 후보를 자동 제거하지 않는다.
+
+기본 paired trial의 계획상 하한은 `3×warmup + 2×measure + 2×idle = 45초`이고 4회 반복이면 geometry×clock 한 조건당 3분이다. 현재 `memory-read.json`은 계층 3개×geometry 6개이므로 **clock 조건당 최소 54분**, 서로 다른 고정 pair 두 개만으로도 최소 108분이다. 초기화·clock/온도 안정화·NCU replay·batch 초과 실행·mapping 비용은 별도다. 실제 plan의 trial 수·`estimated_minimum_seconds`를 확인하고 stage별 중간 결과와 `--resume`을 활용한다. [계획 확장과 예산](powermodeling/planner.py)
+
+### 모델링·반복·판정의 경계
+
+기본 증가분 모델의 설계 형태는 `P_work = P_idle_reference + intercept + Σ(e_i×activity_i) + residual`이다. `fit`의 기본 target은 명시적으로 준비한 **기준 대비 증가분 전력**(`incremental_power_w`)이며, 전체 또는 paired 전력 target을 선택하면 해당 범위와 적합성 기준으로 회귀한다. Intercept는 남은 baseline/activation 효과일 수 있어 pure static으로 이름 붙이지 않는다. Tensor·L1·L2·HBM microbenchmark는 공유 경로를 사용하므로 단가 네 개를 더한다고 혼합 workload 전력이 복원되지 않는다.
+
+같은 GPU·고정 clock·측정 정의에서 활동률을 독립적으로 바꾼 calibration과 rank/condition 검사가 필요하다. 미측정 feature를 0으로 채우지 않는다. TFLOP/s 계수는 pJ/FLOP, GB/s 계수는 nJ/byte이며 후자를 pJ/bit로 바꿀 때는 125를 곱한다. 독립 mixed holdout을 통과한 범위의 convex hull 안에서만 혼합 예측을 허용한다. **Mixed workload의 자동 동시 수집은 미구현**이고 수동 feature row의 source 문자열 존재 검사는 실제 센서 scope·동일 시간창·locality의 일치를 입증하지 못한다. 입력 작성자가 그 근거와 동질성을 확인해야 한다. [모델 구현](powermodeling/model.py)
+
+반복 중앙값과 1,000회 bootstrap 95% 구간을 보고하며 관측 수 3개 미만에는 CI를 내지 않는다. 3–4회의 구간은 거칠고 센서 calibration bias·scope 불확실성·control model 오차를 포함하지 않는다. Clock·seed·binary·실험 protocol·working set·SM 범위가 다른 자료를 반복으로 섞지 않는다. 미측정 주파수나 geometry는 보간으로 최적 구간을 만들지 않고 실제 근접 측정점과 CI 겹침을 별도로 제공한다.
+
+### 정합성 재검토 결과와 남은 작업
+
+| 설계 요구 | 현재 판정 | 코드 대조·남은 검증 |
+|---|---|---|
+| 전체/idle 증가분/paired 대비와 static·dynamic 구분 | 구현됨 | `analysis.py`, `test_analysis.py`; 순수 leakage/switching 분리는 주장하지 않음 |
+| Thread/block 한계와 compiled occupancy 기록 | 구현됨 | `planner.py`, CUDA worker, `test_planner.py`; 실제 residency는 GPU에서 확인 |
+| 충분히 높은 bandwidth에서 효율 비교 | **부분 구현** | 관측 95%·plateau는 있으나 독립 bandwidth 기준 하한 없음. 느린 sweep도 상대 기준 통과 가능 |
+| Occupancy에 맞춘 좁은 pilot→후보→정식 sweep | **미구현** | preset은 고정 Cartesian grid. 수동 진단은 가능하나 자동 후보 선택·R 기반 범위 생성 없음 |
+| Default 고정 pair·exact 1110 포함 | 구현됨 | `planner.py`, `runner.py`, clock tests; device/driver 지원·actual MHz는 실측 필요 |
+| 동일 memory clock에서 clock 효과 비교 | **부분 구현** | 1110 비교는 일치 검사. Factory-default 개선율은 memory 변경 효과를 포함할 수 있음 |
+| Sector/stride와 cache·DRAM 경로 검증 | 구현됨 | `memory.py`, `validation.py`, memory tests; 높은 bandwidth나 순수 component energy는 별도 요건 |
+| 20+20 / 25+25 MiB에 따른 near/far 단가 분리 | **부분 구현** | latency/SM/offset 진단만 있음. 검증된 mapping key·별도 그룹·remote−local 결과 필요 |
+| NVML API 의미와 counter/시간창 구분 | 구현됨 | `telemetry.py`, `analysis.py`, telemetry/analysis tests; 평균 센서 필터와 bias는 잔존 |
+| H100 HBM 메모리 센서의 별도 W·J·pJ 보고 | 구현됨 | `memory_power.py`, sensor/report tests; 센서 지원·HBM 경로와 수치 정확도는 장비에서 확인 |
+| 실험 정의·단위·rank·holdout에 근거한 모델 | **부분 구현** | `model.py`의 입력/식별/예측 gate는 있음. 동시 mixed 수집과 수동 provenance 검증은 별도 필요 |
+| 재현 가능한 도구·결과·오류 보존 | 구현됨 | 설치 스크립트, raw JSON, plan, binary/toolkit 정보, `--resume`; 실제 GPU 측정 검증을 대체하지 않음 |
+
+현재 합성 반례로 두 차이를 확인할 수 있다. `tests/test_evaluation.py`의 `study_fixture()`는 peak 100 bytes/s에서도 `qualified_observed_candidate`와 `observed_plateau`를 만든다. 또한 같은 L2 설정의 두 repeat에 서로 다른 검증 locality 라벨만 붙이면 한 group으로 합쳐진다. 둘 다 **정책/그룹화의 한계를 확인하는 합성 사례**이며 GPU 실측 숫자가 아니다. 후속 보완의 우선순위는 독립 bandwidth 기준과 pilot 범위, mapping별 locality 그룹/비교, 동일 memory clock의 default 대조, mixed calibration 자동화다.
+
 ## 검증 및 상세 설계
 
+설치와 같은 `.venv` interpreter로 CPU 테스트를 실행한다. 아래 명령은 가상환경 활성화 여부와 관계없이 해당 환경을 사용한다.
+
 ```bash
-python -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-CPU 테스트는 데이터 분석·모델 식별·plan·NVML mock·클럭 복원을 검증한다. CUDA 컴파일, actual GPU 실행, cache attribution과 측정 정확도는 V100/A100/H100 장비에서 확인해야 한다.
+`--build`까지 완료했으면 GPU 없이 컴파일된 CLI의 입력 검증도 실행할 수 있다.
+
+```bash
+source .tools/env.sh
+POWERBENCH_CLI_TESTS=1 python -m unittest discover -s tests -v
+```
+
+CPU 테스트는 데이터 분석·모델 식별·plan·NVML mock·클럭 복원을 검증한다. CUDA 컴파일은 GPU 없는 호스트에서도 가능하지만, actual GPU 실행·NCU profiling·cache attribution과 측정 정확도는 V100/A100/H100 장비에서 확인해야 한다.
 
 - [실험 설계: static/dynamic 기준, DVFS, hierarchy, near/far, fairness](docs/experiment-design.ko.md)
 - [비선형 SFU 마이크로벤치: register loop·차분 pJ/instruction·control·SASS 검증](docs/nonlinear-experiments.ko.md)

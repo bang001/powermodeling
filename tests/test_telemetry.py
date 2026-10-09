@@ -129,6 +129,73 @@ class TelemetryTests(unittest.TestCase):
             self.assertLessEqual(sample["query_start_s"], sample["t_s"])
             self.assertLessEqual(sample["t_s"], sample["query_end_s"])
 
+    def test_h100_average_only_memory_power_preserves_sensor_semantics(self):
+        fake = FakeNvml(memory_supported=True)
+        original = fake.nvmlDeviceGetFieldValues
+        timestamp_us = 1730000000123456
+
+        def average_only(handle, fields):
+            values = original(handle, fields)
+            for value, (field_id, scope) in zip(values, fields):
+                value.fieldId = field_id
+                value.scopeId = scope
+                if scope == fake.NVML_POWER_SCOPE_MEMORY:
+                    if field_id == fake.NVML_FI_DEV_POWER_INSTANT:
+                        value.nvmlReturn = 3
+                    else:
+                        value.value.uiVal = 43125
+                        value.timestamp = timestamp_us
+                        value.latencyUsec = 35
+            return values
+
+        fake.nvmlDeviceGetFieldValues = average_only
+        with NvmlDevice(nvml_module=fake) as device:
+            sample = device.read_sample()
+            self.assertEqual(sample["memory_power_average_w"], 43.125)
+            self.assertIsNone(sample["memory_power_instant_w"])
+            self.assertEqual(sample["memory_power_w"], 43.125)
+            self.assertEqual(sample["memory_power_source"], "memory_power_average_w")
+            self.assertIn("error code 3", sample["errors"]["memory_power_instant_w"]["message"])
+            self.assertFalse(device.capabilities["memory_power_instant_w"]["available"])
+            self.assertTrue(device.capabilities["memory_power_average_w"]["available"])
+            meta = sample["field_metadata"]["memory_power_average_w"]
+            self.assertEqual(meta["field"], "NVML_FI_DEV_POWER_AVERAGE")
+            self.assertEqual(meta["scope"], "memory")
+            self.assertEqual(meta["scope_id"], fake.NVML_POWER_SCOPE_MEMORY)
+            self.assertEqual(meta["timestamp_us"], timestamp_us)
+            self.assertEqual(meta["timestamp_clock"], "unix_epoch_microseconds")
+            self.assertEqual(meta["latency_us"], 35)
+            self.assertEqual(meta["semantics"], "one_second_average")
+
+    def test_malformed_memory_power_metadata_cannot_select_rejected_value(self):
+        for field_id, key in ((186, "memory_power_instant_w"),
+                              (185, "memory_power_average_w")):
+            for attribute in ("timestamp", "latencyUsec"):
+                with self.subTest(field=key, attribute=attribute):
+                    fake = FakeNvml(memory_supported=True)
+                    original = fake.nvmlDeviceGetFieldValues
+
+                    def malformed(handle, fields):
+                        values = original(handle, fields)
+                        for value, (requested_id, scope) in zip(values, fields):
+                            if scope == fake.NVML_POWER_SCOPE_MEMORY:
+                                if requested_id == field_id:
+                                    setattr(value, attribute, "invalid sensor metadata")
+                                else:
+                                    value.nvmlReturn = 3
+                        return values
+
+                    fake.nvmlDeviceGetFieldValues = malformed
+                    with NvmlDevice(nvml_module=fake) as device:
+                        sample = device.read_sample()
+                        self.assertIsNone(sample[key])
+                        self.assertIsNone(sample["memory_power_w"])
+                        self.assertIsNone(sample["memory_power_source"])
+                        self.assertNotIn(key, sample["field_metadata"])
+                        self.assertEqual(sample["errors"][key]["type"], "ValueError")
+                        self.assertFalse(device.capabilities[key]["available"])
+                        self.assertFalse(device.capabilities["memory_power_w"]["available"])
+
     def test_failed_power_api_does_not_emit_zero(self):
         fake = FakeNvml()
         def unavailable(handle):

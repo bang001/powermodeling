@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from pathlib import Path
+import math
 import statistics
 
 from .evaluation import OBJECTIVES
@@ -24,6 +25,16 @@ def write_plots(summary, output_dir):
         workload = c["stratum"]["workload"]
         suffix = "-" + c["component_id"] if counts[workload] > 1 else ""
         name = workload + suffix
+        if workload == "hbm":
+            domains = {p.get("requested_memory_mhz") for p in c["points"]}
+            for memory in sorted(domains, key=lambda value: (value is None, value or 0)):
+                subset = sorted((p for p in c["points"] if p.get("requested_memory_mhz") == memory),
+                                key=lambda p: (p.get("requested_graphics_mhz") is None,
+                                               p.get("requested_graphics_mhz") or 0, p["group_id"]))
+                sensor_name = name + (f"-mem-{memory}" if len(domains) > 1 else "")
+                for start in range(0, len(subset), 8):
+                    page_name = sensor_name + (f"-page-{start // 8 + 1:02d}" if len(subset) > 8 else "")
+                    _memory_sensor_figure(c, subset[start:start + 8], page_name, output, files, plt)
         if workload in ("control", "l2_latency"):
             _diagnostic(c, name, output, files, plt, np)
             continue
@@ -57,6 +68,66 @@ def _save(fig, stem, output, files, plt):
         fig.savefig(path, dpi=160)
         files[stem + "_" + extension] = str(path.resolve())
     plt.close(fig)
+
+
+def _memory_sensor_figure(component, points, name, output, files, plt):
+    """Export the measured memory scope independently of board objectives."""
+    def value(point, field, validity):
+        sensor = point.get("hbm_memory_power") or {}
+        number = sensor.get(field)
+        if (sensor.get("measurement_valid") and sensor.get(validity)
+                and sensor.get("status") in ("available", "partial")
+                and isinstance(number, (int, float)) and not isinstance(number, bool)
+                and math.isfinite(number)):
+            return number
+        return None
+
+    if not any(value(p, "power_w", "measurement_valid") is not None for p in points):
+        return
+    fig, axes = plt.subplots(2, 3, figsize=(17, 10), layout="constrained")
+    panels = (
+        ("power_w", "measurement_valid", "Memory-scope power (W)", "Memory sensor: measured power"),
+        ("energy_j", "measurement_valid", "Memory-scope energy (J)", "Memory sensor: integrated energy"),
+        ("pj_per_logical_bit", "normalization_valid", "pJ/logical bit", "Memory sensor: logical payload normalization"),
+        ("incremental_power_w", "incremental_valid", "Memory-scope increment (W)", "Matched idle increment: power"),
+        ("incremental_energy_j", "incremental_valid", "Memory-scope increment (J)", "Matched idle increment: energy"),
+        ("incremental_pj_per_logical_bit", "incremental_valid", "Incremental pJ/logical bit", "Matched idle increment: logical payload"))
+    labels, captions = [], []
+    for point in points:
+        sensor = point.get("hbm_memory_power") or {}
+        geometry = point.get("geometry") or {}
+        labels.append(f"{point['group_id'][:12]}\nSM={point.get('requested_graphics_mhz')} / mem={point.get('requested_memory_mhz')}\n"
+                      f"B={geometry.get('blocks')} T={geometry.get('threads')}")
+        captions.append(f"{point['group_id'][:12]}: {sensor.get('status', 'unavailable')}; "
+                        f"{sensor.get('valid_repeats', 0)}/{sensor.get('observed_repeats', 0)} sensor repeats; "
+                        f"{sensor.get('normalized_repeats', 0)} normalized; {sensor.get('incremental_repeats', 0)} matched idle; "
+                        f"freshness {sensor.get('freshness_status', 'unverified')}")
+    for ax, (field, validity, ylabel, title) in zip(axes.flat, panels):
+        observed = [(index, p, value(p, field, validity)) for index, p in enumerate(points)]
+        observed = [(index, p, number) for index, p, number in observed if number is not None
+                    and (field != "incremental_pj_per_logical_bit" or (p.get("hbm_memory_power") or {}).get("normalization_valid"))]
+        if observed:
+            ax.scatter([index for index, _, _ in observed], [number for _, _, number in observed], color="#3e77b5")
+            for index, point, _ in observed:
+                interval = (point["hbm_memory_power"].get("ci95") or {}).get(field)
+                if (isinstance(interval, (list, tuple)) and len(interval) == 2
+                        and all(isinstance(n, (int, float)) and math.isfinite(n) for n in interval)):
+                    ax.plot([index, index], interval, color="#3e77b5", alpha=.5, linewidth=1)
+        else:
+            ax.text(.5, .5, "N/A: no qualified sensor values", ha="center", transform=ax.transAxes)
+        ax.set_xticks(range(len(points)), labels, rotation=35, ha="right", fontsize=7)
+        ax.set(xlabel="Measured condition / requested clocks (MHz) / launch geometry", ylabel=ylabel, title=title)
+        ax.grid(alpha=.2)
+    sources = sorted({str((p.get("hbm_memory_power") or {}).get("source")) for p in points
+                      if (p.get("hbm_memory_power") or {}).get("source")})
+    semantics = sorted({str((p.get("hbm_memory_power") or {}).get("semantics")) for p in points
+                        if (p.get("hbm_memory_power") or {}).get("semantics")})
+    fig.suptitle(f"{name}: separate HBM memory sensor — {component.get('gpu_name')} / {component['stratum']['gpu_uuid']}\n"
+                 f"Source: {'; '.join(sources)}. {'; '.join(semantics)}\n"
+                 "Repeat medians / bootstrap 95% intervals. Missing or invalid measurements are blank. "
+                 "Board total remains a separate objective; sensor values are not added to board energy.\n"
+                 + "\n".join(captions), fontsize=9)
+    _save(fig, name + "-memory-sensor", output, files, plt)
 
 
 def _scatter(ax, points, x, y, ci=None):

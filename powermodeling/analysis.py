@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from .nonlinear import NONLINEAR_WORKLOADS, ROW_WORKLOADS, count_issues
 from .memory import count_issues as memory_count_issues, coalesced_read_geometry
+from .memory_power import trial_sensor, group_sensor
 from .sfu import SFU_WORKLOADS, CONTRACT_FIELDS as SFU_CONTRACT_FIELDS, REFERENCE_KIND as SFU_REFERENCE_KIND, count_issues as sfu_count_issues
 from .evaluation import (experiment_contract, evaluate, energy_role_eligible,
                          energy_coalescing_eligible, energy_peak_population_eligible)
@@ -1032,6 +1033,16 @@ stable clock/thermal telemetry alone cannot prove stationary work throughput.
         result[prefix + "pj_per_element"] = power / element_rate * 1e12 if power is not None and element_rate else None
         result[prefix + "pj_per_row"] = power / row_rate * 1e12 if power is not None and row_rate else None
     result["energy_peak_population_eligible"] = energy_peak_population_eligible(result)
+    result["hbm_memory_power"] = trial_sensor(record, result, phases, phase_records,
+                                             policy.max_sample_gap_s, policy.max_idle_drift_fraction,
+                                             _integrate, _idle_at)
+    if result["hbm_memory_power"] is not None:
+        sensor = result["hbm_memory_power"]
+        for alias, field in (("memory_rail_power_w", "power_w"), ("memory_rail_energy_j", "energy_j"),
+                             ("memory_rail_idle_power_w", "idle_power_w"),
+                             ("memory_rail_incremental_power_w", "incremental_power_w"),
+                             ("memory_rail_incremental_energy_j", "incremental_energy_j")):
+            result[alias] = sensor[field]
     result["measurement_diagnostics"] = _measurement_diagnostics(result, benchmark, epochs)
     result["measurement_diagnostics"]["memory_access_geometry"] = result["memory_access_geometry"]
     result["measurement_diagnostics"]["memory_coalescing"] = result["memory_coalescing"]
@@ -1445,6 +1456,15 @@ def summarize(records: Iterable[Mapping[str, Any]], throughput_fraction: float =
             values = [value for t in valid if (value := _finite(t.get(metric))) is not None]
             group[metric] = statistics.median(values) if values else None
             group["ci95"][metric] = _median_ci(values, int(digest, 16))
+        group["hbm_memory_power"] = group_sensor(valid, group["workload"], int(digest, 16), _median_ci, repeats)
+        if group["hbm_memory_power"] is not None:
+            sensor = group["hbm_memory_power"]
+            for alias, field in (("memory_rail_power_w", "power_w"), ("memory_rail_energy_j", "energy_j"),
+                                 ("memory_rail_idle_power_w", "idle_power_w"),
+                                 ("memory_rail_incremental_power_w", "incremental_power_w"),
+                                 ("memory_rail_incremental_energy_j", "incremental_energy_j")):
+                group[alias] = sensor[field]
+                group["ci95"][alias] = sensor["ci95"][field]
         statuses = {trial["ncu_status"] for trial in valid}
         group["ncu_status"] = "fail" if "fail" in statuses else "pass" if statuses == {"pass"} else "unprofiled" if statuses == {"unprofiled"} else "inconclusive"
         group["paired_reference_both_orders_observed"] = all(group["paired_reference_order_counts"].values())
@@ -1531,6 +1551,8 @@ def write_summary(summary: Mapping[str, Any], output_dir: str | Path) -> dict[st
               "memory_access_geometry", "memory_coalescing", "memory_coalescing_energy_eligible", "energy_peak_population_eligible",
               "verified_selection_eligible", "count_energy_time_alignment_exact", "energy_per_work_kind", "issues", "warnings", "baseline_valid", "baseline_issues", "operational_idle_increment_eligible", "paired_active_reference_eligible", "paired_active_reference_issues", "treatment_design_stratum", "baseline_clock_domains_compared", "baseline_sm_clock_uses_graphics_proxy", "baseline_state_matched", "baseline_state_issues", "baseline_state_domains_compared", "resource_geometry", "row_width", "nonlinear_contract", "counted_measure_elements", "element_count_convention", "row_operation_convention", "paired_reference_clock_domains_compared", "paired_reference_sm_clock_uses_graphics_proxy", "duration_s", *_METRICS,
               "total_energy_j", "incremental_energy_j", "energy_source", "power_limit_w", "tensor_peak_clock_source",
+              "hbm_memory_power", "memory_rail_energy_j", "memory_rail_idle_power_w",
+              "memory_rail_incremental_energy_j", "memory_rail_sources",
               "sfu_contract", "counted_measure_sfu_instructions", "sfu_instruction_count_convention",
               "sfu_reference_delta_measurement_valid", "sfu_reference_delta_positive_optimum_eligible",
               "sfu_reference_delta_estimator", "sfu_reference_delta_diagnostics", "sfu_reference_delta_issues", "sfu_hardware_attribution_proven"]

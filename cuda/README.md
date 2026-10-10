@@ -77,9 +77,9 @@ double references, without claiming full approximate recurrence equivalence.
 
 | Workload | Issued work | Interpretation |
 | --- | --- | --- |
-| `tensor` | FP16 WMMA 16×16×16, FP32 accumulators, register operands loaded once per launch | Tensor reuse microbenchmark; identical operand matrices across warps. It does not implement Hopper WGMMA. |
+| `tensor` | CUDA WMMA API `m16n16k16`, FP16 inputs, FP32 accumulators. A and B are loaded once per launch into register fragments; the timed loop is `mma_sync` on those registers. Shared memory is not an operand source. | Register-reuse microbenchmark; identical operand matrices across warps. This is not raw PTX `mma.m16n8k8` or `mma.m16n8k16`, and the WMMA shape is not evidence of the lowered SASS `mma` shape. It does not implement Hopper WGMMA. |
 | `gemm` | cuBLAS dense FP16 × FP16 → FP32 GEMM | Sustained dense throughput reference; includes input/cache/memory and output work. Launch geometry and SM filters cannot control cuBLAS internals. |
-| `l1` | One coalesced scalar `.ca` load and one uint32 sum per thread iteration | Total allocation is divided into disjoint per-block slices; maximum L1 carveout is requested. Cache residency requires counters. Read only. |
+| `l1` | One coalesced scalar `.ca` load and one uint32 sum per thread iteration | Total allocation is divided into disjoint per-block slices. Preferred shared-memory carveout is 0%, requesting the largest L1 allocation; this is a preference, not measured residency. Global loads through L1 differ from explicit shared-memory loads. Cache residency requires counters. Read only. |
 | `l2` | Read: one scalar `.cg` load and uint32 sum per thread iteration. Write/copy: four scalar stores or load/store pairs. | Shared footprint across all blocks; L1 bypass. Cache residency requires counters. |
 | `hbm` | Same read/write/copy `.cg` loops over a larger incompressible footprint | The name is a requested target, not proof that payload reached DRAM. Verify DRAM counters and effective address footprint. |
 | `l2_latency` | One active lane per admitted block traverses a randomized full-cycle linked list through dependent `.cg` loads | Per-SM cycles/access diagnostic; clocks, loop overhead and concurrent blocks matter. Address/SM probes do not establish near/far partition labels. |

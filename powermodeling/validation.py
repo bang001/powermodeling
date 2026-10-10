@@ -335,7 +335,7 @@ def _kernel_assessment(rows, evidence, policy):
             if access in ("read", "write"):
                 wrong_direction = dram_write if access == "read" else dram_read
                 _check(checks, "hbm_unrequested_direction_ratio", _ratio(wrong_direction, logical), lambda v: v <= policy.cache_max_downstream_bytes_per_logical_byte, f"<={policy.cache_max_downstream_bytes_per_logical_byte} unexpected-direction DRAM bytes per logical byte")
-            _check(checks, "hbm_physical_throughput", derived["dram_throughput_bytes_s"], lambda v: v > 0, "positive physical DRAM byte/s; saturation is determined by throughput sweep, not this admission check")
+            _check(checks, "hbm_physical_throughput", derived["dram_throughput_bytes_s"], lambda v: v > 0, "positive replay DRAM byte/s; energy candidates use matching-window logical bandwidth versus clock-specific theory, not this replay rate or a physical saturation claim")
             inflation = derived["l2_sector_inflation"]
         # Pointer chasing requests one 4B value per 32B sector by design.
         minimum = policy.min_sector_bytes_per_logical_byte
@@ -404,16 +404,34 @@ def assess_profile(evidence, policy=None):
             "scope": "path/residency admission for whole-device incremental-energy experiments; does not isolate rail or block energy"}
 
 
+def _clock_sample_values(samples, field):
+    values = []
+    for sample in samples:
+        value = _number(sample.get(field)) if isinstance(sample, dict) else None
+        errors = sample.get("errors", {}) if isinstance(sample, dict) else None
+        error = not isinstance(errors, dict) or field in errors
+        values.append(value if value is not None and value > 0 and not error else None)
+    return values
+
+
 def _clock_values(evidence, assessment, field):
     context = evidence.get("profile_context") or {}
     samples = context.get("profile_active_nvml_samples") or []
-    values = [_number(sample.get(field)) for sample in samples if isinstance(sample, dict)]
-    values = [v for v in values if v is not None and v > 0]
+    observed = _clock_sample_values(samples, field)
+    valid = [value for value in observed if value is not None]
+    values = valid if len(valid) == len(observed) else []
+    counts = {"raw_samples": len(observed), "valid_samples": len(valid),
+              "kernel_samples": 0, "valid_kernel_samples": 0, "source": "profile_nvml_samples"}
     if field == "graphics_clock_mhz":
         frequencies = [_number(k["metrics"].get(SM_HZ)) for k in assessment["kernels"]]
-        frequencies = [v / 1e6 for v in frequencies if v is not None and v > 0]
-        if frequencies: values = frequencies
-    return values
+        valid_frequencies = [value / 1e6 for value in frequencies if value is not None and value > 0]
+        counts.update(kernel_samples=len(frequencies), valid_kernel_samples=len(valid_frequencies))
+        # Unsupported on every kernel permits the NVML alternative. A partial
+        # kernel frequency series cannot silently certify its successful subset.
+        if any(SM_HZ in kernel["metrics"] for kernel in assessment["kernels"]):
+            values = valid_frequencies if len(valid_frequencies) == len(frequencies) else []
+            counts["source"] = "kernel_sm_frequency"
+    return values, counts
 
 
 def validate_evidence(record, evidence, policy=None):
@@ -543,14 +561,17 @@ def validate_evidence(record, evidence, policy=None):
         requested = _number(config.get(field))
         profile_requested = _number(clocks.get(key))
         _check(checks, "matching_requested_" + field, profile_requested if requested is not None else None, lambda v, e=requested: v == e and v > 0, "matching explicit positive controlled frequency; uncontrolled DVFS profiles remain unverified")
-        values = _clock_values(evidence, result, field)
+        values, counts = _clock_values(evidence, result, field)
         median = statistics.median(values) if values else None
-        actual_clocks[field] = {"median": median, "minimum": min(values) if values else None, "maximum": max(values) if values else None, "samples": len(values)}
+        actual_clocks[field] = {"median": median, "minimum": min(values) if values else None,
+                               "maximum": max(values) if values else None, "samples": len(values), **counts}
         _check(checks, "profile_actual_" + field, median if requested is not None else None, lambda v, e=requested: e is not None and abs(v - e) / e <= policy.max_clock_error_fraction, f"actual profiled frequency within {policy.max_clock_error_fraction:.1%} of requested frequency")
         spread = (max(values) - min(values)) / median if values and median else None
         _check(checks, "profile_stability_" + field, spread, lambda v: v <= policy.max_clock_drift_fraction, f"profile frequency spread <= {policy.max_clock_drift_fraction:.1%}")
-        measured = [_number(s.get(field)) for s in active_samples]
-        measured = [v for v in measured if v is not None and v > 0]
+        observed_energy = _clock_sample_values(active_samples, field)
+        valid_energy = [value for value in observed_energy if value is not None]
+        measured = valid_energy if len(valid_energy) == len(observed_energy) else []
+        actual_clocks[field].update(energy_raw_samples=len(observed_energy), energy_valid_samples=len(valid_energy))
         measured_median = statistics.median(measured) if measured else None
         _check(checks, "matched_actual_" + field, measured_median if median is not None else None, lambda v, e=median: e is not None and abs(v - e) / e <= policy.max_clock_error_fraction, f"actual energy/profile frequency agreement within {policy.max_clock_error_fraction:.1%}")
     result.update(status=_status(checks), suitable_verified=_status(checks) == "pass", profile_actual_clocks=actual_clocks,

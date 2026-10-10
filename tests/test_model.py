@@ -6,6 +6,10 @@ from powermodeling.model import fit_model, predict_power
 
 @unittest.skipUnless(importlib.util.find_spec("numpy"), "model regression requires numpy")
 class ModelTests(unittest.TestCase):
+    def predict(self, model, features):
+        return predict_power(model, features, context={"gpu_uuid": "GPU-test",
+                            "graphics_clock_mhz": 1200, "memory_clock_mhz": 1000})
+
     def documented(self, row, index):
         return {"trial_id": f"synthetic-calibration-{index}", "gpu_uuid": "GPU-test",
                 "config": {"graphics_clock_mhz": 1200, "memory_clock_mhz": 1000},
@@ -26,16 +30,16 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(model["intercept_w"], 5)
         self.assertAlmostEqual(model["coefficients"]["x"], 2)
         self.assertAlmostEqual(model["coefficients"]["y"], 3)
-        self.assertAlmostEqual(predict_power(model, {"x": 2, "y": 0}), 9)
+        self.assertAlmostEqual(self.predict(model, {"x": 2, "y": 0}), 9)
         with self.assertRaises(ValueError):
-            predict_power(model, {"x": 1, "y": 1})
+            self.predict(model, {"x": 1, "y": 1})
 
     def test_heldout_mixed_validation_enables_prediction_and_failure_blocks_it(self):
         rows = self.rows()
         heldout = {**rows[0], "trial_id": "synthetic-heldout", "x": 2, "y": 1, "incremental_power_w": 12, "split": "validation"}
         model = fit_model(rows + [heldout], ["x", "y"])
         self.assertTrue(model["additive_validated"])
-        self.assertAlmostEqual(predict_power(model, {"x": 2, "y": 1}), 12)
+        self.assertAlmostEqual(self.predict(model, {"x": 2, "y": 1}), 12)
         heldout["incremental_power_w"] = 40
         model = fit_model(rows + [heldout], ["x", "y"])
         self.assertFalse(model["additive_validated"])
@@ -79,9 +83,9 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(model["status"], "rejected")
         model = fit_model(self.rows(), ["x", "y"])
         with self.assertRaises(ValueError):
-            predict_power(model, {"x": 4, "y": 0})
+            self.predict(model, {"x": 4, "y": 0})
         with self.assertRaises(ValueError):
-            predict_power(model, {"x": 1})
+            self.predict(model, {"x": 1})
 
     def test_feature_units_and_measurement_provenance_are_required(self):
         rows = self.rows()
@@ -99,7 +103,7 @@ class ModelTests(unittest.TestCase):
         model = fit_model(rows + [heldout], ["x", "y"])
         self.assertTrue(model["additive_validated"])
         with self.assertRaises(ValueError):
-            predict_power(model, {"x": 1, "y": 2})
+            self.predict(model, {"x": 1, "y": 2})
         self.assertIn("single_mixed_holdout_validates_only_that_feature_vector", model["warnings"])
 
     def test_mixed_hull_is_stricter_than_per_feature_bounding_box(self):
@@ -107,9 +111,9 @@ class ModelTests(unittest.TestCase):
         holdouts = [{**rows[0], "trial_id": f"synthetic-heldout-{x}", "x": x, "y": x,
                      "incremental_power_w": 5 + 5 * x, "split": "validation"} for x in (1, 2)]
         model = fit_model(rows + holdouts, ["x", "y"])
-        self.assertAlmostEqual(predict_power(model, {"x": 1.5, "y": 1.5}), 12.5)
+        self.assertAlmostEqual(self.predict(model, {"x": 1.5, "y": 1.5}), 12.5)
         with self.assertRaises(ValueError):
-            predict_power(model, {"x": 1.5, "y": 1.75})
+            self.predict(model, {"x": 1.5, "y": 1.75})
 
     def test_duplicate_or_unidentified_holdout_cannot_claim_independence(self):
         rows = self.rows()

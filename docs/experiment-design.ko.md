@@ -1,6 +1,6 @@
 # V100·A100·H100 에너지 실험 설계
 
-이 실험의 목적은 **각 GPU를 충분히 활용하는 조건에서 실측 pJ/FLOP·pJ/bit가 가장 낮은 설정과 주변 측정점**을 찾는 것이다. 전력의 절대 최솟값만 찾으면 GPU를 쉬게 하는 설정이 선택된다. 각 frequency pair에서 NCU·품질·정확한 시간 정렬을 통과한 최소 2개의 resource geometry를 실제로 비교하고, 비교한 유효 geometry의 관측 최고 처리량의 95% 이상을 유지하는 설정으로 효율 최적점을 찾고, 전체 clock sweep 최고 처리량의 95% 이상을 요구하는 성능 제약 선택도 별도로 보고한다. 전체 에너지·승인된 idle 증가분·승인된 paired-reference 대비를 각각 비교한다. Pareto 경계는 더 높은 처리량과 더 낮은 전력을 동시에 제공하는 다른 관측 설정이 없는 점들의 집합이다. 95%는 본 프로젝트의 운영 기준이며 NVIDIA의 보장값이 아니다.
+이 실험의 목적은 **각 GPU를 충분히 활용하는 조건에서 실측 pJ/FLOP·pJ/bit가 가장 낮은 설정과 주변 측정점**을 찾는 것이다. 전력의 절대 최솟값만 찾으면 GPU를 쉬게 하는 설정이 선택된다. 각 frequency pair에서 NCU·품질·정확한 시간 정렬을 통과한 최소 2개의 resource geometry를 실제로 비교한다. HBM을 제외한 계층·연산은 비교한 유효 geometry의 관측 최고 처리량의 95% 이상을 유지하는 설정으로 효율 최적점을 찾고, 전체 clock sweep 최고 처리량의 95% 이상을 요구하는 성능 제약 선택도 별도로 보고한다. HBM 후보는 그 95% 대신, 같은 에너지 구간의 logical byte/s가 해당 memory clock 이론 bandwidth의 80% 이상인지를 본다. 전체 에너지·승인된 idle 증가분·승인된 paired-reference 대비를 각각 비교한다. Pareto 경계는 더 높은 처리량과 더 낮은 전력을 동시에 제공하는 다른 관측 설정이 없는 점들의 집합이다. 95%는 본 프로젝트의 운영 기준이며 NVIDIA의 보장값이 아니다.
 
 실측 전력이 없으면 idle 전력이나 각 블록의 에너지를 숫자로 확정하지 않는다. 이 저장소는 측정과 분석을 재현하는 도구이며, 예제나 CPU 테스트 결과는 GPU 측정 결과가 아니다.
 
@@ -77,7 +77,7 @@ flowchart TD
 
 | 워크로드 | 실험 설계 | 반드시 확인할 것 | 에너지에 함께 들어가는 것 |
 |---|---|---|---|
-| Tensor WMMA | 작은 타일을 한 번 준비하고 반복 MMA; 여러 독립 accumulator, warp/block 및 block 수 sweep | FP16 입력·FP32 누산, 연산이 제거되지 않음, tensor 명령이 실제 생성됨 | Tensor operand 전달, register file, instruction issue, 제어 및 최소 입출력 |
+| Tensor WMMA | WMMA API `m16n16k16`, FP16 입력·FP32 누산. A·B는 launch당 한 번 register fragment로 읽은 뒤 반복 `mma_sync`. shared operand나 raw PTX `mma.m16n8k16`이 아님. accumulator·warp/block sweep | FP16·FP32 누산, 연산이 제거되지 않음, tensor 명령이 실제 생성됨. WMMA shape와 SASS의 `mma` shape가 같다고 단정하지 않음 | register file, instruction issue, 제어 및 최소 입출력. 반복 구간의 L1/shared 재읽기 에너지가 아님 |
 | Tensor cuBLAS GEMM | 행렬 크기를 늘려 지속 dense FP16 GEMM을 실행 | `2MNK`, datatype, 누산, 라이브러리·툴킷, 실제 Tensor 경로·finite sample/checksum; 기준 결과와의 정확도 비교는 별도 | Tensor와 데이터 이동·캐시·HBM 전체 |
 | Native SFU — 기본 nonlinear | Q개 register lane의 1/4/8 chain에서 native 근사 명령 반복; 같은 loop에서 SFU를 뺀 control | Binary-bound SASS에서 native 명령 유지·hot-loop 데이터 load/store·spill 부재, scalar/warp count, one-step 수치 검증, matched control과 CI | Signed control 차분에도 issue·register·scheduling 차이가 남음; 초기화·loop 후 lane당 4 B sink·launch를 iterations로 amortize |
 | L1 | `ld.global.ca`로 block별 작은 working set을 반복 읽음 | resident block들의 총 working set, L1 hit 및 낮은 L2/DRAM 트래픽 | load/store unit, 주소 계산, register·L1·제어 |
@@ -86,7 +86,7 @@ flowchart TD
 | control | 같은 grid/thread 규모의 가벼운 정수 제어 커널 | 이 커널도 실제 ALU·제어 동작을 함 | active-control 기준 자체의 전력 |
 | locality | `.cg` pointer chase, 주소 offset와 실제 실행 SM ID 변화 | 의존 load의 latency 분포와 가능하면 L2 fabric counter | 지연시간 지도; 고처리량 L2 에너지 실험과 분리 |
 
-`WMMA`는 Warp Matrix Multiply Accumulate, `GEMM`은 General Matrix Multiply이다. 공통 WMMA는 세 세대 비교의 출발점이다. H100의 architecture-specific WGMMA, Tensor Memory Accelerator 등까지 포괄하는 최고 성능 구현은 공통 WMMA와 같은 실험으로 취급하지 않는다. cuBLAS 경로를 함께 측정하여 공통 microbenchmark의 포화 정도를 평가한다.
+`WMMA`는 Warp Matrix Multiply Accumulate, `GEMM`은 General Matrix Multiply이다. 공통 커널은 CUDA WMMA API의 `m16n16k16`이다. PTX ISA 9.4에서 floating-point `wmma`는 `sm_70` 이상이고 FP16 shape는 `.m16n16k16`, `.m8n32k16`, `.m32n8k16`이다. raw `mma`의 `.f16` `.m16n8k8`은 `sm_75` 이상, `.f16` `.m16n8k16`은 `sm_80` 이상이므로 V100 공통 경로가 아니다. [S8] 이 WMMA shape가 어떤 SASS `mma`로 내려가는지는 이 저장소의 측정 주장이 아니다. H100의 architecture-specific WGMMA, Tensor Memory Accelerator 등까지 포괄하는 최고 성능 구현은 공통 WMMA와 같은 실험으로 취급하지 않는다. cuBLAS 경로를 함께 측정하여 공통 microbenchmark의 포화 정도를 평가한다. dense FP16 ceiling(H100 4,096 FLOP/SM/cycle 포함)은 그 공통 커널의 도달 성능이 아니다.
 
 PTX의 `.ca`는 cache-all, `.cg`는 global-level caching의 힌트이다. `.cg`는 **L2를 우회하여 HBM만 읽는 명령이 아니다**. working set 크기만으로 계층이 확정되지 않으므로 counter 검증 전에는 결과를 해당 계층을 목표로 한 실험으로 해석한다. [S8]
 
@@ -121,7 +121,7 @@ misalignment, locality 설정은 `experiment_role=diagnostic`으로 표시하여
 clock에서도 에너지 최적점에서 제외한다. 기존 기본 stride도 1이었으며,
 진단 조건의 낮은 sector 효율을 본 실험에 허용했던 검증 누락을 보완하는 변경이다.
 
-`KiB = 1,024 bytes`, `MiB = 1,048,576 bytes`이고, `GB/s = 10^9 bytes/s`이다. Nsight Compute의 정의에서 L1/L2 cache line은 128 bytes, sector는 32 bytes이며 최소 접근 크기는 sector 하나다. Line이 4 sectors라고 매 요청이 항상 128 bytes를 전송하는 것은 아니다. Full warp의 32개 thread가 각각 연속된 4-byte 원소를 읽고 시작 주소가 32-byte 정렬이면 요청량은 128 bytes, 요청 sector 수는 4다. 128-byte 정렬된 기준 주소에서 시작점을 4 bytes 옮기면 5 sectors, 32 bytes 옮기면 두 128-byte line에 걸쳐도 4 sectors이다. 현재 single-stream read v2는 이런 scalar load를 thread당 iteration마다 1개 실행하므로 warp당 logical payload는 128 bytes이다. 이전 four-stream read는 4개/512 bytes였고 write/copy는 기존 네 접근을 유지한다. [변경된 read count와 재실험 방법](memory-read-v2.ko.md)을 참고한다. [sector 검토와 정렬 비교 설정](cache-sector-review.ko.md)을 별도로 제공한다. stride가 커지면 같은 logical bytes를 읽어도 많은 sectors가 움직일 수 있다. HBM stride sweep은 전체 stride cycle에서 가능한 sector footprint와 **한 launch가 유한한 iteration 동안 방문하는 footprint**를 구분한다. 주소 시작점이 같은 짧은 launch를 반복하면 큰 할당도 cache에 머물 수 있다. worker는 정확한 footprint 또는 상한임을 표시하고 주소 정렬·SM filter 한계를 기록한다. write/copy는 각 thread의 목적지 소유권을 겹치지 않게 유효 footprint를 조정한다. actual DRAM counter는 여전히 필요하며 cache throughput과 HBM bandwidth를 logical bytes만으로 비교하지 않는다. [S9]
+`KiB = 1,024 bytes`, `MiB = 1,048,576 bytes`이고, `GB/s = 10^9 bytes/s`이다. Nsight Compute의 정의에서 L1/L2 cache line은 128 bytes, sector는 32 bytes이며 최소 접근 크기는 sector 하나다. Line이 4 sectors라고 매 요청이 항상 128 bytes를 전송하는 것은 아니다. Full warp의 32개 thread가 각각 연속된 4-byte 원소를 읽고 시작 주소가 32-byte 정렬이면 요청량은 128 bytes, 요청 sector 수는 4다. 128-byte 정렬된 기준 주소에서 시작점을 4 bytes 옮기면 5 sectors, 32 bytes 옮기면 두 128-byte line에 걸쳐도 4 sectors이다. 현재 single-stream read `scalar_single_stream_read_v3`는 이런 scalar load를 thread당 iteration마다 1개 실행하므로 warp당 logical payload는 128 bytes이다. 직전 single-stream은 v2이고, 그 이전 four-stream read는 4개/512 bytes였다. write/copy는 기존 네 접근을 유지한다. [변경된 read count와 재실험 방법](memory-read-v2.ko.md)을 참고한다. [sector 검토와 정렬 비교 설정](cache-sector-review.ko.md)을 별도로 제공한다. stride가 커지면 같은 logical bytes를 읽어도 많은 sectors가 움직일 수 있다. HBM stride sweep은 전체 stride cycle에서 가능한 sector footprint와 **한 launch가 유한한 iteration 동안 방문하는 footprint**를 구분한다. 주소 시작점이 같은 짧은 launch를 반복하면 큰 할당도 cache에 머물 수 있다. worker는 정확한 footprint 또는 상한임을 표시하고 주소 정렬·SM filter 한계를 기록한다. write/copy는 각 thread의 목적지 소유권을 겹치지 않게 유효 footprint를 조정한다. actual DRAM counter는 여전히 필요하며 cache throughput과 HBM bandwidth를 logical bytes만으로 비교하지 않는다. [S9]
 
 ## 5. 센서와 측정 시간
 
@@ -173,7 +173,7 @@ SFU에서 memory clock은 환경 통제·비교 축이다. 이를 L1/L2/HBM work
 
 HBM에서는 memory clock을 고정한 뒤 SM clock을 올려 bandwidth가 포화되는 지점을 찾고, SM clock을 고정한 뒤 memory clock을 바꾼다. 낮은 SM clock에서 HBM bandwidth가 떨어지는 이유는 memory clock만이 아니라 load 발행량·주소 계산·interconnect·L2의 공급 능력일 수 있다. tensor·L1·L2도 클럭별 plateau를 따로 찾는다.
 
-각 층에서 반복 중앙값을 사용한다. `empirical_gpu_energy_optima`는 GPU UUID·workload·access·고정 memory MHz·objective별로, 각 clock pair에서 **최소 2개의 검증된 resource geometry를 실제 비교하고 전체 유효 관측 population의 peak** 대비 `R >= 0.95 × R_max`를 만족하는 검증 후보 중 단가 최소를 선택한다. `empirical_gpu_overall_energy_optima`는 검증된 measured memory domain도 함께 비교한다. 전체 단가, 승인된 idle 증가분, 승인된 paired-reference 대비는 각각 선택한다. 최적 graphics/memory MHz가 V100·A100·H100마다 같다고 가정하지 않는다. `R_max`는 이론 peak가 아닌 관측값이다. current-policy reference와 고정 클럭 탐색은 분리하고 seed·binary·clock policy·환경이 다른 결과를 같은 repeat로 합치지 않는다.
+각 층에서 반복 중앙값을 사용한다. `empirical_gpu_energy_optima`는 GPU UUID·workload·access·고정 memory MHz·objective별로, 각 clock pair에서 **최소 2개의 검증된 resource geometry를 실제 비교**한 검증 후보 중 단가 최소를 선택한다. HBM이 아닌 workload는 전체 유효 관측 population의 peak 대비 `R >= 0.95 × R_max`를 추가로 요구한다. HBM은 그 조건 대신 같은 에너지 구간의 logical byte/s가 해당 memory clock 이론 bandwidth의 80% 이상인 후보만 고른다. `empirical_gpu_overall_energy_optima`는 검증된 measured memory domain도 함께 비교한다. 전체 단가, 승인된 idle 증가분, 승인된 paired-reference 대비는 각각 선택한다. 최적 graphics/memory MHz가 V100·A100·H100마다 같다고 가정하지 않는다. `R_max`는 이론 peak가 아닌 관측값이다. current-policy reference와 고정 클럭 탐색은 분리하고 seed·binary·clock policy·환경이 다른 결과를 같은 repeat로 합치지 않는다.
 
 기본 nonlinear/SFU에서는 register-control 차분만 효율 후보로 선택하고 전체·idle
 objective는 진단으로 남긴다. 음수나 0을 포함하는 CI는 보존하되 양의 비용을 확인한
@@ -184,7 +184,7 @@ geometry 개수는 blocks·threads·Tensor accumulator 또는 GEMM dimensions처
 
 각 winner에는 요청/실제 클럭, `metric_value`, `metric_ci95`, `near_optimum_support_points`(기본 최솟값의 5% 이내 실측 group), `uncertainty_overlap_support_points`, `all_eligible_support_points`를 남긴다. 근접 단가와 신뢰구간 겹침은 별개로 표시한다. support point 사이의 미측정 영역을 연속 최적 구간으로 보장하지 않는다. 3–4회처럼 적은 반복의 bootstrap 구간은 거칠어 작은 차이에는 반복과 최소점 주변 측정을 늘린다.
 
-verified 선택은 NCU 통과·같은 측정 구간의 정확한 work count·반복 품질을 요구한다. 주파수별 efficiency 최적점의 95% 분모에는 그 주파수의 미검증·target 실패 group도 포함한다. 별도 `cross_clock_best`/`verified_target_cross_clock_best`는 전체 clock sweep 최고 처리량 근처에서의 운영 설정을 고른다. 이 성능 제약의 95% 분모는 미검증·target 실패 후보도 포함한 **전체 유효 고정 클럭 sweep의 최고 처리량**이다. 검증한 후보 중 최고 처리량만으로 기준을 낮추지 않는다. 검증된 후보가 전체 최고값의 95%에 도달하지 못하면 winner는 비워 두고 `verified_target_coverage`에 전체/검증된 peak·비율·미검증 또는 실패한 peak group을 남긴다. 반복 수·변동폭을 함께 확인하고 좁은 차이를 물리적 최솟값이라고 단정하지 않는다.
+verified 선택은 NCU 통과·같은 측정 구간의 정확한 work count·반복 품질을 요구한다. HBM이 아닌 workload에서 주파수별 efficiency 최적점의 95% 분모에는 그 주파수의 미검증·target 실패 group도 포함한다. HBM의 처리량 관문은 이 관측 peak 비율이 아니라 logical byte/s와 이론 bandwidth의 비다. HBM이 아닌 workload의 `cross_clock_best`/`verified_target_cross_clock_best`는 전체 clock sweep 최고 처리량 근처에서의 운영 설정을 고른다. 이 성능 제약의 95% 분모는 미검증·target 실패 후보도 포함한 **전체 유효 고정 클럭 sweep의 최고 처리량**이다. HBM은 clock마다 logical 80%를 유지하며, 이 sweep 전체 관측 peak 95%로 후보를 빼지 않는다. 검증한 후보 중 최고 처리량만으로 기준을 낮추지 않는다. 검증된 후보가 전체 최고값의 95%에 도달하지 못하면 winner는 비워 두고 `verified_target_coverage`에 전체/검증된 peak·비율·미검증 또는 실패한 peak group을 남긴다. 반복 수·변동폭을 함께 확인하고 좁은 차이를 물리적 최솟값이라고 단정하지 않는다.
 
 클럭 변경에는 드라이버·권한 제한이 있을 수 있다. 실패를 조용히 기본 DVFS 실행으로 바꾸지 않고 명시한다. 커널이 없는 idle 구간에는 높은 요청 클럭에서도 hardware gating으로 실제 클럭이 내려갈 수 있다. 이런 기준은 requested-clock-matched reference이며, 모든 실험에서 실제 active idle 상태가 일치한다고 부르지 않는다. `baseline_clock_matched`와 `baseline_temperature_matched`로 idle와 active 상태의 일치를 별도 기록한다. `dynamic_attribution_eligible`는 기존의 기준 대비 해석 승인 alias이며 새 `operational_idle_increment_eligible`와 같은 operational 의미로 읽는다. 순수 physical dynamic의 분리 증명이 아니다. [S10]
 
@@ -223,7 +223,7 @@ L1은 L1 global-read sector bytes, L2/HBM은 L2 TEX-origin read-sector bytes를
 Logical BW, L1/L2 read-sector BW, DRAM read BW는 계층·측정 구간과 함께 각각
 보고한다. NCU replay의 처리량을 energy 구간의 처리량이나 pJ 분모로 대체하지 않는다.
 
-실패와 미확정의 에너지 결과를 삭제하지 않는다. 일반 raw 결과에 상태·이유를 남기고 목표가 검증된 최적값 선택에서 제외한다. `pass`가 증명하는 것은 **관측 counter에서 의도한 데이터/연산 경로를 지배적으로 사용했다는 프로젝트 기준의 적절성**이다. 대역폭이 포화됐다는 증명은 clock/geometry sweep와 별도 plateau 판정, 높은 throughput에서의 최소 에너지는 반복과 95% 선정, 순수 회로 에너지는 rail·식별 가능한 모델 검증을 추가로 요구한다.
+실패와 미확정의 에너지 결과를 삭제하지 않는다. 일반 raw 결과에 상태·이유를 남기고 목표가 검증된 최적값 선택에서 제외한다. `pass`가 증명하는 것은 **관측 counter에서 의도한 데이터/연산 경로를 지배적으로 사용했다는 프로젝트 기준의 적절성**이다. 대역폭이 포화됐다는 증명은 clock/geometry sweep와 별도 plateau 판정이다. HBM이 아닌 workload의 높은 throughput 최소 에너지는 반복과 관측 peak 95% 선정을 요구한다. HBM은 logical 80% 이론 bandwidth 후보에서 고른다. 순수 회로 에너지는 rail·식별 가능한 모델 검증을 추가로 요구한다. Profile clock evidence가 불완전하면 `inconclusive`다. memory clock은 profile 샘플마다 양의 유한값과 해당 필드 오류 없음이 필요하고, graphics를 kernel `SM_HZ`로 대체하려면 모든 kernel에 유효한 양의 주파수가 필요하다. `profile_actual_clocks`는 `raw_samples`/`valid_samples`와 `kernel_samples`/`valid_kernel_samples`를 남긴다.
 
 warm cache 검증에서 flushing을 끄면 일반 실행 상태를 보존하기 쉽지만 hit를 보장하지는 않는다. warmup이 짧거나 SM 배치가 달라 실제 hit가 낮으면 해당 실행을 검증 통과로 처리하지 않는다. locality도 counter 자동 통과만으로 이름 붙이지 않고 독립적으로 검증한 지도와 함께 평가한다. 실제 metric·권한·NCU 지원 여부는 V100/A100/H100 각각에서 확인한다.
 
@@ -245,9 +245,15 @@ warm cache 검증에서 flushing을 끄면 일반 실행 상태를 보존하기 
 
 이 식은 설계 형태이며 네 개의 microbenchmark 결과를 더하면 자동으로 물리적 전력이 복원된다는 뜻이 아니다. 각 workload는 공유 경로를 사용하고 상관된 counter를 만든다. 먼저 단일 workload의 **기준 대비 증가분 기울기**를 확인한다. 여러 블록을 함께 쓰는 모델은 각각의 활동을 독립적으로 변화시킨 calibration, counter 기반 특징, 설계 행렬의 rank/condition 점검, 알려지지 않은 mixed workload holdout 검증이 필요하다. 식별되지 않는 계수는 결과를 내지 않는다. idle baseline, active control, tensor와 memory 데이터가 서로 중복 집계되지 않게 정의한다. control은 독립 진단 workload와 같은 process의 paired reference 두 형태로 구분된다. `active_control_associations`는 독립 control을 설명용으로 연결하며 자동 component 차감에 사용하지 않는다. paired arm의 `paired_active_reference_*`는 실제 AB/BA protocol·state·geometry 요건을 검사한 operational contrast이며 최적값에는 균형 잡힌 유효 순서 반복이 필요하다. 어떤 control 차이도 명령·cache·occupancy가 완전히 같은 counterfactual이라는 보장 없이 component의 순수 회로 에너지로 이름 붙이지 않는다.
 
-`fit`은 명시적으로 준비한 활동률 feature rows에 대해 증가분 전력을 회귀한다. 단위·counter/count source·logical/physical byte 정의·power provenance와 같은 GPU/고정 클럭 층을 요구한다. 분석 row는 NCU evidence를 다시 평가하고 정확한 work/energy 시간 정렬을 확인한다. 미측정 feature를 0으로 채우지 않으며 rank가 부족하거나 condition이 나쁜 설계는 거부한다. logical throughput으로 fitting한 계수는 workload의 계수이며 순수 L1/L2/HBM 회로 계수가 아니다.
+`fit`은 명시적으로 준비한 활동률 feature rows에 대해 증가분 전력을 회귀한다. 단위·counter/count source·logical/physical byte 정의·power provenance와 같은 GPU·요청 클럭·소프트웨어 stratum을 요구한다. 분석 row는 NCU evidence를 다시 평가하고 정확한 work/energy 시간 정렬을 확인한다. 미측정 feature를 0으로 채우지 않으며 rank가 부족하거나 condition이 나쁜 설계는 거부한다. logical throughput으로 fitting한 계수는 workload의 계수이며 순수 L1/L2/HBM 회로 계수가 아니다.
 
-mixed 예측은 독립 holdout의 오차와 calibration 범위가 통과한 뒤, 통과 holdout feature들의 convex hull 안으로 제한한다. 이는 실제 검증 조건을 가중 평균하여 만들 수 있는 범위다. feature별 최소/최대의 사각형 전체가 검증됐다고 확대하지 않는다. holdout 하나는 같은 vector만 지지한다. 현재 harness는 concurrent mixed workload의 실제 feature rows를 자동 수집하지 않으므로 별도 측정·counter 검증이 필요하다.
+`status: "fitted"`는 OLS calibration이 식별되었다는 뜻이다. `holdout_validation_status`는 `not_provided`, `pass`, `fail` 중 하나다. `fail`이면 계수는 진단용으로 남지만 단일 활동 예측과 mixed 예측은 모두 거부되고 `fit` CLI는 exit code 2다. 온도는 `temperature_stratum`에 `qualified`/`unverified`/`rejected`, `minimum_c`, `maximum_c`, `median_c`, `maximum_span_c=5`로 남긴다. 분석 행의 measure 최소·최대를 포함한 알려진 온도 폭이 5°C를 넘거나 일부 행만 온도가 없으면 rejected다. 온도가 모두 없으면 warning과 `unverified`다. `execution_scope`는 `gpu_uuid`, 요청 clock인 `requested_clock_pairs`, `cross_clock_model`, `benchmark_sha256`, `measurement_stratum`, `treatment_design_stratum`을 저장한다. 예측은 기본적으로 이 scope와 맞는 GPU·요청 clock context를 요구한다. `features`에 같은 context가 있으면 그것도 읽는다. cross-clock 모델은 clock feature를 config 요청값과 fit에서 대조하고 예측 때 그 feature를 쓴다. 온도가 알려진 모델은 현재 온도를 요구하고, calibration과 예측 온도를 합친 폭이 5°C를 넘으면 거부한다. `allow_unbound_context=True`는 누락된 context의 과거 진단 계산만 허용하며, 명시적 불일치·holdout 실패·mixed hull 거부는 우회하지 않는다. scope가 없는 legacy 모델도 기본 예측에서는 다시 fit하거나 이 opt-in이 필요하다.
+
+mixed 예측은 holdout이 `pass`이고 calibration 범위가 통과한 뒤, 통과 holdout feature들의 convex hull 안으로 제한한다. 이는 실제 검증 조건을 가중 평균하여 만들 수 있는 범위다. feature별 최소/최대의 사각형 전체가 검증됐다고 확대하지 않는다. holdout 하나는 같은 vector만 지지한다. 현재 harness는 concurrent mixed workload의 실제 feature rows를 자동 수집하지 않으므로 별도 측정·counter 검증이 필요하다.
+
+온도 범위는 calibration과 holdout을 모두 포함한다. prediction에서는 그 범위와 현재 온도를 합친 최대−최소가 5°C 이내여야 한다. cross-clock feature 단위는 `MHz`다. software/power stratum은 prediction context에 제공된 경우 대조하며, GPU·요청 clock 검사만으로 생략한 환경 정보까지 일치한다고 인증하지 않는다. `raw_samples`/`valid_samples`는 NVML 관측 수, `kernel_samples`/`valid_kernel_samples`는 `SM_HZ` 관측 수다. graphics clock의 `source`가 kernel이면 NVML graphics 누락이 있어도 모든 kernel의 유효한 직접 주파수 관측으로 검사할 수 있다. 모든 kernel에서 `SM_HZ`가 미지원이면 완전한 NVML graphics 관측을 사용한다.
+
+주파수 feature와 config 요청 clock이 어긋난 행은 `skipped_rows`에 사유를 남기고 fitting에서 제외한다. Holdout `pass`는 상대오차 관문만 뜻한다. Cross-clock 단일 활동 예측은 주파수 feature의 calibration 범위 안에서 보간할 수 있으며, 지원 clock 목록 검증이나 물리적 DVFS 법칙을 보장하지 않는다. Mixed 활동은 별도로 검증한 holdout hull 안으로 제한한다.
 
 | 질문 | 계산 | 의미 |
 |---|---|---|

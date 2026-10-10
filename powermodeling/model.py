@@ -5,13 +5,18 @@ logical memory bytes is an empirical workload model, not circuit/rail energy.
 """
 from __future__ import annotations
 
+import copy
 import math
 import json
+import statistics
 from typing import Any, Iterable, Mapping, Sequence
 
 
 DEFAULT_FEATURES = ("tensor_tflops", "l1_gbps", "l2_gbps", "hbm_gbps")
 FREQUENCY_FEATURES = {"graphics_clock_mhz", "memory_clock_mhz"}
+# Matches the default within-trial AnalysisPolicy temperature drift bound.
+# This is an admission policy, not a model of temperature-dependent leakage.
+MODEL_TEMPERATURE_SPAN_C = 5.0
 
 
 def _mixed_activity(features, values):
@@ -32,6 +37,45 @@ def _number(value: Any) -> float | None:
     except (ValueError, TypeError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _temperature_reading(row):
+    phases = row.get("phases") or {}
+    phase = (phases.get("measure") or {}) if isinstance(phases, Mapping) else {}
+    raw_center = row.get("temperature_c", phase.get("temperature_c"))
+    raw_low = phase.get("temperature_c_min", row.get("temperature_c_min"))
+    raw_high = phase.get("temperature_c_max", row.get("temperature_c_max"))
+    raw = (raw_center, raw_low, raw_high)
+    if all(value is None for value in raw):
+        return None, None
+    if any(value is not None and _number(value) is None for value in raw):
+        return None, "invalid_temperature_provenance"
+    center, low, high = map(_number, raw)
+    if low is None and high is None:
+        return (center, center, center), None
+    if low is None or high is None or low > high or center is not None and not low <= center <= high:
+        return None, "invalid_temperature_provenance"
+    return (low, high, center if center is not None else (low + high) / 2), None
+
+
+def _temperature_stratum(rows):
+    readings = [_temperature_reading(row) for row in rows]
+    known = [reading for reading, _ in readings if reading is not None]
+    issues = sorted({issue for _, issue in readings if issue})
+    result = {"status": "unverified", "minimum_c": None, "maximum_c": None,
+              "median_c": None, "maximum_span_c": MODEL_TEMPERATURE_SPAN_C}
+    if known:
+        result.update(minimum_c=min(reading[0] for reading in known),
+                      maximum_c=max(reading[1] for reading in known),
+                      median_c=statistics.median(reading[2] for reading in known))
+        if len(known) != len(readings):
+            issues.append("incomplete_temperature_provenance")
+        if result["maximum_c"] - result["minimum_c"] > MODEL_TEMPERATURE_SPAN_C + 1e-9:
+            issues.append("temperature_span_exceeds_model_stratum")
+        result["status"] = "qualified" if not issues else "rejected"
+    elif issues:
+        result["status"] = "rejected"
+    return result, issues
 
 
 def _within_hull(values, observed, tolerance=1e-7):
@@ -90,6 +134,8 @@ def _provenance_issue(row, features):
             return "incorrect_tensor_unit; use_TFLOP/s"
         if feature in DEFAULT_FEATURES[1:] and unit != "GB/s":
             return "incorrect_byte_rate_unit; use_decimal_GB/s"
+        if feature in FREQUENCY_FEATURES and unit != "MHz":
+            return "incorrect_frequency_unit; use_MHz"
         description = source.get("source") if isinstance(source, Mapping) else source
         if not isinstance(description, str) or not description.strip():
             return "missing_feature_provenance:" + feature
@@ -120,6 +166,7 @@ be supplied explicitly, including measured/known zero; missing is not zero.
         "include_intercept": include_intercept, "coefficients": None, "intercept_w": None,
         "additive_validated": False, "issues": [], "warnings": [],
         "mixed_validation_feature_points": [],
+        "holdout_validation_status": "not_provided", "holdout_failure_reasons": [],
         "interpretation": "Empirical whole-device power or operational contrast per stated measured-rate unit; coefficients do not isolate physical block leakage or switching energy.",
         "energy_objective": "measured total treatment power" if target == "board_power_w" else "paired active-reference operational contrast" if target == "paired_active_reference_power_w" else "operational powered-idle increment" if target in ("incremental_power_w", "operational_idle_increment_power_w") else "explicit user-supplied target",
     }
@@ -169,6 +216,11 @@ be supplied explicitly, including measured/known zero; missing is not zero.
         clock_values = [config.get(field, row.get(field)) for field in ("graphics_clock_mhz", "memory_clock_mhz")]
         if not isinstance(uuid, str) or not uuid or any((_number(clock) or 0) <= 0 for clock in clock_values):
             skipped.append({"index": index, "trial_id": row.get("trial_id"), "reason": "explicit_device_and_fixed_clock_provenance_required"})
+            continue
+        if any(feature in FREQUENCY_FEATURES and value != _number(config.get(feature, row.get(feature)))
+               for feature, value in zip(features, values)):
+            skipped.append({"index": index, "trial_id": row.get("trial_id"),
+                            "reason": "frequency_features_must_match_requested_clock_provenance"})
             continue
         if any(value < 0 for value in values):
             skipped.append({"index": index, "trial_id": row.get("trial_id"), "reason": "negative_activity_rate"})
@@ -225,8 +277,8 @@ be supplied explicitly, including measured/known zero; missing is not zero.
     for _, _, row in calibration + validation:
         config = row.get("config") or {}
         strata.add((row.get("gpu_uuid", config.get("gpu_uuid")),
-                    config.get("graphics_clock_mhz", row.get("graphics_clock_mhz")),
-                    config.get("memory_clock_mhz", row.get("memory_clock_mhz"))))
+                    _number(config.get("graphics_clock_mhz", row.get("graphics_clock_mhz"))),
+                    _number(config.get("memory_clock_mhz", row.get("memory_clock_mhz")))))
     gpu_ids = {stratum[0] for stratum in strata if stratum[0] is not None}
     if len(gpu_ids) > 1:
         result["issues"].append("multiple_devices_require_separate_models")
@@ -243,6 +295,22 @@ be supplied explicitly, including measured/known zero; missing is not zero.
             result["issues"].append("cross_clock_model_requires_explicit_graphics_and_memory_frequency_features")
             return result
         result["warnings"].append("cross_clock_model_is_empirical; include frequency and voltage effects explicitly")
+    first_row = calibration[0][2]
+    result["execution_scope"] = {
+        "gpu_uuid": next(iter(gpu_ids)), "clock_basis": "requested_fixed_clocks",
+        "requested_clock_pairs": [{"graphics_clock_mhz": graphics, "memory_clock_mhz": memory}
+                                  for _, graphics, memory in sorted(strata)],
+        "cross_clock_model": bool(allow_cross_clock and len(strata) > 1),
+        **{field: copy.deepcopy(first_row.get(field)) for field in (
+            "benchmark_sha256", "measurement_stratum", "treatment_design_stratum")},
+    }
+    thermal, thermal_issues = _temperature_stratum([row for _, _, row in calibration + validation])
+    result["temperature_stratum"] = thermal
+    if thermal_issues:
+        result["issues"].extend(thermal_issues)
+        return result
+    if thermal["status"] == "unverified":
+        result["warnings"].append("temperature_provenance_missing; thermal scope is unverified")
     x = np.asarray([entry[0] for entry in calibration], dtype=float)
     y = np.asarray([entry[1] for entry in calibration], dtype=float)
     scales = np.sqrt(np.mean(x * x, axis=0))
@@ -297,6 +365,8 @@ be supplied explicitly, including measured/known zero; missing is not zero.
         mixed = _mixed_activity(features, values)
         entry = {"trial_id": row.get("trial_id"), "measured_power_w": measured, "predicted_power_w": predicted,
                  "relative_error": relative_error, "mixed": mixed,
+                 "holdout_validation_status": "pass" if relative_error <= max_validation_relative_error else "fail",
+                 "failure_reasons": [] if relative_error <= max_validation_relative_error else ["holdout_relative_error_exceeds_tolerance"],
                  "features": dict(zip(features, values)),
                  "independent_measurement_identity": calibration_identity_known and _measurement_identity(row) is not None,
                  "within_calibration_feature_ranges": all(float(x[:, i].min()) <= value <= float(x[:, i].max()) for i, value in enumerate(values))}
@@ -306,6 +376,14 @@ be supplied explicitly, including measured/known zero; missing is not zero.
     result["validation"] = validation_results
     result["validation_relative_error_denominator_floor_w"] = 1.0
     result["max_validation_relative_error"] = max_validation_relative_error
+    failed_holdouts = [entry for entry in validation_results if entry["holdout_validation_status"] == "fail"]
+    if validation_results:
+        result["holdout_validation_status"] = "fail" if failed_holdouts else "pass"
+    if failed_holdouts:
+        result["holdout_failure_reasons"] = [{"trial_id": entry["trial_id"],
+                                             "relative_error": entry["relative_error"],
+                                             "reasons": entry["failure_reasons"]} for entry in failed_holdouts]
+        result["warnings"].append("heldout_prediction_error_exceeds_tolerance; all predictions disabled")
     if mixed_validation:
         passed = all(entry["relative_error"] <= max_validation_relative_error and entry["within_calibration_feature_ranges"] for entry in validation_results) and all(entry["independent_measurement_identity"] for entry in mixed_validation)
         result["additive_validated"] = passed
@@ -322,10 +400,74 @@ be supplied explicitly, including measured/known zero; missing is not zero.
     return result
 
 
-def predict_power(model: Mapping[str, Any], features: Mapping[str, Any], *, allow_extrapolation: bool = False) -> float:
-    """Predict only in the validated/calibrated scope; raise outside it."""
+def _check_prediction_context(model, features, values, context, allow_unbound):
+    if context is not None and not isinstance(context, Mapping):
+        raise ValueError("prediction context must be a mapping")
+    supplied = {}
+    fields = {"gpu_uuid", *FREQUENCY_FEATURES, "temperature_c", "temperature_c_min", "temperature_c_max",
+              "benchmark_sha256", "measurement_stratum", "treatment_design_stratum"}
+    numeric = FREQUENCY_FEATURES | {"temperature_c", "temperature_c_min", "temperature_c_max"}
+    for source in (features, context or {}):
+        for field in fields & source.keys():
+            value = source[field]
+            if field in supplied:
+                a, b = (_number(supplied[field]), _number(value)) if field in numeric else (supplied[field], value)
+                if a != b:
+                    raise ValueError("conflicting prediction context: " + field)
+            supplied[field] = value
+    scope = model.get("execution_scope")
+    if not isinstance(scope, Mapping) or not scope.get("gpu_uuid") or not scope.get("requested_clock_pairs"):
+        if not allow_unbound:
+            raise ValueError("model has no saved execution scope; refit or explicitly allow unbound diagnostic context")
+        return
+    uuid = supplied.get("gpu_uuid")
+    if uuid is not None and uuid != scope["gpu_uuid"]:
+        raise ValueError("prediction GPU context differs from the fitted model")
+    if uuid is None and not allow_unbound:
+        raise ValueError("prediction context requires gpu_uuid")
+    fixed = scope["requested_clock_pairs"][0]
+    for field in FREQUENCY_FEATURES:
+        clock = _number(supplied.get(field))
+        if field in supplied and (clock is None or clock <= 0):
+            raise ValueError("invalid requested-clock prediction context: " + field)
+        if clock is None and not allow_unbound:
+            raise ValueError("prediction context requires requested " + field)
+        if clock is not None:
+            expected = values.get(field) if scope.get("cross_clock_model") else _number(fixed[field])
+            if clock != expected:
+                raise ValueError("prediction requested-clock context differs from the fitted model: " + field)
+    for field in ("benchmark_sha256", "measurement_stratum", "treatment_design_stratum"):
+        if scope.get(field) is not None and field in supplied and supplied[field] != scope[field]:
+            raise ValueError("prediction software/power context differs from the fitted model: " + field)
+    thermal = model.get("temperature_stratum") or {}
+    reading, issue = _temperature_reading(supplied)
+    if issue:
+        raise ValueError("invalid temperature prediction context")
+    if thermal.get("status") == "qualified":
+        if reading is None:
+            if not allow_unbound:
+                raise ValueError("prediction context requires current temperature_c")
+        elif max(thermal["maximum_c"], reading[1]) - min(thermal["minimum_c"], reading[0]) > thermal["maximum_span_c"] + 1e-9:
+            raise ValueError("prediction temperature lies outside the fitted thermal stratum")
+
+
+def predict_power(model: Mapping[str, Any], features: Mapping[str, Any], *,
+                  context: Mapping[str, Any] | None = None, allow_unbound_context: bool = False,
+                  allow_extrapolation: bool = False) -> float:
+    """Require a matching GPU/requested-clock/known-temperature context.
+
+    Context may be supplied separately or alongside activity features. Explicit
+    unbound diagnostic predictions preserve old math calls, but never bypass a
+    failed holdout, a supplied context mismatch, or mixed validation/hull gates.
+    """
+    if type(allow_unbound_context) is not bool or type(allow_extrapolation) is not bool:
+        raise ValueError("prediction diagnostic/extrapolation options must be boolean")
     if model.get("status") != "fitted" or not model.get("coefficients"):
         raise ValueError("model was not fitted successfully")
+    tolerance = _number(model.get("max_validation_relative_error"))
+    if model.get("holdout_validation_status") == "fail" or tolerance is not None and any(
+            (_number(entry.get("relative_error")) or 0) > tolerance for entry in model.get("validation", [])):
+        raise ValueError("model failed held-out prediction validation (holdout error exceeds tolerance)")
     values = {name: _number(features.get(name)) for name in model["features"]}
     if any(value is None or value < 0 for value in values.values()):
         raise ValueError("supply every explicit nonnegative measured feature rate")
@@ -334,6 +476,7 @@ def predict_power(model: Mapping[str, Any], features: Mapping[str, Any], *, allo
         raise ValueError("mixed-workload additivity has no passing independent validation")
     if mixed and not _within_hull([values[name] for name in model["features"]], model.get("mixed_validation_feature_points", [])):
         raise ValueError("mixed feature vector lies outside the convex hull of passing independent mixed validation")
+    _check_prediction_context(model, features, values, context, allow_unbound_context)
     if not allow_extrapolation:
         for name, value in values.items():
             low, high = model["calibration_feature_ranges"][name]

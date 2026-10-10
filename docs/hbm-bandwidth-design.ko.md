@@ -8,8 +8,8 @@
 
 ```text
 B_theoretical [byte/s] = 2 × achieved_memory_clock_MHz × 10^6 × memory_bus_width_bits / 8
-utilization = sustained_logical_bytes_per_second / B_theoretical
-HBM candidate: utilization >= 0.80
+logical_fraction = sustained_logical_bytes_per_second / B_theoretical
+HBM candidate: logical_fraction >= 0.80
 ```
 
 대상 V100/A100/H100 HBM의 DDR clock convention을 사용한다. CUDA에서 조회한
@@ -51,6 +51,11 @@ count 점검을 위한 진단으로 남기며 물리적 모순이라고 자동 �
 예를 들어 logical rate 101%에서 20%가 L2에 hit하면 단순 모델의 DRAM rate는
 약 80.8%일 수 있다. 이 예시는 측정이 아니며 실제 DRAM 기여는 counter로
 확인한다. NCU의 `% of peak sustained`도 별도 기준이다.
+
+logical 80%와 다른 replay의 DRAM/logical 75%를 곱한 60%는 같은 에너지 구간의
+DRAM 전송률이 아니고, DRAM bus 사용률의 하한도 아니다. 두 숫자는 서로 다른
+실행의 서로 다른 비율이다. 이번 범위에는 에너지 구간 DRAM byte/s로 80%를
+판정하는 gate를 추가하지 않는다.
 
 ## Read 커널과 DVFS의 연산 오버헤드
 

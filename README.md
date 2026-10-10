@@ -1,6 +1,6 @@
 # NVIDIA GPU power modeling
 
-**SXM 모듈의 V100·A100·H100**에서 **충분한 처리량을 유지하는 pJ/FLOP·pJ/logical-bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. HBM은 **실제 memory clock과 버스 폭으로 계산한 이론 bandwidth의 80% 이상**에서 최소 단가를 고른다. 다른 계층·연산은 관측 peak·plateau의 상대 평가를 사용한다. 어느 판정도 물리적 포화나 전역 최소점을 보장하지 않는다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
+**SXM 모듈의 V100·A100·H100**에서 **충분한 처리량을 유지하는 pJ/FLOP·pJ/logical-bit·pJ/SFU instruction 최소점과 주변 측정점**을 찾기 위한 CUDA/NVML 실험 도구다. HBM은 **같은 에너지 구간의 logical byte/s가, 실측 memory clock과 버스 폭으로 계산한 이론 bandwidth의 80% 이상**인 후보에서 최소 단가를 고른다. 이 80%는 DRAM bus 사용률이 아니다. 다른 계층·연산은 관측 peak·plateau의 상대 평가를 사용한다. 어느 판정도 물리적 포화나 전역 최소점을 보장하지 않는다. FP16 Tensor, L1, L2, HBM과 **register-resident SFU 기본 명령**의 작업량·thread/block·SM/memory clock을 바꾸고, 수초 동안 전력과 처리량을 함께 측정한다. 비선형 기본 실험은 global 입력 버퍼 없이 EX2·LG2·RCP·RSQ·SQRT·native TANH를 반복한다. 메모리 실험에는 stride·주소 offset sweep도 제공한다.
 
 SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다. 실제 메모리 용량·SKU·SM 수를 이름만으로 확정하지 않는다. 이 저장소에는 실측 GPU 숫자가 들어 있지 않다. 전체 단가, 승인된 전후 idle 증가분, 같은 process에서 짝지은 active-reference 대비를 별도로 보고한다. `idle`은 운영상 기준이며 순수 누설 전력이 아니다. 지원되는 memory power scope도 전체 GPU scope와 구분한다. cache/DRAM counter가 목표 경로를 확인한 뒤에도 측정 에너지를 해당 물리 회로만의 에너지로 동일시하지 않는다.
 
@@ -12,7 +12,7 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 
 | 기능 | 구현 |
 |---|---|
-| Tensor | FP16 입력·FP32 누산 WMMA 반복, 독립 accumulator sweep, cuBLAS dense GEMM 비교 |
+| Tensor | FP16 입력·FP32 누산 WMMA `m16n16k16` register reuse, 독립 accumulator sweep, cuBLAS dense GEMM 비교. raw PTX `mma.m16n8k16`이나 shared-resident operand 경로가 아님 |
 | L1·L2·HBM | L1 `.ca`, L2/HBM `.cg` load, HBM `.ca`/`.cs` 비교 진단; working set·grid·thread·stride·주소 offset·read/copy sweep |
 | L2 locality | 의존 pointer chase의 SM별 cycle/access와 offset 변화; near/far 확정은 별도 evidence 필요 |
 | Register SFU | EX2·LG2·RCP·RSQ·SQRT·native TANH의 register 반복, SFU를 뺀 control 대비 차분 pJ/scalar instruction |
@@ -20,7 +20,7 @@ SXM은 GPU 모듈의 장착 형태이고 HBM은 측정할 메모리 계층이다
 | 시간·기준 | 같은 context·버퍼·clock policy의 전후 idle 및 AB/BA paired active reference, arm별 warmup·완료 epoch의 정렬 적분 |
 | 클럭·DVFS | 900 MHz 이상 지원 pair의 60/90/120 등 가변 간격 graphics grid, 정확한 1110 MHz·advertised default·현재 정책 reference coverage, 요청/실제 클럭·복원 |
 | 분석 | GPU UUID별 전체·idle 증가분·paired-reference 단가 최소와 이산 근접 측정점·bootstrap 구간; 주파수별 활용 조건과 전체 최고 성능 제약을 분리 |
-| 모델 | 명시적 활동률 특징, rank/condition 검사, 다른 GPU·클럭 층 분리, mixed holdout 검증 |
+| 모델 | 명시적 활동률 특징, rank/condition 검사, GPU·요청 클럭·온도 폭·실행 scope 분리. `fitted`는 calibration 성공이고 holdout 승인과 별도 |
 | 검증 | Nsight Compute counter를 자동 판정하고 분석에 반영; `pass`/`fail`/`inconclusive` 및 근거 보존 |
 
 **A100 GA100의 `nvmlDeviceGetPowerUsage`는 현재 전력이고 H100은 약 1초 평균이다.** H100 이름만 보고 HBM 별도 센서가 지원된다고 가정하지 않는다. 지원 scope와 실패 상태를 실제 장치에서 확인한다. [공식 자료](docs/sources.md)
@@ -402,13 +402,36 @@ L2 Fabric counter는 `--extra-metrics`로 추가할 수 있다. `local-heavy`/`r
 python -m powermodeling fit --input feature-rows.json --features tensor_tflops,l1_gbps,l2_gbps,hbm_gbps --output model.json
 ```
 
-입력·식별 요건을 충족하지 못한 fitting은 `status: "rejected"`와 이유를 JSON에 보존하고 exit code 2를 반환한다.
+입력·식별 요건을 충족하지 못한 fitting은 `status: "rejected"`와 이유를 JSON에 보존하고 exit code 2를 반환한다. OLS calibration이 식별되면 `status`는 `"fitted"`로 남고 계수와 실패 진단도 보존한다. `holdout_validation_status`는 별도다. validation 행이 없으면 `not_provided`, 허용 오차를 모두 넘지 않으면 `pass`, 하나라도 넘으면 `fail`이다. `fail`이면 단일 활동 예측과 mixed 예측을 모두 거부하고 `fit` CLI도 exit code 2를 반환한다. mixed 실패는 추가로 `additive_validated: false`이며, 통과한 mixed holdout의 convex hull 밖 예측도 거부한다.
+
+`temperature_stratum`은 `status`(`qualified`/`unverified`/`rejected`), `minimum_c`, `maximum_c`, `median_c`, `maximum_span_c`(5)를 저장한다. 분석 행은 measure 구간의 최소·최대 온도를 폭에 포함한다. calibration·holdout의 알려진 온도 전체 폭이 5°C를 넘거나 일부 행만 온도가 없으면 rejected다. 온도가 모두 없으면 warning과 `unverified`만 남기고, 그 모델의 예측에는 현재 온도를 요구하지 않는다. 온도가 알려진 모델의 예측은 현재 온도를 요구하고, fitting 입력과 그 온도를 합친 폭이 5°C를 넘으면 거부한다. 더 넓은 온도 sweep를 한 모델로 맞추는 경로는 없다.
+
+`execution_scope`는 `gpu_uuid`, `requested_clock_pairs`, `cross_clock_model`, `benchmark_sha256`, `measurement_stratum`, `treatment_design_stratum`을 저장한다. 여기의 clock은 요청값이다. `predict_power(model, features, *, context=None, allow_unbound_context=False, allow_extrapolation=False)`는 기본적으로 GPU UUID와 요청 clock context를 요구한다. `features` 안에 같은 context가 있으면 그것도 읽는다. 고정 클럭 모델은 저장된 요청 pair와 맞아야 한다. cross-clock 모델은 fit 때 각 행의 clock feature를 그 행의 config 요청 clock과 대조하고, 예측 때는 그 feature를 clock 입력으로 쓴다. `allow_unbound_context=True`는 context를 생략한 과거 진단 계산만 허용한다. 명시적 불일치, holdout 실패, mixed hull 밖 예측은 이 옵션으로 통과하지 않는다. `execution_scope`가 없는 legacy JSON도 기본 예측에서는 거부하며, 다시 fit하거나 같은 opt-in을 명시해야 한다.
 
 현재 harness는 Tensor와 memory 활동률을 함께 측정하는 mixed-workload calibration을 자동 생성하지 않는다. 해당 workload를 별도로 실행하고 실제 활동률 counters로 feature rows를 준비해야 한다. 예측 가능한 모델의 완성 여부는 이 데이터와 독립적인 holdout 검증에 달려 있다.
 
-Tensor feature의 단위는 TFLOP/s, byte feature의 단위는 GB/s이다. fitting 계수의 단위는 각각 W/(TFLOP/s), W/(GB/s)이다. 같은 숫자는 전자의 경우 pJ/FLOP, 후자의 경우 nJ/byte로 변환된다. 모델은 intercept, residual, rank와 condition, 검증 오차를 보고한다. mixed 예측은 통과한 독립 holdout feature들의 convex hull, 즉 실제 검증한 혼합 조건을 가중 평균해서 만들 수 있는 범위로 제한한다. holdout 하나만 통과하면 그 혼합 vector만 검증된 것이며 임의의 다른 혼합으로 확대하지 않는다.
+실제 예측 대상의 context를 다음처럼 별도로 제공한다. clock은 모델과 같은 **요청 clock**, 온도는 현재 측정값이다. `benchmark_sha256`, `measurement_stratum`, `treatment_design_stratum`은 context에 제공된 경우 저장한 값과 비교한다. 생략된 환경 정보까지 검증하는 기능은 아니므로 적용 환경의 동질성을 확인해야 한다.
 
-Tensor의 클럭별 ceiling은 `SM 개수 × 실제 SM MHz × FLOP/SM/cycle × 10^-6` TFLOP/s로 계산한다. 공통 dense FP16·FP32 누산의 FLOP/SM/cycle은 V100 1,024, A100 2,048, H100 4,096을 사용한다. clock-specific issue ceiling이며, 공통 WMMA가 이 수치를 모두 달성한다는 보장은 없다.
+```python
+from powermodeling.model import predict_power
+
+watts = predict_power(model, measured_features, context={
+    "gpu_uuid": "GPU-실제-대상-UUID",
+    "graphics_clock_mhz": 1200,
+    "memory_clock_mhz": 1593,
+    "temperature_c": 50.0,
+})
+```
+
+위 숫자는 호출 형식의 예시이며 GPU 측정값이 아니다. 반환 전력의 의미는 `model["target"]`에 따른다. `incremental_power_w` 모델은 idle 기준 증가분을 반환하므로 전체 소비전력과 구분한다. cross-clock feature의 단위는 `MHz`다. 변경 논의와 검증 결과는 [교차 검토 기록](docs/self-audit.ko.md)에 정리했다.
+
+두 prediction 옵션은 Python boolean만 받으며 문자열 `"false"`나 숫자 `0`/`1`을 boolean으로 해석하지 않는다. clock feature와 config 요청값이 어긋난 fitting 행은 다른 provenance 오류와 같이 `skipped_rows`에 사유를 남기고 제외한다. `holdout_validation_status=pass`는 오차 통과만 뜻하며, mixed 독립성·범위·hull 검사를 대신하지 않는다.
+
+Cross-clock 모델의 단일 활동 예측은 주파수 feature의 calibration 최소·최대 안에서 보간할 수 있다. 저장된 요청 pair 목록에 없는 조합도 그 범위 안에서는 허용되며 실제 지원 clock이나 물리적 DVFS 모델의 검증을 뜻하지 않는다. Mixed 활동은 통과한 holdout의 convex hull 제한도 충족해야 한다.
+
+Tensor feature의 단위는 TFLOP/s, byte feature의 단위는 GB/s이다. fitting 계수의 단위는 각각 W/(TFLOP/s), W/(GB/s)이다. 같은 숫자는 전자의 경우 pJ/FLOP, 후자의 경우 nJ/byte로 변환된다. 모델은 intercept, residual, rank와 condition, 검증 오차를 보고한다. mixed 예측은 holdout이 `pass`인 독립 holdout feature들의 convex hull, 즉 실제 검증한 혼합 조건을 가중 평균해서 만들 수 있는 범위로 제한한다. holdout 하나만 통과하면 그 혼합 vector만 검증된 것이며 임의의 다른 혼합으로 확대하지 않는다.
+
+Tensor의 클럭별 ceiling은 `SM 개수 × 실제 SM MHz × FLOP/SM/cycle × 10^-6` TFLOP/s로 계산한다. 공통 dense FP16·FP32 누산의 FLOP/SM/cycle은 V100 1,024, A100 2,048, H100 4,096을 사용한다. clock-specific issue ceiling이며, 공통 WMMA `m16n16k16`이 이 수치를 모두 달성한다는 보장은 없다. 이 ceiling은 raw PTX `mma` shape나 SASS lowering과 같은 값이 아니다.
 
 400 W/312 TFLOPS만으로 idle 몫을 구할 수는 없다. TDP는 상한 사양이며 실제 부하 전력과 다르고, 312 TFLOPS는 특정 A100 SKU의 dense FP16 Tensor peak다. 측정한 idle, 실제 power, 실제 clock의 peak ceiling을 사용하여 idle 비율과 throughput utilization을 평가한다.
 
@@ -422,7 +445,7 @@ Tensor의 클럭별 ceiling은 `SM 개수 × 실제 SM MHz × FLOP/SM/cycle × 1
 
 HBM은 `B_theory = 2 × achieved_memory_MHz × 10^6 × bus_bits / 8` byte/s의 **80% 이상**에서 최소 pJ/logical bit를 선택한다. 버스 폭은 CUDA device metadata, memory MHz는 같은 에너지 구간의 실제 NVML 관측값이다. Peak clock 속성이나 요청 clock으로 누락값을 대체하지 않는다. **관측 peak의 95%는 HBM의 추가 탈락 조건이 아니다.** `--hbm-bandwidth-fraction 0.80`으로 기준을 명시할 수 있다. 버스 폭·클럭이 미지수인 기존 raw는 보존하되 승인 후보로 쓰지 않는다.
 
-분자는 에너지 구간의 logical payload rate이며 물리적 HBM bus 사용률의 동시 측정은 아니다. NCU replay의 DRAM bytes를 에너지 분모로 섞지 않고, HBM 경로·coalescing을 별도 검증한다. 80%는 사용자 선택 정책으로 물리적 포화를 뜻하지 않는다. 반복 품질·서로 다른 resource geometry·완료 count·clock·CI 조건도 유지한다.
+분자는 에너지 구간의 logical payload rate이며 물리적 HBM bus 사용률의 동시 측정은 아니다. NCU replay의 DRAM bytes를 에너지 분모로 섞지 않고, HBM 경로·coalescing을 별도 검증한다. 그 replay의 DRAM/logical 75%와 logical 80%를 곱한 60%는 같은 구간의 DRAM 전송률이 아니고, DRAM 사용률의 하한도 아니다. 80%는 사용자 선택 정책으로 물리적 포화를 뜻하지 않는다. 반복 품질·서로 다른 resource geometry·완료 count·clock·CI 조건도 유지한다.
 
 다른 계층·연산에는 주파수별/전체 고정 클럭 sweep의 관측 peak 95% 정책이 남는다. **모든 측정이 느리면 상대 95%와 plateau도 통과할 수 있는 한계는 해당 계층에 남아 있다.** `qualified_observed_candidate`는 관측 격자 안의 승인 후보이며 `hardware_saturation_proven=false`다. [HBM 기준과 구현](docs/hbm-bandwidth-design.ko.md), [평가 구현](powermodeling/evaluation.py), [관측 최소점 분석](powermodeling/analysis.py)
 
@@ -551,7 +574,7 @@ Geometry pilot은 보통 **계층당 두 clock 합계 14–16조건**, 모든 T�
 
 기본 증가분 모델의 설계 형태는 `P_work = P_idle_reference + intercept + Σ(e_i×activity_i) + residual`이다. `fit`의 기본 target은 명시적으로 준비한 **기준 대비 증가분 전력**(`incremental_power_w`)이며, 전체 또는 paired 전력 target을 선택하면 해당 범위와 적합성 기준으로 회귀한다. Intercept는 남은 baseline/activation 효과일 수 있어 pure static으로 이름 붙이지 않는다. Tensor·L1·L2·HBM microbenchmark는 공유 경로를 사용하므로 단가 네 개를 더한다고 혼합 workload 전력이 복원되지 않는다.
 
-같은 GPU·고정 clock·측정 정의에서 활동률을 독립적으로 바꾼 calibration과 rank/condition 검사가 필요하다. 미측정 feature를 0으로 채우지 않는다. TFLOP/s 계수는 pJ/FLOP, GB/s 계수는 nJ/byte이며 후자를 pJ/bit로 바꿀 때는 125를 곱한다. 독립 mixed holdout을 통과한 범위의 convex hull 안에서만 혼합 예측을 허용한다. **Mixed workload의 자동 동시 수집은 미구현**이고 수동 feature row의 source 문자열 존재 검사는 실제 센서 scope·동일 시간창·locality의 일치를 입증하지 못한다. 입력 작성자가 그 근거와 동질성을 확인해야 한다. [모델 구현](powermodeling/model.py)
+같은 GPU·요청 clock·측정 정의에서 활동률을 독립적으로 바꾼 calibration과 rank/condition 검사가 필요하다. 온도가 알려진 행은 measure 최소·최대를 포함한 폭 5°C 안에서만 한 모델에 들어간다. 미측정 feature를 0으로 채우지 않는다. TFLOP/s 계수는 pJ/FLOP, GB/s 계수는 nJ/byte이며 후자를 pJ/bit로 바꿀 때는 125를 곱한다. 독립 mixed holdout을 통과한 범위의 convex hull 안에서만 혼합 예측을 허용한다. **Mixed workload의 자동 동시 수집은 미구현**이고 수동 feature row의 source 문자열 존재 검사는 실제 센서 scope·동일 시간창·locality의 일치를 입증하지 못한다. 입력 작성자가 그 근거와 동질성을 확인해야 한다. [모델 구현](powermodeling/model.py)
 
 반복 중앙값과 1,000회 bootstrap 95% 구간을 보고하며 관측 수 3개 미만에는 CI를 내지 않는다. 3–4회의 구간은 거칠고 센서 calibration bias·scope 불확실성·control model 오차를 포함하지 않는다. Clock·seed·binary·실험 protocol·working set·SM 범위가 다른 자료를 반복으로 섞지 않는다. 미측정 주파수나 geometry는 보간으로 최적 구간을 만들지 않고 실제 근접 측정점과 CI 겹침을 별도로 제공한다.
 

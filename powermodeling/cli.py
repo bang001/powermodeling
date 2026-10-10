@@ -221,7 +221,7 @@ def main(argv=None):
                 atomic_json(output/"trials"/(record["trial_id"]+".json"),record)
             result={"assessed_trials":len(matching),"preserved_trials":len(records)-len(matching),"output":str(output.resolve())}
         print(json.dumps(result,indent=2,allow_nan=False))
-        if args.command=="fit" and result.get("status")=="rejected": return 2
+        if args.command=="fit" and (result.get("status")=="rejected" or result.get("holdout_validation_status")=="fail"): return 2
         return 0
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
         print(f"powermodeling: {exc}",file=sys.stderr)
